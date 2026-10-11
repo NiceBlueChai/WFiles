@@ -1,10 +1,12 @@
 //! 一个浏览窗格：工具栏、文件列表、详情面板与状态栏。
 //!
 //! 窗格自己持有目录状态，这样以后加标签页时每个标签就是一个 `Entity<Pane>`。
+//! 文件操作不在这里执行：窗格只向 [`Ops`] 发起请求，完成后根据事件刷新自己。
 
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
+    time::Duration,
 };
 
 use gpui_kit::assets::IconName;
@@ -18,10 +20,12 @@ use gpui_kit::component::{
 };
 // component::Size 是控件尺寸档位，这里要的是 gpui 的几何尺寸。
 use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::{Size, *};
+use gpui_kit::{AsyncApp, Size, Task, WeakEntity, *};
 
 use crate::format;
 use crate::model::{Listing, Selection, Sort, SortKey};
+use crate::ops_entity::{Ops, OpsEvent};
+use crate::watch;
 
 const ROW_HEIGHT: f32 = 40.;
 const COL_SIZE: f32 = 100.;
@@ -33,6 +37,9 @@ const COL_KIND: f32 = 90.;
 /// 只有列表区在这个上下文里，工具栏的筛选框不在，
 /// 所以在筛选框里打字、按方向键都不会误动文件列表。
 const KEY_CONTEXT: &str = "WFilesPane";
+
+/// 目录监听的去抖时间：批量改动收敛成一次刷新。
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 gpui_kit::actions!(
     wfiles,
@@ -52,6 +59,13 @@ gpui_kit::actions!(
         GoForward,
         Refresh,
         ClearSelection,
+        NewFolder,
+        Rename,
+        Trash,
+        CopySelection,
+        CutSelection,
+        Paste,
+        Undo,
     ]
 );
 
@@ -75,10 +89,26 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-r", Refresh, context),
         KeyBinding::new("cmd-a", SelectAll, context),
         KeyBinding::new("escape", ClearSelection, context),
+        KeyBinding::new("cmd-shift-n", NewFolder, context),
+        KeyBinding::new("f2", Rename, context),
+        KeyBinding::new("cmd-backspace", Trash, context),
+        KeyBinding::new("cmd-c", CopySelection, context),
+        KeyBinding::new("cmd-x", CutSelection, context),
+        KeyBinding::new("cmd-v", Paste, context),
+        KeyBinding::new("cmd-z", Undo, context),
     ]);
 }
 
+/// 窗格广播给应用的事件：当前目录变了，会话该存盘了。
+#[derive(Clone, Debug)]
+pub enum PaneEvent {
+    Navigated,
+}
+
+impl EventEmitter<PaneEvent> for Pane {}
+
 pub struct Pane {
+    ops: Entity<Ops>,
     listing: Listing,
     selection: Selection,
     back: Vec<PathBuf>,
@@ -91,11 +121,18 @@ pub struct Pane {
     scroll: VirtualListScrollHandle,
     /// 虚拟列表要一份逐行高度，行数变化时才重建。
     row_sizes: Rc<Vec<Size<Pixels>>>,
+    /// 当前目录的监听任务；丢掉它就等于停止监听。
+    watch_task: Option<Task<()>>,
     subscriptions: Vec<Subscription>,
 }
 
 impl Pane {
-    pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        path: PathBuf,
+        ops: Entity<Ops>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("筛选当前文件夹"));
         let (listing, error) = match Listing::read(&path) {
             Ok(listing) => (listing, None),
@@ -103,6 +140,7 @@ impl Pane {
         };
 
         let mut pane = Self {
+            ops,
             listing,
             selection: Selection::default(),
             back: Vec::new(),
@@ -113,6 +151,7 @@ impl Pane {
             status: String::new(),
             scroll: VirtualListScrollHandle::new(),
             row_sizes: Rc::new(Vec::new()),
+            watch_task: None,
             subscriptions: Vec::new(),
         };
 
@@ -125,9 +164,15 @@ impl Pane {
                 }
             },
         ));
+        pane.subscriptions.push(cx.subscribe_in(
+            &pane.ops,
+            window,
+            |this, _, event: &OpsEvent, _, cx| this.on_ops_event(event, cx),
+        ));
 
         pane.sync_row_sizes();
         pane.update_status();
+        pane.start_watching(cx);
         // 一打开就能用方向键，不需要先点一下列表。
         pane.focus.focus(window, cx);
         pane
@@ -198,7 +243,9 @@ impl Pane {
                 self.clear_filter(window, cx);
                 self.sync_row_sizes();
                 self.scroll_to_top();
+                self.start_watching(cx);
                 self.focus.focus(window, cx);
+                cx.emit(PaneEvent::Navigated);
             }
             Err(error) => {
                 // 保留当前内容，只把失败说清楚，避免界面突然变空。
@@ -257,6 +304,13 @@ impl Pane {
         }
         self.update_status();
         cx.notify();
+    }
+
+    /// 关掉最后一个标签时把窗格重置回主页。
+    pub fn reset_to(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.back.clear();
+        self.forward.clear();
+        self.navigate_to(path, false, window, cx);
     }
 
     pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -371,6 +425,124 @@ impl Pane {
         }
     }
 
+    // ---- 文件操作请求 ----
+
+    /// 按列表顺序返回选中项，批量操作要用同一个顺序。
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        self.selection.ordered(&self.listing)
+    }
+
+    fn request_new_folder(&mut self, cx: &mut Context<Self>) {
+        let parent = self.listing.path().to_path_buf();
+        self.ops
+            .update(cx, |ops, cx| ops.request_new_folder(parent, cx));
+    }
+
+    fn request_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.selection.single().map(PathBuf::from) {
+            self.ops
+                .update(cx, |ops, cx| ops.request_rename(path, cx));
+        }
+    }
+
+    fn request_trash(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        self.ops.update(cx, |ops, cx| ops.request_trash(paths, cx));
+    }
+
+    fn request_copy(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        self.ops.update(cx, |ops, cx| ops.copy(paths, cx));
+    }
+
+    fn request_cut(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        self.ops.update(cx, |ops, cx| ops.cut(paths, cx));
+    }
+
+    fn request_paste(&mut self, cx: &mut Context<Self>) {
+        let dest = self.listing.path().to_path_buf();
+        self.ops.update(cx, |ops, cx| ops.request_paste(dest, cx));
+    }
+
+    fn request_undo(&mut self, cx: &mut Context<Self>) {
+        self.ops.update(cx, |ops, cx| ops.request_undo(cx));
+    }
+
+    // ---- 目录监听与外部变更 ----
+
+    /// 开始监听当前目录；切换目录时旧任务被丢弃，监听随之停止。
+    fn start_watching(&mut self, cx: &mut Context<Self>) {
+        let path = self.listing.path().to_path_buf();
+        let Ok((watcher, rx)) = watch::watch_directory(&path) else {
+            return;
+        };
+
+        self.watch_task = None;
+        // async move 前缀形式 + 克隆 AsyncApp：future 持有所有权，跨 await 安全。
+        self.watch_task = Some(cx.spawn(async move |pane: WeakEntity<Pane>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            // watcher 活在任务里：任务被丢弃（切换目录）时监听停止。
+            let _watcher = watcher;
+            while rx.recv().await.is_ok() {
+                // 去抖：静默期内的后续事件全部读干，只刷新一次。
+                cx.background_executor().timer(WATCH_DEBOUNCE).await;
+                while rx.try_recv().is_ok() {}
+                pane.update(&mut cx, |pane, cx| pane.refresh_if_watching(&path, cx))
+                    .ok();
+            }
+        }));
+    }
+
+    /// 监听回调：确认还在看同一个目录才刷新（导航后的旧回调双保险）。
+    fn refresh_if_watching(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.listing.path() == path {
+            self.refresh(cx);
+        }
+    }
+
+    fn on_ops_event(&mut self, event: &OpsEvent, cx: &mut Context<Self>) {
+        // 剪贴板变化只影响按钮可用性，重绘时自然会读到最新状态。
+        if !matches!(event, OpsEvent::Changed { .. }) {
+            return;
+        }
+        cx.notify();
+    }
+
+    /// 文件操作或外部程序改了文件系统：能对上号就刷新，目录被搬走就跟着搬。
+    pub fn apply_external_change(
+        &mut self,
+        removed: &[PathBuf],
+        changed: &[PathBuf],
+        renamed_to: &[(PathBuf, PathBuf)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self.listing.path().to_path_buf();
+
+        // 当前目录被搬走：跟着去新家，不记历史（前进后退是浏览用的）。
+        if let Some((_, to)) = renamed_to.iter().find(|(from, _)| *from == path) {
+            self.navigate_to(to.clone(), false, window, cx);
+            return;
+        }
+        // 当前目录被删掉：刷新会落到错误状态，把原因说清楚。
+        if removed.iter().any(|gone| gone == &path) {
+            self.refresh(cx);
+            return;
+        }
+        // 目录内容有变（里面新增、删除、改名，或者目录自己被改写）。
+        let inside = |candidate: &PathBuf| candidate.starts_with(&path);
+        if changed.iter().any(inside)
+            || renamed_to
+                .iter()
+                .any(|(from, to)| inside(from) || inside(to))
+        {
+            self.refresh(cx);
+        }
+    }
+
+    // ---- 渲染 ----
+
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .h(px(52.))
@@ -411,12 +583,65 @@ impl Pane {
                     .tooltip("刷新")
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
+            .children(self.render_file_ops(cx))
             .child(
                 Input::new(&self.filter)
                     .prefix(Icon::new(IconName::Search).size_4())
                     .cleanable(true)
-                    .w(px(220.)),
+                    .w(px(200.)),
             )
+    }
+
+    /// 文件操作按钮组：选中状态决定哪些能按。
+    fn render_file_ops(&mut self, cx: &mut Context<Self>) -> Vec<Button> {
+        let selected = self.selection.len();
+        let can_write = self.error.is_none();
+        let can_paste = !self.ops.read(cx).clipboard().paths.is_empty();
+
+        vec![
+            Button::new("op-new-folder")
+                .icon(IconName::FolderPlus)
+                .ghost()
+                .small()
+                .tooltip("新建文件夹（Cmd+Shift+N）")
+                .disabled(!can_write)
+                .on_click(cx.listener(|this, _, _, cx| this.request_new_folder(cx))),
+            Button::new("op-rename")
+                .icon(IconName::SquarePen)
+                .ghost()
+                .small()
+                .tooltip("重命名（F2）")
+                .disabled(selected != 1)
+                .on_click(cx.listener(|this, _, _, cx| this.request_rename(cx))),
+            Button::new("op-trash")
+                .icon(IconName::Trash)
+                .ghost()
+                .small()
+                .tooltip("移到回收站（Cmd+Backspace）")
+                .disabled(selected == 0)
+                .on_click(cx.listener(|this, _, _, cx| this.request_trash(cx))),
+            Button::new("op-copy")
+                .icon(IconName::Copy)
+                .ghost()
+                .small()
+                .tooltip("拷贝（Cmd+C）")
+                .disabled(selected == 0)
+                .on_click(cx.listener(|this, _, _, cx| this.request_copy(cx))),
+            Button::new("op-cut")
+                .icon(IconName::Scissors)
+                .ghost()
+                .small()
+                .tooltip("剪切（Cmd+X）")
+                .disabled(selected == 0)
+                .on_click(cx.listener(|this, _, _, cx| this.request_cut(cx))),
+            Button::new("op-paste")
+                .icon(IconName::ClipboardPaste)
+                .ghost()
+                .small()
+                .tooltip("粘贴（Cmd+V）")
+                .disabled(!can_paste)
+                .on_click(cx.listener(|this, _, _, cx| this.request_paste(cx))),
+        ]
     }
 
     /// 面包屑：每一段都能点，段数太多时从左边裁掉，保证当前目录一直看得见。
@@ -752,6 +977,13 @@ impl Pane {
             .on_action(cx.listener(|this, _: &GoForward, window, cx| this.go_forward(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.clear_selection(cx)))
+            .on_action(cx.listener(|this, _: &NewFolder, _, cx| this.request_new_folder(cx)))
+            .on_action(cx.listener(|this, _: &Rename, _, cx| this.request_rename(cx)))
+            .on_action(cx.listener(|this, _: &Trash, _, cx| this.request_trash(cx)))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.request_copy(cx)))
+            .on_action(cx.listener(|this, _: &CutSelection, _, cx| this.request_cut(cx)))
+            .on_action(cx.listener(|this, _: &Paste, _, cx| this.request_paste(cx)))
+            .on_action(cx.listener(|this, _: &Undo, _, cx| this.request_undo(cx)))
             .child(self.render_header(cx))
             .child(self.render_list(cx))
             .child(self.render_status_bar(cx))

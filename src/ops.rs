@@ -37,8 +37,10 @@ pub struct Outcome {
     pub done: usize,
     pub skipped: usize,
     pub failed: Vec<(PathBuf, String)>,
-    /// 本次操作实际创建或移动出来的路径，界面刷新与撤销记录都用它。
+    /// 本次操作实际创建或移动出来的路径，界面刷新用它。
     pub touched: Vec<PathBuf>,
+    /// 移动操作的“源 -> 目标”配对，撤销移动要用。
+    pub transfers: Vec<(PathBuf, PathBuf)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,9 +107,14 @@ fn same_file(left: &Path, right: &Path) -> bool {
 // 单项操作
 // ---------------------------------------------------------------------------
 
-/// 新建文件夹，返回实际创建的路径（可能带序号）。
-pub fn create_folder(parent: &Path) -> Result<PathBuf, String> {
-    let path = fresh_folder_path(parent);
+/// 用指定的名字新建文件夹；名字已存在时报错，由界面留在输入框里让用户改。
+pub fn create_folder_named(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    valid_name(name)?;
+    let trimmed = name.trim();
+    let path = parent.join(trimmed);
+    if path.exists() {
+        return Err(format!("“{trimmed}”已存在"));
+    }
     fs::create_dir(&path).map_err(|error| format!("无法创建文件夹：{error}"))?;
     Ok(path)
 }
@@ -380,7 +387,10 @@ fn transfer_entries(
         match transfer_one(source, &target, remove_source) {
             Ok(()) => {
                 outcome.done += 1;
-                outcome.touched.push(target);
+                outcome.touched.push(target.clone());
+                if remove_source {
+                    outcome.transfers.push((source.clone(), target));
+                }
             }
             Err(error) => outcome.failed.push((source.clone(), error.to_string())),
         }
@@ -452,6 +462,22 @@ pub enum HistoryEntry {
 }
 
 impl HistoryEntry {
+    /// 这一条记录涉及的所有路径（旧与新），撤销成功后界面据此刷新。
+    pub fn paths(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Created { path } => vec![path.clone()],
+            Self::Renamed { from, to } => vec![from.clone(), to.clone()],
+            Self::Copied { created } => created.clone(),
+            Self::Moved { moves } => moves
+                .iter()
+                .flat_map(|(from, to)| [from.clone(), to.clone()])
+                .collect(),
+            Self::Trashed { originals } => {
+                originals.iter().map(|(path, _)| path.clone()).collect()
+            }
+        }
+    }
+
     /// 撤销按钮上的文案。
     pub fn describe(&self) -> String {
         match self {
@@ -542,10 +568,6 @@ impl History {
         self.entries.push(entry);
     }
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -553,6 +575,14 @@ impl History {
     /// 栈顶操作的描述，用于“撤销 XXX”按钮。
     pub fn last_describe(&self) -> Option<String> {
         self.entries.last().map(HistoryEntry::describe)
+    }
+
+    /// 栈顶操作涉及的路径（撤销前后都要刷新）。
+    pub fn last_paths(&self) -> Vec<PathBuf> {
+        self.entries
+            .last()
+            .map(HistoryEntry::paths)
+            .unwrap_or_default()
     }
 
     /// 弹出并执行撤销，返回被撤销操作的描述。
@@ -913,11 +943,14 @@ mod tests {
     #[test]
     fn undo_create_removes_the_folder() {
         let root = temp();
-        let folder = create_folder(root.path()).unwrap();
+        let folder = create_folder_named(root.path(), "未命名文件夹").unwrap();
 
         let mut history = History::default();
         history.push(HistoryEntry::Created { path: folder.clone() });
-        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history.last_describe(),
+            Some("新建“未命名文件夹”".to_string())
+        );
 
         assert_eq!(history.pop_undo().unwrap(), "新建“未命名文件夹”");
         assert!(!folder.exists());
@@ -927,14 +960,17 @@ mod tests {
     #[test]
     fn undo_create_refuses_a_folder_that_gained_content() {
         let root = temp();
-        let folder = create_folder(root.path()).unwrap();
+        let folder = create_folder_named(root.path(), "未命名文件夹").unwrap();
         fs::write(folder.join("later.txt"), "x").unwrap();
 
         let mut history = History::default();
         history.push(HistoryEntry::Created { path: folder.clone() });
 
         assert!(history.pop_undo().is_err());
-        assert_eq!(history.len(), 1, "撤不动要留在栈里");
+        assert!(
+            history.last_describe().is_some(),
+            "撤不动要留在栈里"
+        );
         assert!(folder.exists());
     }
 
@@ -1018,7 +1054,7 @@ mod tests {
     #[test]
     fn note_renamed_keeps_undo_pointing_at_the_new_name() {
         let root = temp();
-        let folder = create_folder(root.path()).unwrap();
+        let folder = create_folder_named(root.path(), "未命名文件夹").unwrap();
         let renamed = rename(&folder, "改名了").unwrap();
 
         let mut history = History::default();
@@ -1045,7 +1081,11 @@ mod tests {
         });
 
         history.note_removed(&gone);
-        assert_eq!(history.len(), 1, "只删失效的那条");
+        assert_eq!(
+            history.last_describe(),
+            Some("复制 1 项".to_string()),
+            "只删失效的那条"
+        );
         assert_eq!(
             history.entries[0],
             HistoryEntry::Copied {

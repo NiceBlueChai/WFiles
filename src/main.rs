@@ -2,6 +2,7 @@ mod app;
 mod format;
 mod model;
 mod ops;
+mod ops_entity;
 mod pane;
 mod session;
 mod watch;
@@ -14,6 +15,7 @@ fn main() {
     let application = gpui_kit::application().with_assets(Assets);
     application.run(|cx| {
         gpui_kit::init(cx);
+        app::init(cx);
         pane::init(cx);
 
         let window_options = WindowOptions {
