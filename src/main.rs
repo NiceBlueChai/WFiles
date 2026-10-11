@@ -1,7 +1,10 @@
 mod app;
 mod format;
 mod model;
+mod ops;
 mod pane;
+mod session;
+mod watch;
 
 use app::WFilesApp;
 use gpui_kit::assets::Assets;
