@@ -10,6 +10,7 @@ use std::{
 
 use gpui_kit::{AsyncApp, WeakEntity, *};
 
+use crate::bulk_rename::{self, BulkRename, BulkRenamePreview};
 use crate::ops::{self, ConflictPolicy, History, Outcome, Progress};
 
 /// 广播给窗格的事件：文件系统变了，该刷新的自己对照路径判断。
@@ -26,6 +27,8 @@ pub enum OpsEvent {
     ClipboardChanged,
     /// 输入对话框开/关，应用层据此创建/销毁输入框。
     PromptChanged { open: bool },
+    /// 批量重命名对话框开/关，应用层据此创建/销毁那一组输入框。
+    BulkChanged { open: bool },
 }
 
 impl EventEmitter<OpsEvent> for Ops {}
@@ -82,6 +85,14 @@ pub struct Prompt {
     pub action: PendingAction,
 }
 
+/// 批量重命名对话框：一套规则 + 实时算出来的预览。
+#[derive(Clone, Debug)]
+pub struct BulkState {
+    pub sources: Vec<PathBuf>,
+    pub rule: BulkRename,
+    pub previews: Vec<BulkRenamePreview>,
+}
+
 /// 进行中的任务。
 #[derive(Clone, Debug)]
 pub struct Running {
@@ -101,6 +112,11 @@ enum JobResult {
     Trashed(Vec<(PathBuf, SystemTime)>),
     /// 拷贝/移动的结果。
     Transferred { outcome: Outcome, cut: bool },
+    /// 批量重命名的结果。
+    BulkRenamed {
+        renamed: Vec<(PathBuf, PathBuf)>,
+        failed: Vec<(PathBuf, String)>,
+    },
 }
 
 pub struct Ops {
@@ -110,6 +126,7 @@ pub struct Ops {
     confirm: Option<Confirm>,
     conflict: Option<Conflict>,
     prompt: Option<Prompt>,
+    bulk: Option<BulkState>,
     /// 最近一次操作的结论，显示在底部状态栏。
     last_message: Option<String>,
     /// 上一条消息是不是错误（决定显示颜色）。
@@ -125,6 +142,7 @@ impl Ops {
             confirm: None,
             conflict: None,
             prompt: None,
+            bulk: None,
             last_message: None,
             last_message_is_error: false,
         }
@@ -150,6 +168,10 @@ impl Ops {
 
     pub fn prompt(&self) -> Option<&Prompt> {
         self.prompt.as_ref()
+    }
+
+    pub fn bulk(&self) -> Option<&BulkState> {
+        self.bulk.as_ref()
     }
 
     /// “撤销”按钮的文案；没有可撤销操作时返回 None。
@@ -269,6 +291,68 @@ impl Ops {
             action: PendingAction::Undo,
         });
         cx.notify();
+    }
+
+    // ---- 批量重命名 ----
+
+    /// 打开批量重命名对话框：默认规则是“什么都不改”，预览逐项算出来。
+    pub fn request_bulk_rename(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.len() < 2 {
+            return;
+        }
+        let rule = BulkRename::default();
+        let previews = bulk_rename::preview(&paths, &rule);
+        self.bulk = Some(BulkState {
+            sources: paths,
+            rule,
+            previews,
+        });
+        cx.emit(OpsEvent::BulkChanged { open: true });
+        cx.notify();
+    }
+
+    /// 规则变了：重算预览。预览是纯函数，改一个字符全部项立刻跟着变。
+    pub fn set_bulk_rule(&mut self, rule: BulkRename, cx: &mut Context<Self>) {
+        if let Some(bulk) = self.bulk.as_mut() {
+            bulk.previews = bulk_rename::preview(&bulk.sources, &rule);
+            bulk.rule = rule;
+        }
+        cx.notify();
+    }
+
+    pub fn dismiss_bulk(&mut self, cx: &mut Context<Self>) {
+        self.bulk = None;
+        cx.emit(OpsEvent::BulkChanged { open: false });
+        cx.notify();
+    }
+
+    /// 执行：只动可执行的项，结果压进撤销栈（整批算一条记录，一次撤销全改回）。
+    pub fn apply_bulk_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(bulk) = self.bulk.clone() else {
+            return;
+        };
+        let count = bulk_rename::executable_count(&bulk.previews);
+        if count == 0 {
+            self.last_message = Some("没有可执行的重命名".to_string());
+            self.last_message_is_error = true;
+            cx.notify();
+            return;
+        }
+
+        self.bulk = None;
+        cx.emit(OpsEvent::BulkChanged { open: false });
+        self.spawn_job(
+            format!("正在批量重命名 {count} 项"),
+            count,
+            cx,
+            move |tx| {
+                let (renamed, failed) = bulk_rename::apply(&bulk.previews);
+                let _ = tx.try_send(WorkerMessage::Done(JobResult::BulkRenamed {
+                    renamed,
+                    failed,
+                }));
+            },
+        );
     }
 
     // ---- 对话框回调 ----
@@ -554,6 +638,32 @@ impl Ops {
                                 renamed_to: Vec::new(),
                             });
                         }
+                    }
+                    JobResult::BulkRenamed { renamed, failed } => {
+                        if !renamed.is_empty() {
+                            // 先把更早的记录指向新路径，再压入整批记录。
+                            for (from, to) in &renamed {
+                                self.history.note_renamed(from, to);
+                            }
+                            self.history.push(ops::HistoryEntry::BulkRenamed {
+                                moves: renamed.clone(),
+                            });
+                        }
+                        let mut message = format!("已重命名 {} 项", renamed.len());
+                        if !failed.is_empty() {
+                            message.push_str(&format!(
+                                "，{} 项失败（{}）",
+                                failed.len(),
+                                failed[0].1
+                            ));
+                        }
+                        self.last_message = Some(message);
+                        self.last_message_is_error = !failed.is_empty();
+                        cx.emit(OpsEvent::Changed {
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                            renamed_to: renamed,
+                        });
                     }
                     JobResult::Transferred { outcome, cut } => {
                         let removed = if cut {

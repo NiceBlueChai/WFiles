@@ -457,6 +457,8 @@ pub enum HistoryEntry {
     Copied { created: Vec<PathBuf> },
     /// 移动：撤销就是移回原处。
     Moved { moves: Vec<(PathBuf, PathBuf)> },
+    /// 批量重命名：撤销就是按记录全部改回去。
+    BulkRenamed { moves: Vec<(PathBuf, PathBuf)> },
     /// 移进回收站：撤销就是从回收站放回原处。
     Trashed { originals: Vec<(PathBuf, SystemTime)> },
 }
@@ -469,6 +471,10 @@ impl HistoryEntry {
             Self::Renamed { from, to } => vec![from.clone(), to.clone()],
             Self::Copied { created } => created.clone(),
             Self::Moved { moves } => moves
+                .iter()
+                .flat_map(|(from, to)| [from.clone(), to.clone()])
+                .collect(),
+            Self::BulkRenamed { moves } => moves
                 .iter()
                 .flat_map(|(from, to)| [from.clone(), to.clone()])
                 .collect(),
@@ -492,6 +498,9 @@ impl HistoryEntry {
             }
             Self::Moved { moves } => {
                 format!("移动 {} 项", moves.len())
+            }
+            Self::BulkRenamed { moves } => {
+                format!("批量重命名 {} 项", moves.len())
             }
             Self::Trashed { originals } => {
                 format!("移到回收站 {} 项", originals.len())
@@ -533,6 +542,19 @@ impl HistoryEntry {
                 for (from, to) in moves.iter().rev() {
                     if let Some(parent) = from.parent() {
                         fs::create_dir_all(parent).ok();
+                    }
+                    fs::rename(to, from).map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            }
+            Self::BulkRenamed { moves } => {
+                // 逆序改回去，避免序号类改名互相踩。
+                for (from, to) in moves.iter().rev() {
+                    if !to.exists() {
+                        return Err(format!(
+                            "“{}”已经不在改名后的位置了",
+                            display_name(to)
+                        ));
                     }
                     fs::rename(to, from).map_err(|error| error.to_string())?;
                 }
@@ -636,6 +658,16 @@ impl History {
                         }
                     }
                 }
+                HistoryEntry::BulkRenamed { moves } => {
+                    for (f, t) in moves.iter_mut() {
+                        if *f == from {
+                            *f = to.to_path_buf();
+                        }
+                        if *t == from {
+                            *t = to.to_path_buf();
+                        }
+                    }
+                }
                 HistoryEntry::Trashed { .. } => {}
             }
         }
@@ -652,6 +684,10 @@ impl History {
                 !created.is_empty()
             }
             HistoryEntry::Moved { moves } => {
+                moves.retain(|(f, t)| f != path && t != path);
+                !moves.is_empty()
+            }
+            HistoryEntry::BulkRenamed { moves } => {
                 moves.retain(|(f, t)| f != path && t != path);
                 !moves.is_empty()
             }
@@ -1049,6 +1085,61 @@ mod tests {
         assert_eq!(fs::read_to_string(src.join("a.txt")).unwrap(), "aaa");
         assert_eq!(fs::read_to_string(src.join("b.txt")).unwrap(), "bbb");
         assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn undo_bulk_rename_restores_every_name() {
+        let root = temp();
+        let names = ["a.txt", "b.txt", "c.txt"];
+        let paths: Vec<PathBuf> = names.iter().map(|name| root.path().join(name)).collect();
+        for path in &paths {
+            fs::write(path, "x").unwrap();
+        }
+
+        // 模拟一次批量重命名：整批压成一条记录。
+        let moves: Vec<(PathBuf, PathBuf)> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.clone(), root.path().join(format!("IMG_{}.txt", index + 1))))
+            .collect();
+        let mut history = History::default();
+        history.push(HistoryEntry::BulkRenamed { moves: moves.clone() });
+
+        for (from, to) in &moves {
+            fs::rename(from, to).unwrap();
+        }
+
+        history.pop_undo().unwrap();
+        for path in &paths {
+            assert!(path.exists(), "{} 应该被改回原名", path.display());
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), paths.len());
+    }
+
+    #[test]
+    fn history_self_heals_after_a_bulk_rename() {
+        let root = temp();
+        let original = root.path().join("a.txt");
+        let renamed = root.path().join("b.txt");
+        fs::write(&original, "x").unwrap();
+        // 先按批量重命名真的落盘一次，后面的“又被改名”才有对象。
+        fs::rename(&original, &renamed).unwrap();
+
+        let mut history = History::default();
+        history.push(HistoryEntry::BulkRenamed {
+            moves: vec![(original.clone(), renamed.clone())],
+        });
+
+        // 这批之后，其中一个产物又被改成了别的名字：栈里的旧路径要跟着更新。
+        let later = root.path().join("c.txt");
+        fs::rename(&renamed, &later).unwrap();
+        history.note_renamed(&renamed, &later);
+        assert_eq!(history.last_paths(), vec![original.clone(), later.clone()]);
+
+        // 产物被删掉：涉及它的记录要失效。
+        fs::remove_file(&later).unwrap();
+        history.note_removed(&later);
+        assert!(history.is_empty(), "记录涉及的路径消失后应被清理");
     }
 
     #[test]

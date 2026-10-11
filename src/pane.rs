@@ -61,6 +61,7 @@ gpui_kit::actions!(
         ClearSelection,
         NewFolder,
         Rename,
+        BulkRename,
         Trash,
         CopySelection,
         CutSelection,
@@ -91,6 +92,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", ClearSelection, context),
         KeyBinding::new("cmd-shift-n", NewFolder, context),
         KeyBinding::new("f2", Rename, context),
+        KeyBinding::new("cmd-shift-r", BulkRename, context),
         KeyBinding::new("cmd-backspace", Trash, context),
         KeyBinding::new("cmd-c", CopySelection, context),
         KeyBinding::new("cmd-x", CutSelection, context),
@@ -445,6 +447,12 @@ impl Pane {
         }
     }
 
+    fn request_bulk_rename(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        self.ops
+            .update(cx, |ops, cx| ops.request_bulk_rename(paths, cx));
+    }
+
     fn request_trash(&mut self, cx: &mut Context<Self>) {
         let paths = self.selected_paths();
         self.ops.update(cx, |ops, cx| ops.request_trash(paths, cx));
@@ -613,6 +621,13 @@ impl Pane {
                 .tooltip("重命名（F2）")
                 .disabled(selected != 1)
                 .on_click(cx.listener(|this, _, _, cx| this.request_rename(cx))),
+            Button::new("op-bulk-rename")
+                .icon(IconName::TextCursorInput)
+                .ghost()
+                .small()
+                .tooltip("批量重命名（Cmd+Shift+R）")
+                .disabled(selected < 2)
+                .on_click(cx.listener(|this, _, _, cx| this.request_bulk_rename(cx))),
             Button::new("op-trash")
                 .icon(IconName::Trash)
                 .ghost()
@@ -979,6 +994,7 @@ impl Pane {
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.clear_selection(cx)))
             .on_action(cx.listener(|this, _: &NewFolder, _, cx| this.request_new_folder(cx)))
             .on_action(cx.listener(|this, _: &Rename, _, cx| this.request_rename(cx)))
+            .on_action(cx.listener(|this, _: &BulkRename, _, cx| this.request_bulk_rename(cx)))
             .on_action(cx.listener(|this, _: &Trash, _, cx| this.request_trash(cx)))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.request_copy(cx)))
             .on_action(cx.listener(|this, _: &CutSelection, _, cx| this.request_cut(cx)))

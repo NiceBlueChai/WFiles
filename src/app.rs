@@ -16,12 +16,23 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
+use crate::bulk_rename::BulkRename;
 use crate::ops::ConflictPolicy;
 use crate::ops_entity::{Ops, OpsEvent, PendingAction};
 use crate::pane::{Pane, PaneEvent};
 use crate::session::Session;
 
 gpui_kit::actions!(wfiles, [NewTab, CloseTab, NextTab]);
+
+/// 批量重命名对话框里的五个输入框，随开随建、随关随毁。
+#[derive(Clone)]
+struct BulkInputs {
+    template: Entity<InputState>,
+    find: Entity<InputState>,
+    replace: Entity<InputState>,
+    start: Entity<InputState>,
+    step: Entity<InputState>,
+}
 
 /// 应用级快捷键：不依赖任何上下文，任何地方按下都生效。
 pub fn init(cx: &mut App) {
@@ -38,6 +49,8 @@ pub struct WFilesApp {
     active: usize,
     /// 输入对话框（新建文件夹/重命名）的输入框，随开随建。
     prompt_input: Option<Entity<InputState>>,
+    /// 批量重命名对话框的输入框组。
+    bulk_inputs: Option<BulkInputs>,
     /// 最近一次落盘的会话，用来判断要不要再写一次。
     saved_session: Session,
     /// 退出时存盘的订阅；必须一直持有，否则回调会被丢弃。
@@ -67,6 +80,7 @@ impl WFilesApp {
             tabs,
             active,
             prompt_input: None,
+            bulk_inputs: None,
             saved_session: Session::default(),
             quit_subscription: None,
             subscriptions: Vec::new(),
@@ -343,7 +357,87 @@ impl WFilesApp {
                     self.prompt_input = None;
                 }
             }
+            OpsEvent::BulkChanged { open } => {
+                if *open {
+                    if self.bulk_inputs.is_none() {
+                        self.create_bulk_inputs(window, cx);
+                    }
+                } else {
+                    self.bulk_inputs = None;
+                }
+            }
         }
+    }
+
+    /// 建批量重命名对话框的五个输入框，任何一个变动都重算整批预览。
+    fn create_bulk_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rule = self
+            .ops
+            .read(cx)
+            .bulk()
+            .map(|bulk| bulk.rule.clone())
+            .unwrap_or_default();
+
+        let mut field = |initial: String,
+                     placeholder: &'static str,
+                     window: &mut Window,
+                     cx: &mut Context<Self>| {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(initial)
+                    .placeholder(placeholder)
+            });
+            self.subscriptions.push(cx.subscribe_in(
+                &input,
+                window,
+                |this, _, event: &InputEvent, _, cx| {
+                    // 失焦/聚焦不关心；只有内容变了才重算。
+                    if matches!(event, InputEvent::Change) {
+                        this.sync_bulk_rule(cx);
+                    }
+                },
+            ));
+            input
+        };
+
+        let template = field(rule.template.clone(), "{name}{ext}", window, cx);
+        let find = field(rule.find.clone(), "查找（可留空）", window, cx);
+        let replace = field(rule.replace_with.clone(), "替换为（可留空）", window, cx);
+        let start = field(rule.start.to_string(), "1", window, cx);
+        let step = field(rule.step.to_string(), "1", window, cx);
+
+        self.bulk_inputs = Some(BulkInputs {
+            template,
+            find,
+            replace,
+            start,
+            step,
+        });
+        if let Some(inputs) = self.bulk_inputs.as_ref() {
+            inputs.template.update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
+    /// 把五个输入框的当前内容收成一套规则，交给 ops 重算预览。
+    fn sync_bulk_rule(&mut self, cx: &mut Context<Self>) {
+        let Some(inputs) = self.bulk_inputs.as_ref() else {
+            return;
+        };
+        let value = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        let rule = BulkRename {
+            template: value(&inputs.template),
+            find: value(&inputs.find),
+            replace_with: value(&inputs.replace),
+            // 序号解析不出来就退回默认值，输入过程中的中间态不该报错。
+            start: value(&inputs.start).trim().parse().unwrap_or(1),
+            step: value(&inputs.step).trim().parse().unwrap_or(1).max(1),
+        };
+        self.ops.update(cx, |ops, cx| ops.set_bulk_rule(rule, cx));
+    }
+
+    fn dismiss_bulk(&mut self, cx: &mut Context<Self>) {
+        self.ops.update(cx, |ops, cx| ops.dismiss_bulk(cx));
+        self.bulk_inputs = None;
     }
 
     fn dismiss_prompt(&mut self, cx: &mut Context<Self>) {
@@ -525,6 +619,7 @@ impl WFilesApp {
     /// 点遮罩等于取消；卡片内部的点击不会传到遮罩上。
     fn overlay_card(
         title: String,
+        width: Pixels,
         cx: &mut Context<Self>,
         body: AnyElement,
         footer: AnyElement,
@@ -543,7 +638,7 @@ impl WFilesApp {
             }))
             .child(
                 v_flex()
-                    .w(px(420.))
+                    .w(width)
                     .gap_4()
                     .p_5()
                     .rounded(cx.theme().radius)
@@ -582,6 +677,7 @@ impl WFilesApp {
 
         Self::overlay_card(
             confirm.title,
+            px(420.),
             cx,
             body,
             h_flex().gap_2().child(cancel).child(ok).into_any_element(),
@@ -646,6 +742,7 @@ impl WFilesApp {
 
         Self::overlay_card(
             "名称冲突".to_string(),
+            px(460.),
             cx,
             body,
             h_flex()
@@ -712,10 +809,141 @@ impl WFilesApp {
 
         Self::overlay_card(
             prompt.title,
+            px(420.),
             cx,
             body.into_any_element(),
             h_flex().gap_2().child(cancel).child(ok).into_any_element(),
             |this, _, cx| this.dismiss_prompt(cx),
+        )
+    }
+
+    /// 批量重命名：规则输入 + 实时预览列表，确认后才落盘。
+    fn render_bulk(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(bulk) = self.ops.read(cx).bulk().cloned() else {
+            return div().into_any_element();
+        };
+        let Some(inputs) = self.bulk_inputs.clone() else {
+            return div().into_any_element();
+        };
+
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+
+        let labeled = |label: &'static str, input: &Entity<InputState>| {
+            v_flex()
+                .gap_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(label),
+                )
+                .child(Input::new(input).w_full())
+        };
+
+        let rules = h_flex()
+            .gap_3()
+            .items_end()
+            .child(labeled("名字模板", &inputs.template).w(px(260.)))
+            .child(labeled("查找", &inputs.find).w(px(120.)))
+            .child(labeled("替换为", &inputs.replace).w(px(120.)))
+            .child(labeled("起始序号", &inputs.start).w(px(80.)))
+            .child(labeled("步长", &inputs.step).w(px(70.)));
+
+        // 预览列表：旧名 -> 新名，跳过/冲突的标出来。
+        let rows = bulk.previews.iter().enumerate().map(|(index, item)| {
+            let status: AnyElement = if let Some(error) = &item.error {
+                div().text_xs().text_color(danger).child(error.clone()).into_any_element()
+            } else if item.collision {
+                div().text_xs().text_color(danger).child("名称冲突").into_any_element()
+            } else if item.unchanged {
+                div().text_xs().text_color(muted).child("无变化").into_any_element()
+            } else {
+                div().text_xs().text_color(muted).child("将执行").into_any_element()
+            };
+
+            h_flex()
+                .id(("bulk-row", index))
+                .w_full()
+                .gap_2()
+                .items_center()
+                .py_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .child(item.old_name.clone()),
+                )
+                .child(Icon::new(IconName::ArrowRight).size_3().text_color(muted))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .child(item.new_name.clone()),
+                )
+                .child(div().flex_shrink_0().w(px(64.)).child(status))
+        });
+
+        let executable = crate::bulk_rename::executable_count(&bulk.previews);
+        let total = bulk.previews.len();
+
+        let body = v_flex()
+            .gap_3()
+            .child(rules)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("占位符：{name} 原主干 · {ext} 原扩展名（含点）· {n} 序号"),
+            )
+            .child(
+                div()
+                    .id("bulk-preview")
+                    .max_h(px(280.))
+                    .overflow_y_scroll()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .p_2()
+                    .child(
+                        v_flex().gap_1().children(rows),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!("共 {total} 项，其中 {executable} 项会被执行")),
+            )
+            .into_any_element();
+
+        let cancel = Button::new("bulk-cancel")
+            .label("取消")
+            .ghost()
+            .on_click(cx.listener(|this, _, _, cx| this.dismiss_bulk(cx)))
+            .into_any_element();
+        let ok = Button::new("bulk-ok")
+            .label("执行重命名")
+            .primary()
+            .disabled(executable == 0)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.ops
+                    .update(cx, |ops, cx| ops.apply_bulk_rename(cx))
+            }))
+            .into_any_element();
+
+        Self::overlay_card(
+            format!("批量重命名（{total} 项）"),
+            px(620.),
+            cx,
+            body,
+            h_flex().gap_2().child(cancel).child(ok).into_any_element(),
+            |this, _, cx| this.dismiss_bulk(cx),
         )
     }
 }
@@ -724,7 +952,8 @@ impl Render for WFilesApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_overlay = self.ops.read(cx).confirm().is_some()
             || self.ops.read(cx).conflict().is_some()
-            || self.ops.read(cx).prompt().is_some();
+            || self.ops.read(cx).prompt().is_some()
+            || self.ops.read(cx).bulk().is_some();
 
         let mut root = v_flex()
             .size_full()
@@ -749,9 +978,11 @@ impl Render for WFilesApp {
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)));
 
         if has_overlay {
-            // 一次只显示一层：冲突 > 输入 > 确认。
+            // 一次只显示一层：冲突 > 批量 > 输入 > 确认。
             let overlay = if self.ops.read(cx).conflict().is_some() {
                 self.render_conflict(cx)
+            } else if self.ops.read(cx).bulk().is_some() {
+                self.render_bulk(cx)
             } else if self.ops.read(cx).prompt().is_some() {
                 self.render_prompt(cx)
             } else {

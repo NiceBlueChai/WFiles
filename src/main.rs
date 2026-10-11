@@ -1,4 +1,5 @@
 mod app;
+mod bulk_rename;
 mod format;
 mod model;
 mod ops;
