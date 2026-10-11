@@ -22,6 +22,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{AsyncApp, Size, Task, WeakEntity, *};
 
+use crate::clipboard;
 use crate::format;
 use crate::model::{Listing, Selection, Sort, SortKey};
 use crate::ops_entity::{Ops, OpsEvent};
@@ -65,6 +66,8 @@ gpui_kit::actions!(
         Trash,
         CopySelection,
         CutSelection,
+        CopyPath,
+        CopyFileName,
         Paste,
         Undo,
     ]
@@ -96,6 +99,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-backspace", Trash, context),
         KeyBinding::new("cmd-c", CopySelection, context),
         KeyBinding::new("cmd-x", CutSelection, context),
+        KeyBinding::new("cmd-alt-c", CopyPath, context),
+        KeyBinding::new("cmd-shift-c", CopyFileName, context),
         KeyBinding::new("cmd-v", Paste, context),
         KeyBinding::new("cmd-z", Undo, context),
     ]);
@@ -473,6 +478,34 @@ impl Pane {
         self.ops.update(cx, |ops, cx| ops.request_paste(dest, cx));
     }
 
+    /// 复制完整路径：多个选中项每行一个，直接可粘到终端里。
+    fn copy_paths(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(clipboard::clipboard_text(
+            &paths,
+            clipboard::ClipboardText::FullPath,
+        )));
+        self.status = format!("已复制 {} 个路径", paths.len());
+        cx.notify();
+    }
+
+    /// 只复制文件名，适合贴到文档里列清单。
+    fn copy_file_names(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(clipboard::clipboard_text(
+            &paths,
+            clipboard::ClipboardText::NameOnly,
+        )));
+        self.status = format!("已复制 {} 个文件名", paths.len());
+        cx.notify();
+    }
+
     fn request_undo(&mut self, cx: &mut Context<Self>) {
         self.ops.update(cx, |ops, cx| ops.request_undo(cx));
     }
@@ -649,6 +682,20 @@ impl Pane {
                 .tooltip("剪切（Cmd+X）")
                 .disabled(selected == 0)
                 .on_click(cx.listener(|this, _, _, cx| this.request_cut(cx))),
+            Button::new("op-copy-path")
+                .icon(IconName::Link)
+                .ghost()
+                .small()
+                .tooltip("复制路径（Cmd+Alt+C）")
+                .disabled(selected == 0)
+                .on_click(cx.listener(|this, _, _, cx| this.copy_paths(cx))),
+            Button::new("op-copy-name")
+                .icon(IconName::Signature)
+                .ghost()
+                .small()
+                .tooltip("复制文件名（Cmd+Shift+C）")
+                .disabled(selected == 0)
+                .on_click(cx.listener(|this, _, _, cx| this.copy_file_names(cx))),
             Button::new("op-paste")
                 .icon(IconName::ClipboardPaste)
                 .ghost()
@@ -998,6 +1045,8 @@ impl Pane {
             .on_action(cx.listener(|this, _: &Trash, _, cx| this.request_trash(cx)))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.request_copy(cx)))
             .on_action(cx.listener(|this, _: &CutSelection, _, cx| this.request_cut(cx)))
+            .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.copy_paths(cx)))
+            .on_action(cx.listener(|this, _: &CopyFileName, _, cx| this.copy_file_names(cx)))
             .on_action(cx.listener(|this, _: &Paste, _, cx| this.request_paste(cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.request_undo(cx)))
             .child(self.render_header(cx))
@@ -1171,3 +1220,4 @@ fn detail_row(label: &str, value: String, cx: &App) -> impl IntoElement {
         )
         .child(div().text_sm().truncate().child(value))
 }
+

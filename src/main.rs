@@ -1,5 +1,6 @@
 mod app;
 mod bulk_rename;
+mod clipboard;
 mod format;
 mod model;
 mod ops;
