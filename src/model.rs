@@ -75,7 +75,10 @@ impl FileEntry {
 }
 
 /// 可以排序的列。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// 派生 `Serialize` 是为了让"每个目录记住排序"能落盘。
+/// 以后加列时注意：旧配置里没有的字段必须还能读出来。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortKey {
     #[default]
     Name,
@@ -84,9 +87,13 @@ pub enum SortKey {
     Kind,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 pub struct Sort {
+    #[serde(default)]
     pub key: SortKey,
+    #[serde(default)]
     pub descending: bool,
 }
 

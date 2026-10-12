@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::app::WFilesApp;
+use crate::model::{Sort, SortKey};
 use crate::session::Session;
 use crate::settings::Settings;
 use crate::terminal;
@@ -266,6 +267,111 @@ fn command_palette_sets_and_persists_the_default_terminal(cx: &mut TestAppContex
     let saved = Settings::load_from(&session.path().join("settings.json"))
         .expect("设置应该已经落盘");
     assert_eq!(saved.terminal, expected);
+}
+
+/// 当前列表里前几行的名字，用来断言排序结果。
+fn row_names(window: &mut gpui_kit::Window) -> Vec<String> {
+    let mut names = Vec::new();
+    // 下标必须是 usize：ElementId 只认 `(&str, usize)`，
+    // 让编译器自己推断会落到 i32 上。
+    for position in 0usize..16 {
+        let Some(row) = window.try_find(("row-name", position)) else {
+            break;
+        };
+        names.push(row.label().unwrap_or_default().to_string());
+    }
+    names
+}
+
+#[gpui_kit::test]
+fn a_folder_keeps_its_sort_between_visits(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    // 名字顺序和大小顺序故意相反：这样"记住了排序"和"默认按名字"一眼能分开。
+    for (name, length) in [("a.txt", 300usize), ("b.txt", 100), ("c.txt", 200)] {
+        std::fs::write(dir.path().join(name), "x".repeat(length)).unwrap();
+    }
+    let (session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(row_names(window), ["a.txt", "b.txt", "c.txt"], "默认是按名字");
+    });
+
+    // 点"大小"表头，改成按大小升序。
+    step(cx, handle, |window, cx| {
+        window.click(("header", 1usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(row_names(window), ["b.txt", "c.txt", "a.txt"]);
+    });
+
+    // 这个目录的排序应该已经写进设置了。
+    let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置应该落盘");
+    assert_eq!(
+        saved.view_for(dir.path()),
+        Some(Sort {
+            key: SortKey::Size,
+            descending: false
+        })
+    );
+}
+
+#[gpui_kit::test]
+fn a_remembered_sort_is_applied_when_the_folder_opens(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, length) in [("a.txt", 300usize), ("b.txt", 100), ("c.txt", 200)] {
+        std::fs::write(dir.path().join(name), "x".repeat(length)).unwrap();
+    }
+
+    // 预先埋一份"上次来过，按大小降序"的设置，再看打开时有没有套用。
+    let session = isolate_session();
+    let mut seeded = Settings::default();
+    seeded.remember_view(
+        dir.path().to_path_buf(),
+        Sort {
+            key: SortKey::Size,
+            descending: true,
+        },
+    );
+    seeded
+        .save_to(&session.path().join("settings.json"))
+        .expect("写测试设置");
+    Session {
+        tabs: vec![dir.path().to_path_buf()],
+        active: 0,
+    }
+    .save_to(&session.path().join("session.json"))
+    .expect("写测试会话");
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            row_names(window),
+            ["a.txt", "c.txt", "b.txt"],
+            "打开这个目录时应该套用记住的排序"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_window_layout_is_remembered(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (session, handle) = open_in(cx, dir.path());
+
+    // 渲染第一帧就会记下窗口位置尺寸。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+    });
+
+    let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置应该落盘");
+    let layout = saved.layout.expect("应该记下了窗口布局");
+    assert!(layout.usable(), "记下来的这份得真能用：{layout:?}");
+    assert!(
+        (layout.width - 1180.).abs() < 1. && (layout.height - 760.).abs() < 1.,
+        "测试窗口是 1180×760，实际记下的是 {layout:?}"
+    );
 }
 
 #[gpui_kit::test]

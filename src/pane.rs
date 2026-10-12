@@ -244,6 +244,7 @@ impl Pane {
         pane.sync_row_sizes();
         pane.update_status();
         pane.start_watching(cx);
+        pane.apply_remembered_sort(cx);
         // 一打开就能用方向键，不需要先点一下列表。
         pane.focus.focus(window, cx);
         pane
@@ -261,6 +262,13 @@ impl Pane {
     /// 还有没有上一级可去（根目录就没有）。
     pub fn has_parent(&self) -> bool {
         self.listing.path().parent().is_some()
+    }
+
+    /// 套用这个目录上次记住的排序；没去过就保持原样。
+    fn apply_remembered_sort(&mut self, cx: &mut Context<Self>) {
+        if let Some(sort) = Settings::read(cx).view_for(self.listing.path()) {
+            self.listing.set_sort(sort);
+        }
     }
 
     fn on_filter_changed(&mut self, cx: &mut Context<Self>) {
@@ -316,9 +324,9 @@ impl Pane {
                     self.back.push(self.listing.path().to_path_buf());
                     self.forward.clear();
                 }
-                let sort = self.listing.sort();
                 self.listing = listing;
-                self.listing.set_sort(sort);
+                // 这个目录上次用什么排序就还用什么；没去过的地方沿用当前的。
+                self.apply_remembered_sort(cx);
                 self.selection.clear();
                 self.error = None;
                 self.clear_filter(window, cx);
@@ -407,6 +415,10 @@ impl Pane {
 
     fn toggle_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
         self.listing.toggle_sort(key);
+        // 记住这个目录的排序：下次回到这里还是这个顺序。
+        let path = self.listing.path().to_path_buf();
+        let sort = self.listing.sort();
+        Settings::update(cx, |settings| settings.remember_view(path, sort));
         self.sync_row_sizes();
         // 选中项按路径记，换排序之后还是原来那批文件；只把光标那行滚回视野。
         if let Some(position) = self.selection.focus_position(&self.listing) {
@@ -1017,6 +1029,9 @@ impl Pane {
 
         let cell = div()
             .id(("header", index))
+            // 让表头在集成测试里可被定位与点击。
+            .test_support()
+            .aria_label(label.to_string())
             .h_full()
             .flex()
             .items_center()
@@ -1095,7 +1110,12 @@ impl Pane {
             .selected(is_selected)
             .accessibility_label(name.clone())
             .child(
+                // `ListItem` 不是可观察元素，观测挂在内层容器上：
+                // 集成测试靠它读出"第几行是哪个文件"，从而断言排序结果。
                 h_flex()
+                    .id(("row-name", position))
+                    .test_support()
+                    .aria_label(name.clone())
                     .w_full()
                     .gap_3()
                     .child(

@@ -23,7 +23,7 @@ use crate::palette::{self, Command as PaletteCommand};
 use crate::pane::{Pane, PaneCommand, PaneEvent};
 use crate::session::Session;
 use crate::thumbnails::Thumbnails;
-use crate::settings::Settings;
+use crate::settings::{Layout, Settings};
 use crate::terminal;
 
 gpui_kit::actions!(wfiles, [NewTab, CloseTab, NextTab, TogglePalette]);
@@ -94,6 +94,8 @@ pub struct WFilesApp {
     palette_input: Option<Entity<InputState>>,
     /// 最近一次落盘的会话，用来判断要不要再写一次。
     saved_session: Session,
+    /// 当前窗口的位置与尺寸，退出时存进设置。
+    layout: Option<Layout>,
     /// 退出时存盘的订阅；必须一直持有，否则回调会被丢弃。
     quit_subscription: Option<Subscription>,
     subscriptions: Vec<Subscription>,
@@ -133,6 +135,7 @@ impl WFilesApp {
             palette: None,
             palette_input: None,
             saved_session: Session::default(),
+            layout: None,
             quit_subscription: None,
             subscriptions: Vec::new(),
         };
@@ -154,10 +157,38 @@ impl WFilesApp {
         // 退出前再存一次，覆盖“最后一次导航还没来得及落盘”的窗口。
         app.quit_subscription = Some(cx.on_app_quit(|this, cx| {
             this.sync_session(cx);
+            this.save_layout(cx);
             std::future::ready(())
         }));
 
         app
+    }
+
+    /// 记下窗口现在的位置与尺寸。
+    ///
+    /// 在渲染时取而不是等到退出时：退出回调拿不到 `Window`，
+    /// 而渲染每一帧都有窗口句柄，顺便读一下是零成本的。
+    fn capture_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = window.window_bounds().get_bounds();
+        let layout = Layout {
+            x: bounds.origin.x.as_f32(),
+            y: bounds.origin.y.as_f32(),
+            width: bounds.size.width.as_f32(),
+            height: bounds.size.height.as_f32(),
+        };
+
+        // 只在真的变了的时候写盘：拖动窗口不会每一帧落一次文件，
+        // 但崩溃退出也不会丢掉布局（不必等到正常的退出流程）。
+        if self.layout != Some(layout) {
+            self.layout = Some(layout);
+            Settings::update(cx, |settings| settings.layout = Some(layout));
+        }
+    }
+
+    /// 退出前把布局写进设置。记不下来无所谓，下次用默认尺寸。
+    fn save_layout(&self, cx: &mut App) {
+        let layout = self.layout;
+        Settings::update(cx, |settings| settings.layout = layout);
     }
 
     fn initial_dir() -> PathBuf {
@@ -1479,7 +1510,8 @@ impl WFilesApp {
 }
 
 impl Render for WFilesApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.capture_layout(window, cx);
         let has_overlay = self.ops.read(cx).confirm().is_some()
             || self.ops.read(cx).conflict().is_some()
             || self.ops.read(cx).prompt().is_some()

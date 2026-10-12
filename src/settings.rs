@@ -12,14 +12,77 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::Sort;
 use crate::terminal;
 
+/// 最多记住多少个目录的视图。
+///
+/// 上限不是怕内存（一项才几十字节），是怕配置文件无限膨胀：
+/// 一个天天在几万个目录里乱逛的人不该背着一个几 MB 的 settings.json。
+const MAX_FOLDER_VIEWS: usize = 500;
+
 /// 需要跨重启记住的偏好。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// 只 PartialEq 不 Eq：Layout 里是像素坐标（f32），浮点没有 Eq。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// 打开终端用哪个程序；`terminal::AUTO` 表示跟着系统走。
     #[serde(default = "default_terminal")]
     pub terminal: String,
+    /// 每个目录记住的视图。最近用过的排在最前面。
+    #[serde(default)]
+    pub folder_views: Vec<FolderView>,
+    /// 上次退出时的窗口位置与尺寸。
+    #[serde(default)]
+    pub layout: Option<Layout>,
+}
+
+/// 一个目录记住的视图设置。
+///
+/// 目前只有排序——等有了网格/Miller 视图和可拖动列宽，往这里加字段就行，
+/// 读取侧不必改（旧配置缺字段会走 `Default`）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderView {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub sort: Sort,
+}
+
+/// 工作区布局：窗口左上角与尺寸，单位像素。
+///
+/// 存成四个数字而不是 `WindowBounds`：那个枚举带最大化/全屏状态，
+/// 序列化它会把 UI 框架的类型钉死在磁盘格式上。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Layout {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Layout {
+    /// 最小可用尺寸：再小就装不下工具栏加一行列表了。
+    const MIN_WIDTH: f32 = 480.;
+    const MIN_HEIGHT: f32 = 320.;
+
+    /// 这份布局还能用吗。
+    ///
+    /// 用户可能换了显示器、拔了外接屏、或者手改了配置文件：
+    /// 一份把窗口放到屏幕外的布局会让应用"打不开"，
+    /// 而这正是最难自己排查的故障。宁可退回默认尺寸。
+    pub fn usable(&self) -> bool {
+        let finite = [self.x, self.y, self.width, self.height]
+            .iter()
+            .all(|value| value.is_finite());
+        if !finite {
+            return false;
+        }
+        if self.width < Self::MIN_WIDTH || self.height < Self::MIN_HEIGHT {
+            return false;
+        }
+        // 至少得有一部分落在"第一块屏幕（原点在左上）"里。
+        // 外接屏在左边时 x 可以是负的，所以只要求右侧/下侧还看得见。
+        self.x + self.width > 160. && self.y + self.height > 120. && self.x < 20_000. && self.y < 20_000.
+    }
 }
 
 fn default_terminal() -> String {
@@ -33,6 +96,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             terminal: default_terminal(),
+            folder_views: Vec::new(),
+            layout: None,
         }
     }
 }
@@ -61,6 +126,27 @@ impl Settings {
             let _ = settings.save();
             result
         })
+    }
+
+    /// 这个目录上次用的排序；没记住过就是 `None`，由调用方决定默认值。
+    pub fn view_for(&self, path: &Path) -> Option<Sort> {
+        self.folder_views
+            .iter()
+            .find(|view| view.path == path)
+            .map(|view| view.sort)
+    }
+
+    /// 记住这个目录的排序。
+    ///
+    /// 同一个目录再来就更新并挪到最前面，超过上限丢最久没用的那个——
+    /// 这是"最近用过的目录"，不是"去过的所有目录"。
+    pub fn remember_view(&mut self, path: PathBuf, sort: Sort) {
+        if let Some(position) = self.folder_views.iter().position(|view| view.path == path) {
+            self.folder_views.remove(position);
+        } else if self.folder_views.len() >= MAX_FOLDER_VIEWS {
+            self.folder_views.pop();
+        }
+        self.folder_views.insert(0, FolderView { path, sort });
     }
 
     pub fn file_path() -> Option<PathBuf> {
@@ -101,18 +187,148 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SortKey;
+
+    fn settings() -> Settings {
+        Settings {
+            terminal: "iterm".to_string(),
+            ..Settings::default()
+        }
+    }
+
+    fn sort_by(key: SortKey) -> Sort {
+        Sort {
+            key,
+            descending: true,
+        }
+    }
 
     #[test]
     fn roundtrip_preserves_the_terminal_choice() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("nested").join("settings.json");
 
-        let settings = Settings {
-            terminal: "iterm".to_string(),
-        };
+        let settings = settings();
         settings.save_to(&path).unwrap();
 
         assert_eq!(Settings::load_from(&path), Some(settings));
+    }
+
+    #[test]
+    fn a_remembered_sort_comes_back_for_that_folder() {
+        let mut stored = Settings::default();
+        let downloads = PathBuf::from("/Users/me/Downloads");
+        let projects = PathBuf::from("/Users/me/Projects");
+
+        stored.remember_view(downloads.clone(), sort_by(SortKey::Modified));
+        stored.remember_view(projects.clone(), sort_by(SortKey::Name));
+
+        assert_eq!(stored.view_for(&downloads), Some(sort_by(SortKey::Modified)));
+        assert_eq!(stored.view_for(&projects), Some(sort_by(SortKey::Name)));
+        assert_eq!(
+            stored.view_for(&PathBuf::from("/Users/me/Music")),
+            None,
+            "没去过的地方就该说没记住"
+        );
+    }
+
+    #[test]
+    fn remembering_twice_updates_instead_of_duplicating() {
+        let mut stored = Settings::default();
+        let path = PathBuf::from("/a");
+        stored.remember_view(path.clone(), sort_by(SortKey::Name));
+        stored.remember_view(path.clone(), sort_by(SortKey::Size));
+
+        assert_eq!(stored.folder_views.len(), 1);
+        assert_eq!(stored.view_for(&path), Some(sort_by(SortKey::Size)));
+    }
+
+    #[test]
+    fn the_most_recent_folder_stays_at_the_front() {
+        let mut stored = Settings::default();
+        stored.remember_view(PathBuf::from("/a"), Sort::default());
+        stored.remember_view(PathBuf::from("/b"), Sort::default());
+        // 再回一次 /a：它该重新排到最前面。
+        stored.remember_view(PathBuf::from("/a"), Sort::default());
+
+        assert_eq!(stored.folder_views[0].path, PathBuf::from("/a"));
+        assert_eq!(stored.folder_views.len(), 2);
+    }
+
+    #[test]
+    fn the_view_list_stops_growing() {
+        let mut stored = Settings::default();
+        for index in 0..MAX_FOLDER_VIEWS + 50 {
+            stored.remember_view(PathBuf::from(format!("/d{index}")), Sort::default());
+        }
+
+        assert_eq!(stored.folder_views.len(), MAX_FOLDER_VIEWS);
+        assert_eq!(
+            stored.folder_views[0].path,
+            PathBuf::from(format!("/d{}", MAX_FOLDER_VIEWS + 49)),
+            "最后去的那个要在最前面"
+        );
+        assert!(
+            stored.view_for(&PathBuf::from("/d0")).is_none(),
+            "最早去过的应该被挤掉"
+        );
+    }
+
+    #[test]
+    fn folder_views_survive_the_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        let mut stored = settings();
+        stored.remember_view(PathBuf::from("/Users/me/Downloads"), sort_by(SortKey::Modified));
+        stored.layout = Some(Layout {
+            x: 10.,
+            y: 20.,
+            width: 1180.,
+            height: 760.,
+        });
+
+        stored.save_to(&path).unwrap();
+        let loaded = Settings::load_from(&path).expect("读回来");
+
+        assert_eq!(
+            loaded.view_for(&PathBuf::from("/Users/me/Downloads")),
+            Some(sort_by(SortKey::Modified))
+        );
+        assert_eq!(loaded.layout, stored.layout);
+    }
+
+    #[test]
+    fn a_layout_that_would_hide_the_window_is_rejected() {
+        let sane = Layout {
+            x: 100.,
+            y: 100.,
+            width: 1180.,
+            height: 760.,
+        };
+        assert!(sane.usable());
+
+        let tiny = Layout {
+            width: 10.,
+            height: 10.,
+            ..sane
+        };
+        assert!(!tiny.usable(), "10×10 的窗口等于没开");
+
+        let offscreen = Layout {
+            x: -40_000.,
+            ..sane
+        };
+        assert!(!offscreen.usable(), "整个跑到屏幕外的窗口等于没开");
+
+        // 外接屏在主屏左边时 x 是负的，只要还有一部分看得见就该接受。
+        let partly_offscreen = Layout { x: -600., ..sane };
+        assert!(partly_offscreen.usable());
+
+        let nonsense = Layout {
+            x: f32::NAN,
+            ..sane
+        };
+        assert!(!nonsense.usable(), "NaN 不能算能用");
     }
 
     #[test]
