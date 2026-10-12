@@ -3172,6 +3172,32 @@ fn switching_to_s3_reveals_the_region_field(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn switching_to_sftp_reveals_the_key_field(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    open_connect_dialog(cx, handle);
+
+    // 只有 SFTP 能用私钥登录，别的协议摆这一栏是纯噪音。
+    let before = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.try_find("connect-key").is_some()
+    });
+    assert!(!before, "WebDAV 时不该问私钥");
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("connect-kind-sftp", cx);
+    });
+
+    let after = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.try_find("connect-key").is_some()
+    });
+    assert!(after, "切到 SFTP 之后该能填私钥文件");
+}
+
+#[gpui_kit::test]
 fn pasting_into_a_remote_folder_uploads_over_http(cx: &mut TestAppContext) {
     let _session = isolate_session();
     let root = tempfile::tempdir().expect("临时目录");

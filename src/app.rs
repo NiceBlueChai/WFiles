@@ -125,6 +125,8 @@ struct ConnectState {
     password: Entity<InputState>,
     /// 地区。只有 S3 用得上，其余协议这一栏不显示。
     region: Entity<InputState>,
+    /// 私钥文件的路径。只有 SFTP 用得上，其余协议这一栏不显示。
+    key: Entity<InputState>,
     /// 正在后台试连：按钮变灰，也不再重复发起。
     busy: bool,
     /// 上一次试连失败的原因。
@@ -157,6 +159,7 @@ fn kind_id(kind: RemoteKind) -> String {
     match kind {
         RemoteKind::WebDav => "connect-kind-webdav".to_string(),
         RemoteKind::S3 => "connect-kind-s3".to_string(),
+        RemoteKind::Sftp => "connect-kind-sftp".to_string(),
         RemoteKind::Ftp => "connect-kind-ftp".to_string(),
     }
 }
@@ -985,6 +988,7 @@ impl WFilesApp {
         let user = field("用户名（可留空）", window, cx);
         let password = field("密码或应用专用密码", window, cx);
         let region = field("us-east-1", window, cx);
+        let key = field("~/.ssh/id_ed25519", window, cx);
         name.update(cx, |input, cx| input.focus(window, cx));
         self.connect = Some(ConnectState {
             kind: RemoteKind::WebDav,
@@ -993,6 +997,7 @@ impl WFilesApp {
             user,
             password,
             region,
+            key,
             busy: false,
             error: None,
         });
@@ -1046,6 +1051,12 @@ impl WFilesApp {
                 region
             };
             config = config.with_region(region);
+        }
+        if state.kind.has_key() {
+            let key = state.key.read(cx).value().trim().to_string();
+            if !key.is_empty() {
+                config = config.with_key(key);
+            }
         }
 
         state.busy = true;
@@ -2916,6 +2927,18 @@ impl WFilesApp {
                     .id("connect-region")
                     .test_support()
                     .child(labeled("地区（MinIO 留空即可）", &state.region)),
+            );
+        }
+        // 私钥只有 SFTP 用：留空就用密码登录，填了就走密钥登录
+        // （这时候下面那栏密码是私钥的口令）。
+        // 私钥只有 SFTP 用：留空就用密码登录，填了就走密钥登录
+        // （这时候下面那栏密码是私钥的口令）。
+        if state.kind.has_key() {
+            body = body.child(
+                div()
+                    .id("connect-key")
+                    .test_support()
+                    .child(labeled(state.kind.key_label(), &state.key)),
             );
         }
         body = body.child(

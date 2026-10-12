@@ -24,6 +24,7 @@ mod ftp;
 mod remote;
 mod remotes;
 mod s3;
+mod sftp;
 mod search;
 mod search_entity;
 mod session;

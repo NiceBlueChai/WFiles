@@ -1,7 +1,7 @@
 //! 远程位置（P4）：连接配置、凭据存放，以及各协议的客户端。
 //!
-//! 已经实现三种：WebDAV（同时也是坚果云、Nextcloud、ownCloud 等一众网盘与
-//! 自建 NAS 的接入方式）、S3 兼容对象存储、明文 FTP。SFTP 按路线图排在其后。
+//! 已经实现四种：WebDAV（同时也是坚果云、Nextcloud、ownCloud 等一众网盘与
+//! 自建 NAS 的接入方式）、S3 兼容对象存储、SFTP、明文 FTP。
 //!
 //! 三条纪律：
 //! 1. **密码不进配置文件**。配置是明文 JSON，会被同步、会被贴到工单里；
@@ -25,17 +25,20 @@ pub enum Kind {
     /// S3 兼容对象存储：AWS S3、MinIO、Cloudflare R2、Backblaze B2，
     /// 以及各家云厂商的 S3 兼容端点。
     S3,
+    /// SFTP：SSH 上的文件传输。服务器几乎都是 Linux/NAS，也是唯一能用密钥登录的一种。
+    Sftp,
     /// 明文 FTP。FTPS 在路线图里明确不做。
     Ftp,
 }
 
 impl Kind {
-    pub const ALL: [Self; 3] = [Self::WebDav, Self::S3, Self::Ftp];
+    pub const ALL: [Self; 4] = [Self::WebDav, Self::S3, Self::Sftp, Self::Ftp];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::WebDav => "WebDAV",
             Self::S3 => "S3 对象存储",
+            Self::Sftp => "SFTP",
             Self::Ftp => "FTP",
         }
     }
@@ -45,6 +48,7 @@ impl Kind {
         match self {
             Self::WebDav => "https://dav.jianguoyun.com/dav/",
             Self::S3 => "https://s3.cn-north-1.amazonaws.com.cn/bucket/",
+            Self::Sftp => "sftp://192.168.1.10:22/home/me/",
             Self::Ftp => "ftp://127.0.0.1:21/",
         }
     }
@@ -54,6 +58,7 @@ impl Kind {
         match self {
             Self::WebDav => "用户名",
             Self::S3 => "Access Key ID",
+            Self::Sftp => "用户名",
             Self::Ftp => "用户名",
         }
     }
@@ -63,8 +68,19 @@ impl Kind {
         match self {
             Self::WebDav => "密码",
             Self::S3 => "Secret Access Key",
+            Self::Sftp => "密码（用私钥时填私钥口令）",
             Self::Ftp => "密码",
         }
+    }
+
+    /// 只有 SFTP 用得上私钥：另开一栏填私钥文件的路径，留空就用密码登录。
+    pub fn has_key(self) -> bool {
+        matches!(self, Self::Sftp)
+    }
+
+    /// 私钥那一栏叫什么。
+    pub fn key_label(self) -> &'static str {
+        "私钥文件（留空则用密码登录）"
     }
 }
 
@@ -85,6 +101,9 @@ pub struct Config {
     /// 进去之后先落在哪个子目录；空就是根。
     #[serde(default)]
     pub root: String,
+    /// 私钥文件的路径。只有 SFTP 用得上；留空就用密码登录。
+    #[serde(default)]
+    pub key: String,
     /// 地区。只有 S3 用得上（签名的一部分）；留空就按地址自己推。
     #[serde(default)]
     pub region: String,
@@ -99,8 +118,15 @@ impl Config {
             url,
             user,
             root: String::new(),
+            key: String::new(),
             region: String::new(),
         }
+    }
+
+    /// 指定私钥文件（SFTP 用）。
+    pub fn with_key(mut self, key: String) -> Self {
+        self.key = key;
+        self
     }
 
     /// 指定地区（S3 用）。
@@ -221,6 +247,7 @@ pub fn open(config: &Config, password: &str) -> Result<Client, String> {
     let client: Client = match config.kind {
         Kind::WebDav => std::sync::Arc::new(Dav::new(config, password)?),
         Kind::S3 => std::sync::Arc::new(crate::s3::S3::new(config, password)?),
+        Kind::Sftp => std::sync::Arc::new(crate::sftp::Sftp::new(config, password)?),
         Kind::Ftp => std::sync::Arc::new(crate::ftp::Ftp::new(config, password)?),
     };
     Ok(client)

@@ -48,6 +48,7 @@ cargo fmt --check
 | `src/query.rs` | 搜索查询的纯逻辑：一句话 → 条件树，以及"这个文件过不过"的判定 |
 | `src/remote.rs` | 远程位置的公共部分：连接配置、钥匙串存取、各协议统一的 `Remote` trait 与客户端出口、WebDAV 客户端、`dav://id/子路径` 的拼拆 |
 | `src/ftp.rs` | FTP 客户端（明文，不带 TLS）：绝对路径发命令、`Mutex` 锁住有状态的控制连接、复制绕本地临时文件、删目录先清空 |
+| `src/sftp.rs` | SFTP 客户端（russh + tokio）：known_hosts 认服务器公钥（换了就拒）、密码与私钥两种登录、复制绕本地临时文件、删目录不跟符号链接 |
 | `src/search.rs` | 后台搜索的纯逻辑：走目录、读文本、分批送结果、随时可中止 |
 | `src/search_entity.rs` | 搜索面板实体：输入 → 查询、结果列表、Enter 跳到那个文件 |
 | `src/term.rs` | 内嵌终端的纯逻辑：按键 → PTY 字节、屏幕与回滚、选中与取文本 |
