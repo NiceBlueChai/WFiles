@@ -53,7 +53,15 @@ impl Session {
         fs::rename(&temp, path).map_err(|error| error.to_string())
     }
 
+    /// 会话文件位置：优先 `WFILES_SESSION_DIR` 指向的目录，
+    /// 否则按平台惯例落到 state/config/home 下的 `WFiles/session.json`。
+    ///
+    /// 环境变量不是歪门邪道：便携安装、多开实例各存一份，
+    /// 以及集成测试要把会话隔到临时目录里，都靠它。
     fn file_path() -> Option<PathBuf> {
+        if let Some(dir) = session_dir_override() {
+            return Some(dir.join("session.json"));
+        }
         dirs::state_dir()
             .or_else(dirs::config_dir)
             .or_else(dirs::home_dir)
@@ -73,6 +81,13 @@ impl Session {
         }
         self
     }
+}
+
+/// 读取会话目录覆盖；空字符串视为没设置。
+fn session_dir_override() -> Option<PathBuf> {
+    let raw = std::env::var("WFILES_SESSION_DIR").ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
 #[cfg(test)]

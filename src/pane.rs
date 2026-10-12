@@ -114,6 +114,24 @@ pub enum PaneEvent {
 
 impl EventEmitter<PaneEvent> for Pane {}
 
+/// 窗格能执行的命令。命令面板、快捷键都走这一个入口，
+/// 以后加“可配置快捷键”只需要在这里补一条，不用再散着接。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneCommand {
+    NewFolder,
+    Rename,
+    BulkRename,
+    Trash,
+    Copy,
+    Cut,
+    Paste,
+    Undo,
+    Refresh,
+    GoUp,
+    CopyPath,
+    CopyFileName,
+}
+
 pub struct Pane {
     ops: Entity<Ops>,
     listing: Listing,
@@ -187,6 +205,16 @@ impl Pane {
 
     pub fn path(&self) -> &Path {
         self.listing.path()
+    }
+
+    /// 当前选中数量。命令面板据此决定哪些命令值得列出来。
+    pub fn selection_len(&self) -> usize {
+        self.selection.len()
+    }
+
+    /// 还有没有上一级可去（根目录就没有）。
+    pub fn has_parent(&self) -> bool {
+        self.listing.path().parent().is_some()
     }
 
     fn on_filter_changed(&mut self, cx: &mut Context<Self>) {
@@ -508,6 +536,29 @@ impl Pane {
 
     fn request_undo(&mut self, cx: &mut Context<Self>) {
         self.ops.update(cx, |ops, cx| ops.request_undo(cx));
+    }
+
+    /// 执行一条命令。窗口参数是因为部分命令要弹对话框/移动焦点。
+    pub fn run_command(
+        &mut self,
+        command: PaneCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            PaneCommand::NewFolder => self.request_new_folder(cx),
+            PaneCommand::Rename => self.request_rename(cx),
+            PaneCommand::BulkRename => self.request_bulk_rename(cx),
+            PaneCommand::Trash => self.request_trash(cx),
+            PaneCommand::Copy => self.request_copy(cx),
+            PaneCommand::Cut => self.request_cut(cx),
+            PaneCommand::Paste => self.request_paste(cx),
+            PaneCommand::Undo => self.request_undo(cx),
+            PaneCommand::Refresh => self.refresh(cx),
+            PaneCommand::GoUp => self.go_up(window, cx),
+            PaneCommand::CopyPath => self.copy_paths(cx),
+            PaneCommand::CopyFileName => self.copy_file_names(cx),
+        }
     }
 
     // ---- 目录监听与外部变更 ----
@@ -1034,21 +1085,45 @@ impl Pane {
             .on_action(cx.listener(|this, _: &PageDown, _, cx| this.move_page(1, cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
             .on_action(cx.listener(|this, _: &Open, window, cx| this.open_cursor(window, cx)))
-            .on_action(cx.listener(|this, _: &OpenParent, window, cx| this.go_up(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenParent, window, cx| {
+                this.run_command(PaneCommand::GoUp, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &GoBack, window, cx| this.go_back(window, cx)))
             .on_action(cx.listener(|this, _: &GoForward, window, cx| this.go_forward(window, cx)))
-            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
+            .on_action(cx.listener(|this, _: &Refresh, window, cx| {
+                this.run_command(PaneCommand::Refresh, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.clear_selection(cx)))
-            .on_action(cx.listener(|this, _: &NewFolder, _, cx| this.request_new_folder(cx)))
-            .on_action(cx.listener(|this, _: &Rename, _, cx| this.request_rename(cx)))
-            .on_action(cx.listener(|this, _: &BulkRename, _, cx| this.request_bulk_rename(cx)))
-            .on_action(cx.listener(|this, _: &Trash, _, cx| this.request_trash(cx)))
-            .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.request_copy(cx)))
-            .on_action(cx.listener(|this, _: &CutSelection, _, cx| this.request_cut(cx)))
-            .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.copy_paths(cx)))
-            .on_action(cx.listener(|this, _: &CopyFileName, _, cx| this.copy_file_names(cx)))
-            .on_action(cx.listener(|this, _: &Paste, _, cx| this.request_paste(cx)))
-            .on_action(cx.listener(|this, _: &Undo, _, cx| this.request_undo(cx)))
+            .on_action(cx.listener(|this, _: &NewFolder, window, cx| {
+                this.run_command(PaneCommand::NewFolder, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Rename, window, cx| {
+                this.run_command(PaneCommand::Rename, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &BulkRename, window, cx| {
+                this.run_command(PaneCommand::BulkRename, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Trash, window, cx| {
+                this.run_command(PaneCommand::Trash, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopySelection, window, cx| {
+                this.run_command(PaneCommand::Copy, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CutSelection, window, cx| {
+                this.run_command(PaneCommand::Cut, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyPath, window, cx| {
+                this.run_command(PaneCommand::CopyPath, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyFileName, window, cx| {
+                this.run_command(PaneCommand::CopyFileName, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Paste, window, cx| {
+                this.run_command(PaneCommand::Paste, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Undo, window, cx| {
+                this.run_command(PaneCommand::Undo, window, cx)
+            }))
             .child(self.render_header(cx))
             .child(self.render_list(cx))
             .child(self.render_status_bar(cx))

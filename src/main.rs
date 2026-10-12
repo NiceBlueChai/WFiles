@@ -5,9 +5,13 @@ mod format;
 mod model;
 mod ops;
 mod ops_entity;
+mod palette;
 mod pane;
 mod session;
 mod watch;
+
+#[cfg(test)]
+mod ui_tests;
 
 use app::WFilesApp;
 use gpui_kit::assets::Assets;

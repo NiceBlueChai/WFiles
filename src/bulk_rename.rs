@@ -7,6 +7,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// 成功改名的一组文件：原路径 → 新路径。
+pub type Renamed = Vec<(PathBuf, PathBuf)>;
+/// 失败的一组文件：原路径加上失败原因。
+pub type RenameFailures = Vec<(PathBuf, String)>;
+
 /// 一套批量重命名规则。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BulkRename {
@@ -170,9 +175,7 @@ pub fn executable_count(previews: &[BulkRenamePreview]) -> usize {
 /// 执行批量重命名。只动可执行的那些项，返回逐项结果。
 ///
 /// 成功的按 `(原路径, 新路径)` 返回，失败带上原因。
-pub fn apply(
-    previews: &[BulkRenamePreview],
-) -> (Vec<(PathBuf, PathBuf)>, Vec<(PathBuf, String)>) {
+pub fn apply(previews: &[BulkRenamePreview]) -> (Renamed, RenameFailures) {
     let mut renamed = Vec::new();
     let mut failed = Vec::new();
 

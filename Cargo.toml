@@ -31,4 +31,7 @@ taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
 
 [dev-dependencies]
+# test-support 打开 GPUI 的无头窗口与事件派发，
+# 只在 cargo test 时生效，不影响正式构建。
+gpui-kit = { version = "0.7.1", features = ["test-support"] }
 tempfile = "3.27.0"

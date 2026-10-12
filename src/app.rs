@@ -19,10 +19,11 @@ use gpui_kit::*;
 use crate::bulk_rename::BulkRename;
 use crate::ops::ConflictPolicy;
 use crate::ops_entity::{Ops, OpsEvent, PendingAction};
-use crate::pane::{Pane, PaneEvent};
+use crate::palette::{self, Command as PaletteCommand};
+use crate::pane::{Pane, PaneCommand, PaneEvent};
 use crate::session::Session;
 
-gpui_kit::actions!(wfiles, [NewTab, CloseTab, NextTab]);
+gpui_kit::actions!(wfiles, [NewTab, CloseTab, NextTab, TogglePalette]);
 
 /// 批量重命名对话框里的五个输入框，随开随建、随关随毁。
 #[derive(Clone)]
@@ -34,12 +35,42 @@ struct BulkInputs {
     step: Entity<InputState>,
 }
 
+/// 命令面板一条候选项：展示信息加上要执行的动作。
+#[derive(Clone)]
+struct PaletteItem {
+    command: PaletteCommand,
+    action: PaletteAction,
+}
+
+/// 面板能触发的动作。窗格内的操作转交给当前窗格，
+/// 应用级的（标签页）由应用自己处理。
+#[derive(Clone)]
+enum PaletteAction {
+    GoTo(PathBuf),
+    SwitchTab(usize),
+    Pane(PaneCommand),
+    NewTab,
+    CloseTab,
+    NextTab,
+}
+
+/// 命令面板的当前状态。候选项在打开时快照，
+/// 这样面板开着的时候改不到列表，行为可预测。
+struct PaletteState {
+    items: Vec<PaletteItem>,
+    /// 过滤后的下标，按相关度排序。
+    filtered: Vec<usize>,
+    selected: usize,
+}
+
+
 /// 应用级快捷键：不依赖任何上下文，任何地方按下都生效。
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-t", NewTab, None),
         KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("cmd-p", TogglePalette, None),
     ]);
 }
 
@@ -51,6 +82,9 @@ pub struct WFilesApp {
     prompt_input: Option<Entity<InputState>>,
     /// 批量重命名对话框的输入框组。
     bulk_inputs: Option<BulkInputs>,
+    /// 命令面板状态与输入框。
+    palette: Option<PaletteState>,
+    palette_input: Option<Entity<InputState>>,
     /// 最近一次落盘的会话，用来判断要不要再写一次。
     saved_session: Session,
     /// 退出时存盘的订阅；必须一直持有，否则回调会被丢弃。
@@ -81,6 +115,8 @@ impl WFilesApp {
             active,
             prompt_input: None,
             bulk_inputs: None,
+            palette: None,
+            palette_input: None,
             saved_session: Session::default(),
             quit_subscription: None,
             subscriptions: Vec::new(),
@@ -335,8 +371,8 @@ impl WFilesApp {
                         self.subscriptions.push(cx.subscribe_in(
                             &input,
                             window,
-                            |this, _, event: &InputEvent, _, cx| match event {
-                                InputEvent::PressEnter { .. } => {
+                            |this, _, event: &InputEvent, _, cx| {
+                                if let InputEvent::PressEnter { .. } = event {
                                     let value = this
                                         .prompt_input
                                         .as_ref()
@@ -348,7 +384,6 @@ impl WFilesApp {
                                 // 不在失焦时关闭：点“创建”按钮会让输入框先失焦，
                                 // 那时关掉对话框按钮就再也点不到了。关闭只认
                                 // 取消按钮和点遮罩。
-                                _ => {}
                             },
                         ));
                         self.prompt_input = Some(input);
@@ -440,6 +475,424 @@ impl WFilesApp {
         self.bulk_inputs = None;
     }
 
+    // ---- 命令面板 ----
+
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.close_palette(cx);
+        } else {
+            self.open_palette(window, cx);
+        }
+    }
+
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 别的弹层开着就别再叠一层，先关掉。
+        self.ops.update(cx, |ops, cx| ops.dismiss_prompt(cx));
+        self.prompt_input = None;
+        self.ops.update(cx, |ops, cx| ops.dismiss_bulk(cx));
+        self.bulk_inputs = None;
+        self.ops.update(cx, |ops, cx| ops.confirm_cancel(cx));
+        self.ops.update(cx, |ops, cx| ops.cancel_conflict(cx));
+
+        let items = self.build_palette_items(cx);
+        let commands: Vec<PaletteCommand> =
+            items.iter().map(|item| item.command.clone()).collect();
+        self.palette = Some(PaletteState {
+            items,
+            filtered: palette::filter(&commands, ""),
+            selected: 0,
+        });
+
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("搜索命令、位置或标签页")
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        // 注意用闭包自己的 window 参数，不能捕获外层的：
+        // subscribe_in 要求闭包 'static，捕获 &mut Window 会逃逸。
+        self.subscriptions.push(cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.sync_palette_filter(cx),
+                InputEvent::PressEnter { .. } => {
+                    this.confirm_palette(window, cx);
+                }
+                _ => {}
+            },
+        ));
+        self.palette_input = Some(input);
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, cx: &mut Context<Self>) {
+        self.palette = None;
+        self.palette_input = None;
+        cx.notify();
+    }
+
+    /// 查询词变了：重新过滤，选中项回到第一条。
+    fn sync_palette_filter(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.palette_input.as_ref() else {
+            return;
+        };
+        let query = input.read(cx).value().to_string();
+        let Some(state) = self.palette.as_mut() else {
+            return;
+        };
+        let commands: Vec<PaletteCommand> =
+            state.items.iter().map(|item| item.command.clone()).collect();
+        state.filtered = palette::filter(&commands, &query);
+        state.selected = 0;
+        cx.notify();
+    }
+
+    fn move_palette_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(state) = self.palette.as_mut() else {
+            return;
+        };
+        let count = state.filtered.len();
+        if count == 0 {
+            return;
+        }
+        let current = state.selected as i32;
+        // 取模保证在 0..count 里循环，负 delta 也能正确回绕。
+        let next = (current + delta).rem_euclid(count as i32);
+        state.selected = next as usize;
+        cx.notify();
+    }
+
+    fn confirm_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.palette.as_ref() else {
+            return;
+        };
+        let Some(&item_index) = state.filtered.get(state.selected) else {
+            return;
+        };
+        let action = state.items[item_index].action.clone();
+        self.run_palette_action(action, window, cx);
+    }
+
+    fn run_palette_action(
+        &mut self,
+        action: PaletteAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_palette(cx);
+        match action {
+            PaletteAction::GoTo(path) => self.navigate_active_tab(path, window, cx),
+            PaletteAction::SwitchTab(index) => {
+                if index < self.tabs.len() {
+                    self.active = index;
+                    self.sync_session(cx);
+                    cx.notify();
+                }
+            }
+            PaletteAction::Pane(command) => {
+                self.tabs[self.active]
+                    .update(cx, |pane, cx| pane.run_command(command, window, cx));
+            }
+            PaletteAction::NewTab => self.new_tab(window, cx),
+            PaletteAction::CloseTab => self.close_tab(self.active, window, cx),
+            PaletteAction::NextTab => self.next_tab(cx),
+        }
+    }
+
+    /// 当前这一刻能用的命令。选不中的、剪贴板空的、没得可撤的都不列，
+    /// 免得面板里躺着一堆按了没反应的项。
+    fn build_palette_items(&self, cx: &Context<Self>) -> Vec<PaletteItem> {
+        let mut items = Vec::new();
+
+        for command in [
+            PaneCommand::NewFolder,
+            PaneCommand::Rename,
+            PaneCommand::BulkRename,
+            PaneCommand::Trash,
+            PaneCommand::Copy,
+            PaneCommand::Cut,
+            PaneCommand::Paste,
+            PaneCommand::Undo,
+            PaneCommand::Refresh,
+            PaneCommand::GoUp,
+            PaneCommand::CopyPath,
+            PaneCommand::CopyFileName,
+        ] {
+            if !self.pane_command_enabled(command, cx) {
+                continue;
+            }
+            let (title, hint, keywords) = Self::describe_pane_command(command);
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("pane:{command:?}"),
+                    title,
+                    hint,
+                    "文件",
+                    keywords,
+                ),
+                action: PaletteAction::Pane(command),
+            });
+        }
+
+        let mut seen_paths: Vec<PathBuf> = Vec::new();
+        for (label, _, path) in Self::places() {
+            // 极端情况下两个位置可能指向同一个目录，跳过重复的，
+            // 免得元素 id 撞车。
+            if seen_paths.contains(&path) {
+                continue;
+            }
+            seen_paths.push(path.clone());
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("go:{}", path.display()),
+                    format!("前往{label}"),
+                    String::new(),
+                    "前往",
+                    "go 位置 打开 跳转",
+                ),
+                action: PaletteAction::GoTo(path),
+            });
+        }
+
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let path = tab.read(cx).path();
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let hint = if index == self.active { "当前" } else { "" };
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("tab:{index}"),
+                    format!("切换到标签页：{label}"),
+                    hint,
+                    "标签页",
+                    "tab 切换 窗口",
+                ),
+                action: PaletteAction::SwitchTab(index),
+            });
+        }
+
+        items.push(PaletteItem {
+            command: PaletteCommand::new("app:new-tab", "新建标签页", "Cmd+T", "标签页", "tab 新开"),
+            action: PaletteAction::NewTab,
+        });
+        items.push(PaletteItem {
+            command: PaletteCommand::new(
+                "app:close-tab",
+                "关闭标签页",
+                "Cmd+W",
+                "标签页",
+                "tab 关闭",
+            ),
+            action: PaletteAction::CloseTab,
+        });
+        items.push(PaletteItem {
+            command: PaletteCommand::new(
+                "app:next-tab",
+                "下一个标签页",
+                "Ctrl+Tab",
+                "标签页",
+                "tab 切换",
+            ),
+            action: PaletteAction::NextTab,
+        });
+
+        items
+    }
+
+    /// 这条命令此刻按下去有没有效果。
+    fn pane_command_enabled(&self, command: PaneCommand, cx: &Context<Self>) -> bool {
+        let pane = self.tabs[self.active].read(cx);
+        let selected = pane.selection_len();
+        match command {
+            PaneCommand::Rename => selected == 1,
+            PaneCommand::BulkRename => selected >= 2,
+            PaneCommand::Trash
+            | PaneCommand::Copy
+            | PaneCommand::Cut
+            | PaneCommand::CopyPath
+            | PaneCommand::CopyFileName => selected >= 1,
+            PaneCommand::Paste => !self.ops.read(cx).clipboard().paths.is_empty(),
+            PaneCommand::Undo => self.ops.read(cx).undo_label().is_some(),
+            PaneCommand::GoUp => pane.has_parent(),
+            _ => true,
+        }
+    }
+
+    fn describe_pane_command(command: PaneCommand) -> (&'static str, &'static str, &'static str) {
+        match command {
+            PaneCommand::NewFolder => ("新建文件夹", "Cmd+Shift+N", "folder 创建 目录"),
+            PaneCommand::Rename => ("重命名", "F2", "rename 改名"),
+            PaneCommand::BulkRename => ("批量重命名", "Cmd+Shift+R", "batch 序号 模板"),
+            PaneCommand::Trash => ("移到回收站", "Cmd+Backspace", "delete 删除 trash"),
+            PaneCommand::Copy => ("拷贝选中项", "Cmd+C", "copy"),
+            PaneCommand::Cut => ("剪切选中项", "Cmd+X", "cut 移动"),
+            PaneCommand::Paste => ("粘贴到当前目录", "Cmd+V", "paste"),
+            PaneCommand::Undo => ("撤销上一步操作", "Cmd+Z", "undo 恢复"),
+            PaneCommand::Refresh => ("刷新当前目录", "Cmd+R", "refresh 重新读取"),
+            PaneCommand::GoUp => ("前往上一级", "Backspace", "up parent 上级"),
+            PaneCommand::CopyPath => ("复制路径", "Cmd+Alt+C", "path 剪贴板"),
+            PaneCommand::CopyFileName => ("复制文件名", "Cmd+Shift+C", "name 剪贴板"),
+        }
+    }
+
+    /// 命令面板：顶部居中的搜索框 + 分组结果列表。
+    ///
+    /// 键盘走卡片自己的 `on_key_down`（冒泡阶段），不依赖快捷键表——
+    /// 输入框占着焦点，靠 keymap 的上下文优先级不可靠，
+    /// 而元素级回调一定会在输入框之后收到。
+    fn render_palette(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(state) = self.palette.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(input) = self.palette_input.clone() else {
+            return div().into_any_element();
+        };
+
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let radius = cx.theme().radius;
+        let selected_bg = cx.theme().muted;
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut current_group: Option<&str> = None;
+        for (row_index, &item_index) in state.filtered.iter().enumerate() {
+            let item = &state.items[item_index];
+            if current_group != Some(item.command.group.as_str()) {
+                current_group = Some(item.command.group.as_str());
+                rows.push(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(item.command.group.clone())
+                        .into_any_element(),
+                );
+            }
+            let is_selected = row_index == state.selected;
+            let action = item.action.clone();
+            // 元素 id 直接用命令 id：界面调试和集成测试都能按命令定位，
+            // 不用去数第几行。
+            rows.push(
+                h_flex()
+                    .id(item.command.id.clone())
+                    // test_support 是 GPUI 的透明观察包装（组件库自己也这么用），
+                    // 让集成测试能按元素 id 定位；aria_label 顺带给读屏软件
+                    // 一个完整的行描述，而不是把标题和快捷键拼在一起。
+                    .test_support()
+                    .aria_label(item.command.title.clone())
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .px_3()
+                    .py_2()
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .bg(if is_selected { selected_bg } else { transparent_white() })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(item.command.title.clone()),
+                    )
+                    .when(!item.command.hint.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(item.command.hint.clone()),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_palette_action(action.clone(), window, cx)
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let body: AnyElement = if rows.is_empty() {
+            div()
+                .py_6()
+                .text_sm()
+                .text_color(muted)
+                .child("没有匹配的命令")
+                .into_any_element()
+        } else {
+            // overflow_y_scroll 属于 StatefulInteractiveElement，
+            // 只有带 id 的 Stateful<Div> 才有，所以先落一个 id。
+            let list = div()
+                .id("palette-list")
+                .flex()
+                .flex_col()
+                .max_h(px(380.))
+                .overflow_y_scroll()
+                .p_1()
+                .children(rows);
+            list.into_any_element()
+        };
+
+        let card = v_flex()
+            .w(px(600.))
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(border)
+            .bg(cx.theme().background)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .h(px(46.))
+                    .border_b_1()
+                    .border_color(border)
+                    .child(Icon::new(IconName::Search).size_4().text_color(muted))
+                    .child(Input::new(&input).cleanable(true).w_full()),
+            )
+            .child(body)
+            .child(
+                h_flex()
+                    .h(px(30.))
+                    .px_3()
+                    .gap_3()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(border)
+                    .text_xs()
+                    .text_color(muted)
+                    .child("↑↓ 选择")
+                    .child("Enter 执行")
+                    .child("Esc 关闭"),
+            );
+
+        div()
+            .id("palette-overlay")
+            .test_support()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(90.))
+            .bg(cx.theme().overlay)
+            .on_click(cx.listener(|this, _, _, cx| this.close_palette(cx)))
+            .child(card)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "up" => this.move_palette_selection(-1, cx),
+                    "down" => this.move_palette_selection(1, cx),
+                    "enter" => this.confirm_palette(window, cx),
+                    "escape" => this.close_palette(cx),
+                    _ => {}
+                }
+            }))
+            .into_any_element()
+    }
+
     fn dismiss_prompt(&mut self, cx: &mut Context<Self>) {
         self.ops.update(cx, |ops, cx| ops.dismiss_prompt(cx));
         self.prompt_input = None;
@@ -463,6 +916,10 @@ impl WFilesApp {
 
             h_flex()
                 .id(("tab", index))
+                // test_support 让集成测试能按标签序号定位；aria_label 顺带给读屏软件
+                // 报出这个标签打开的是哪个文件夹。
+                .test_support()
+                .aria_label(label.clone())
                 .h(px(26.))
                 .max_w(px(180.))
                 .pl_2()
@@ -522,6 +979,15 @@ impl WFilesApp {
                     .icon(IconName::Plus)
                     .tooltip("新建标签页（Cmd+T）")
                     .on_click(cx.listener(|this, _, window, cx| this.new_tab(window, cx))),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("open-palette")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Command)
+                    .tooltip("命令面板（Cmd+P）")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
     }
 
@@ -953,7 +1419,8 @@ impl Render for WFilesApp {
         let has_overlay = self.ops.read(cx).confirm().is_some()
             || self.ops.read(cx).conflict().is_some()
             || self.ops.read(cx).prompt().is_some()
-            || self.ops.read(cx).bulk().is_some();
+            || self.ops.read(cx).bulk().is_some()
+            || self.palette.is_some();
 
         let mut root = v_flex()
             .size_full()
@@ -975,11 +1442,16 @@ impl Render for WFilesApp {
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 this.close_tab(this.active, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)));
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)))
+            .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
+                this.toggle_palette(window, cx)
+            }));
 
         if has_overlay {
-            // 一次只显示一层：冲突 > 批量 > 输入 > 确认。
-            let overlay = if self.ops.read(cx).conflict().is_some() {
+            // 一次只显示一层：命令面板 > 冲突 > 批量 > 输入 > 确认。
+            let overlay = if self.palette.is_some() {
+                self.render_palette(cx)
+            } else if self.ops.read(cx).conflict().is_some() {
                 self.render_conflict(cx)
             } else if self.ops.read(cx).bulk().is_some() {
                 self.render_bulk(cx)
