@@ -795,6 +795,11 @@ impl Pane {
                 format!("远程位置 · {sub} · {text}")
             };
         }
+        // 在云盘的同步文件夹里也要写明：这里删改会牵动另一台机器上的同一份，
+        // 不说的话用户以为自己在动一个普通本地目录。
+        if let Some(root) = crate::cloud::root_for(self.listing.path(), crate::cloud::detected()) {
+            text = format!("{} · {text}", root.provider.name());
+        }
         if !self.selection.is_empty() {
             text.push_str(&format!("，已选中 {} 项", self.selection.len()));
         }
@@ -3350,6 +3355,18 @@ impl Pane {
                     cx,
                 ))
                 .child(detail_row("修改", format::modified(entry.modified), cx))
+                // 云盘状态只对选中那一项判：判一次要问一次文件系统，
+                // 列表里十万行不能每行问一遍。
+                .when_some(
+                    crate::cloud::describe(&entry.path, crate::cloud::detected()),
+                    |this, (root, state)| {
+                        this.child(detail_row(
+                            "云盘",
+                            format!("{} · {}", root.label(), state.label()),
+                            cx,
+                        ))
+                    },
+                )
                 .when_some(
                     mark_text(Settings::read(cx).marks.get(entry.path.as_path())),
                     |this, text| this.child(detail_row("标记", text, cx)),
@@ -4112,7 +4129,16 @@ fn detail_row(label: &str, value: String, cx: &App) -> impl IntoElement {
                 .text_color(cx.theme().muted_foreground)
                 .child(label.to_string()),
         )
-        .child(div().text_sm().truncate().child(value))
+        .child(
+            div()
+                // 每一行都挂 id：界面调试和集成测试按"哪一行"定位，不用数第几个。
+                .id(format!("detail-{label}"))
+                .test_support()
+                .aria_label(value.clone())
+                .text_sm()
+                .truncate()
+                .child(value),
+        )
 }
 
 

@@ -534,6 +534,7 @@ impl WFilesApp {
                     )
                     .children(items),
             )
+            .child(self.render_cloud_section(cx))
             .child(self.render_remote_section(cx))
             .child(div().flex_1())
             .child(
@@ -547,6 +548,63 @@ impl WFilesApp {
                     .child(Icon::new(IconName::HardDrive).size_4())
                     .child("本地文件系统"),
             )
+    }
+
+    /// 侧栏的"云盘"区：本机上找得到的同步文件夹，一条一行。
+    ///
+    /// 没有装任何云盘客户端时这一整块都不出现——空分组比没有更烦人。
+    fn render_cloud_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.tabs[self.active].read(cx).path().to_path_buf();
+        let roots = crate::cloud::detected();
+        if roots.is_empty() {
+            return div().into_any_element();
+        }
+
+        let rows: Vec<AnyElement> = roots
+            .iter()
+            .enumerate()
+            .map(|(index, root)| {
+                let target = root.path.clone();
+                let label = root.label();
+                let name = root.provider.name();
+                // 读屏要听得到"这是谁的同步文件夹"，光听文件夹名不知道。
+                // 名字跟厂商名一样时就别念两遍。
+                let spoken = if label == name {
+                    name.to_string()
+                } else {
+                    format!("{name}：{label}")
+                };
+                let row = ListItem::new(("cloud", index))
+                    .rounded(cx.theme().radius)
+                    .selected(current == root.path)
+                    .accessibility_label(spoken)
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(Icon::new(IconName::Cloud).size_4())
+                            .child(div().flex_1().min_w_0().truncate().child(label)),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.navigate_active_tab(target.clone(), window, cx);
+                    }));
+                row.into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .p_2()
+            .gap_1()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("云盘"),
+            )
+            .children(rows)
+            .into_any_element()
     }
 
     /// 侧栏的"远程"区：存下来的连接一条一行，末尾一行是"连接服务器"。
@@ -1018,6 +1076,18 @@ impl WFilesApp {
     fn close_connect(&mut self, cx: &mut Context<Self>) {
         self.connect = None;
         cx.notify();
+    }
+
+    /// 连接对话框里地址那栏此刻填着什么（测试读状态用）。
+    ///
+    /// 界面上读不出来：没填的时候看到的是占位提示，而占位提示恰好也是
+    /// 一个地址，光看界面分不清"填了"和"没填"。
+    #[cfg(test)]
+    pub(crate) fn connect_url(&self, cx: &App) -> String {
+        self.connect
+            .as_ref()
+            .map(|state| state.url.read(cx).value().to_string())
+            .unwrap_or_default()
     }
 
     /// 点"连接"：收齐四个框，交给 `Remotes` 去后台试连。
@@ -2967,14 +3037,43 @@ impl WFilesApp {
         }
         // 私钥只有 SFTP 用：留空就用密码登录，填了就走密钥登录
         // （这时候下面那栏密码是私钥的口令）。
-        // 私钥只有 SFTP 用：留空就用密码登录，填了就走密钥登录
-        // （这时候下面那栏密码是私钥的口令）。
         if state.kind.has_key() {
             body = body.child(
                 div()
                     .id("connect-key")
                     .test_support()
                     .child(labeled(state.kind.key_label(), &state.key)),
+            );
+        }
+        // WebDAV 有现成的国内服务：坚果云的地址每次手打一遍还容易打错，
+        // 点一下就填上（填完照样能改）。
+        if state.kind == RemoteKind::WebDav {
+            let url = state.url.clone();
+            body = body.child(
+                div()
+                    .id("connect-presets")
+                    .test_support()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_xs().text_color(muted).child("常用服务"))
+                            .child(
+                                Button::new("connect-preset-jianguoyun")
+                                    .label("坚果云")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(move |_, _, window, cx| {
+                                        url.update(cx, |input, cx| {
+                                            input.set_value(
+                                                "https://dav.jianguoyun.com/dav/",
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    })),
+                            ),
+                    ),
             );
         }
         body = body.child(

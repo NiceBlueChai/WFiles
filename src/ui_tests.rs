@@ -23,7 +23,7 @@ use crate::terminal;
 /// 见 [`open_app_of_width`]：放开"别的线程来唤醒"那一刀在它里面，
 /// 两个入口共用同一条路，不再有谁漏掉。
 fn open_app(cx: &mut TestAppContext) -> gpui_kit::WindowHandle<Root> {
-    open_app_of_width(cx, 1180.)
+    open_app_of_width(cx, 1180.).0
 }
 
 /// 指定窗口宽度开一个：网格的列数取决于窗格有多宽，要测就得能改它。
@@ -32,7 +32,13 @@ fn open_app(cx: &mut TestAppContext) -> gpui_kit::WindowHandle<Root> {
 /// 唤醒任务——测试调度器把"别的线程来唤醒"判成不确定行为并直接报错。
 /// 这不是被测代码的问题：监听本来就跨线程。所以开了窗口就统一放开，
 /// 放在这里而不是 `open_app` 里，免得哪个测试直接调这一个入口时漏掉。
-fn open_app_of_width(cx: &mut TestAppContext, width: f32) -> gpui_kit::WindowHandle<Root> {
+///
+/// 连 WFilesApp 那一实体一起给出来：有些断言读状态比读界面准
+/// （比如输入框里此刻填着什么，界面上只能看到占位提示）。
+fn open_app_of_width(
+    cx: &mut TestAppContext,
+    width: f32,
+) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<WFilesApp>) {
     cx.background_executor.allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -43,7 +49,7 @@ fn open_app_of_width(cx: &mut TestAppContext, width: f32) -> gpui_kit::WindowHan
             origin: Point::default(),
             size: size(px(width), px(760.)),
         };
-        let (window, _view) = gpui_kit::open_window(
+        let (window, app) = gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
@@ -52,7 +58,7 @@ fn open_app_of_width(cx: &mut TestAppContext, width: f32) -> gpui_kit::WindowHan
             |window, cx| cx.new(|cx| WFilesApp::new(window, cx)),
         )
         .expect("打开测试窗口");
-        window.downcast::<Root>().expect("Base Root")
+        (window.downcast::<Root>().expect("Base Root"), app)
     })
 }
 
@@ -1335,7 +1341,7 @@ fn columns_at_width(cx: &mut TestAppContext, dir: &Path, width: f32) -> usize {
     }
     .save_to(&session.path().join("session.json"))
     .expect("写测试会话");
-    let handle = open_app_of_width(cx, width);
+    let (handle, _app) = open_app_of_width(cx, width);
 
     let mut columns = 0;
     step(cx, handle, |window, cx| {
@@ -3321,4 +3327,84 @@ fn a_saved_connection_navigates_to_its_remote_location(cx: &mut TestAppContext) 
         status.contains("正在取这个目录") || status.contains("远程位置"),
         "该写明这是远程位置：{status}"
     );
+}
+
+#[gpui_kit::test]
+fn a_cloud_sync_folder_is_called_out_in_the_sidebar_and_the_details(cx: &mut TestAppContext) {
+    use crate::cloud::{Provider, SyncRoot};
+
+    let _session = isolate_session();
+    let root = tempfile::tempdir().expect("临时目录");
+    let sync = root.path().join("Dropbox");
+    std::fs::create_dir_all(&sync).unwrap();
+    std::fs::write(sync.join("notes.txt"), "hello").unwrap();
+    // 真机器上装没装云盘客户端由不得测试决定，所以喂一份假的进去。
+    crate::cloud::install(vec![SyncRoot {
+        provider: Provider::Dropbox,
+        path: sync.clone(),
+    }]);
+
+    let handle = open_app(cx);
+
+    let label = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window
+            .try_find(("cloud", 0usize))
+            .and_then(|row| row.label().map(|label| label.to_string()))
+            .unwrap_or_default()
+    });
+    assert_eq!(label, "Dropbox", "侧栏该列出本机的云盘：{label}");
+
+    step(cx, handle, |window, cx| {
+        window.click(("cloud", 0usize), cx);
+    });
+
+    // 进了同步目录：状态栏得写明，这里删改会牵动另一台机器上的同一份。
+    let status = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        status_text(window)
+    });
+    assert!(status.contains("Dropbox"), "该写明在云盘里：{status}");
+
+    // 选中那个文件：详情里写明是哪家云盘、什么状态。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    let cloud = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window
+            .try_find("detail-云盘")
+            .and_then(|row| row.label().map(|label| label.to_string()))
+            .unwrap_or_default()
+    });
+    assert_eq!(cloud, "Dropbox · 已同步到本地", "实际是 {cloud}");
+}
+
+#[gpui_kit::test]
+fn the_webdav_preset_fills_in_a_domestic_provider(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let (handle, app) = open_app_of_width(cx, 1180.);
+    open_connect_dialog(cx, handle);
+
+    // WebDAV 才摆"常用服务"：SFTP/S3/FTP 各有各的服务商，没有这样一句能填的通用地址。
+    let shown = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.try_find("connect-presets").is_some()
+    });
+    assert!(shown, "WebDAV 时该有常用服务");
+
+    // 读输入框里真正的值而不是界面上的字：没填时界面显示的是占位提示，
+    // 而占位提示恰好也是一个地址，光看界面分不清"填了"和"没填"。
+    let before = cx.update(|cx| app.read(cx).connect_url(cx));
+    assert!(before.is_empty(), "刚打开时该是空的：{before}");
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("connect-preset-jianguoyun", cx);
+    });
+
+    // 点一下就把地址填上了，不用去记那个 URL。
+    let after = cx.update(|cx| app.read(cx).connect_url(cx));
+    assert_eq!(after, "https://dav.jianguoyun.com/dav/", "实际是 {after}");
 }

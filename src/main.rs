@@ -4,6 +4,7 @@ mod app;
 mod archive;
 mod bulk_rename;
 mod clipboard;
+mod cloud;
 mod compare;
 mod compare_entity;
 mod diff;
