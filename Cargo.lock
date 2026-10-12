@@ -7957,6 +7957,7 @@ dependencies = [
  "digest 0.10.7",
  "dirs 6.0.0",
  "gpui-kit",
+ "hmac",
  "image",
  "keyring",
  "md5",

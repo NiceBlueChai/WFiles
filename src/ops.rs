@@ -15,7 +15,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::remote::{self, Dav};
+use crate::remote::{self, Client};
 
 /// 目标已存在时的处理方式。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -572,13 +572,13 @@ fn transfer_entries(
 /// 一次搬运两端的远程客户端；两端都在本地时两个都是 `None`。
 ///
 /// 客户端必须**在主线程上取好再搬进后台线程**：`Remotes` 是 GPUI 实体，
-/// 后台线程里读不到它。取好的 `Dav` 是同步的，跨线程带着走没问题。
+/// 后台线程里读不到它。取好的客户端是同步的，跨线程带着走没问题。
 #[derive(Clone, Default)]
 pub struct RemoteSides {
     /// 源在远程时的客户端（查、下载、移动成功后删源）。
-    pub source: Option<Arc<Dav>>,
+    pub source: Option<Client>,
     /// 目标在远程时的客户端（判重、建目录、上传）。
-    pub dest: Option<Arc<Dav>>,
+    pub dest: Option<Client>,
 }
 
 /// `dav://<连接 id>/<子路径>` → 子路径。
@@ -590,7 +590,7 @@ fn sub_of(path: &Path) -> Result<String, TransferError> {
 
 /// 远程目标上有没有这一项。`Path::exists()` 对 `dav://…` 永远是假，
 /// 判冲突必须问服务器。
-pub fn remote_exists(client: &Dav, target: &Path) -> bool {
+pub fn remote_exists(client: &dyn remote::Remote, target: &Path) -> bool {
     let Some((_, sub)) = remote::parse_location(target) else {
         return false;
     };
@@ -601,7 +601,7 @@ pub fn remote_exists(client: &Dav, target: &Path) -> bool {
 ///
 /// 本地那一支走 [`resolve_conflict`]（靠文件系统判"有没有"），
 /// 远程这一支改成问服务器，并且"保留两者"的候选名也得由服务器确认没人用。
-fn resolve_target(target: &Path, policy: ConflictPolicy, client: Option<&Dav>) -> Option<PathBuf> {
+fn resolve_target(target: &Path, policy: ConflictPolicy, client: Option<&dyn remote::Remote>) -> Option<PathBuf> {
     let Some(client) = client else {
         return resolve_conflict(target, policy);
     };
@@ -616,7 +616,7 @@ fn resolve_target(target: &Path, policy: ConflictPolicy, client: Option<&Dav>) -
 }
 
 /// 在远程那一端给 `sub` 找一个没人用的兄弟：`a.txt` → `a 2.txt`。
-fn unique_remote(client: &Dav, sub: &str) -> String {
+fn unique_remote(client: &dyn remote::Remote, sub: &str) -> String {
     let (prefix, name) = match sub.rsplit_once('/') {
         Some((dir, name)) => (format!("{dir}/"), name.to_string()),
         None => (String::new(), sub.to_string()),
@@ -723,7 +723,7 @@ fn local_to_local(
 
 /// 从远程下载一项（文件或整棵子树）到本地 `target`。
 fn download_entry(
-    client: &Dav,
+    client: &dyn remote::Remote,
     sub: &str,
     target: &Path,
     report: &mut dyn FnMut(u64) -> bool,
@@ -772,7 +772,7 @@ fn download_entry(
 /// `remove_source` 为真时，上传成功后删掉本地那份——这是"剪切"，
 /// 也用于把一次远程 -> 本地的移动撤销回去。
 fn upload_entry(
-    client: &Dav,
+    client: &dyn remote::Remote,
     source: &Path,
     sub: &str,
     remove_source: bool,
@@ -808,8 +808,8 @@ fn upload_entry(
     let length = metadata.len();
     let file = fs::File::open(source)
         .map_err(|error| TransferError::Failed(format!("读不了源文件：{error}")))?;
-    let reader = Reporting { inner: file, report };
-    let result = client.upload_stream(sub, reader, length);
+    let mut reader = Reporting { inner: file, report };
+    let result = client.upload(sub, &mut reader, length);
     if let Err(error) = result {
         // 上传失败时服务器上多半留着半个文件：它由这一层负责清掉，
         // 免得"失败"之后目标目录里多一个看起来传好了的残骸。
@@ -864,18 +864,18 @@ impl<R: Write> Write for Reporting<'_, R> {
 ///
 /// `client` 是源那一端在远程时的客户端：远程得靠列目录数，
 /// 而列目录是要走一趟网络的。
-pub fn count_entries(paths: &[PathBuf], client: Option<&Dav>) -> usize {
+pub fn count_entries(paths: &[PathBuf], client: Option<&dyn remote::Remote>) -> usize {
     paths.iter().map(|path| count_one(path, client)).sum()
 }
 
 /// 拷/移之前先数一遍总字节数：进度条、"还剩多久"都要这个分母。
 ///
 /// 数不出来的（没权限、失效链接）按 0 算，界面退化成只看条目数。
-pub fn count_bytes(paths: &[PathBuf], client: Option<&Dav>) -> u64 {
+pub fn count_bytes(paths: &[PathBuf], client: Option<&dyn remote::Remote>) -> u64 {
     paths.iter().map(|path| bytes_of(path, client)).sum()
 }
 
-fn bytes_of(path: &Path, client: Option<&Dav>) -> u64 {
+fn bytes_of(path: &Path, client: Option<&dyn remote::Remote>) -> u64 {
     if let (Some(client), Some((_, sub))) = (client, remote::parse_location(path)) {
         return bytes_remote(client, &sub);
     }
@@ -883,7 +883,7 @@ fn bytes_of(path: &Path, client: Option<&Dav>) -> u64 {
 }
 
 /// 远程一棵子树的总字节数：一趟递归的 PROPFIND。
-fn bytes_remote(client: &Dav, sub: &str) -> u64 {
+fn bytes_remote(client: &dyn remote::Remote, sub: &str) -> u64 {
     let Some(info) = client.stat(sub).ok().flatten() else {
         return 0;
     };
@@ -916,14 +916,14 @@ fn bytes_local(path: &Path) -> u64 {
     fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0)
 }
 
-fn count_one(path: &Path, client: Option<&Dav>) -> usize {
+fn count_one(path: &Path, client: Option<&dyn remote::Remote>) -> usize {
     if let (Some(client), Some((_, sub))) = (client, remote::parse_location(path)) {
         return count_remote(client, &sub);
     }
     count_local(path)
 }
 
-fn count_remote(client: &Dav, sub: &str) -> usize {
+fn count_remote(client: &dyn remote::Remote, sub: &str) -> usize {
     let Some(info) = client.stat(sub).ok().flatten() else {
         return 1;
     };
@@ -1026,7 +1026,7 @@ impl HistoryEntry {
     ///
     /// `clients` 是这一条记录涉及的远程连接（按连接 id 索引）；
     /// 只涉及本地路径时它是空的，行为跟以前一样。
-    pub fn undo(&self, clients: &HashMap<String, Arc<Dav>>) -> Result<(), String> {
+    pub fn undo(&self, clients: &HashMap<String, Client>) -> Result<(), String> {
         match self {
             Self::Created { path } => {
                 remove_any(path, clients)
@@ -1079,7 +1079,7 @@ impl HistoryEntry {
 }
 
 /// 本地或远程，这一项在不在。`None` = 问不出来（连接没了）。
-fn exists_any(path: &Path, clients: &HashMap<String, Arc<Dav>>) -> Option<bool> {
+fn exists_any(path: &Path, clients: &HashMap<String, Client>) -> Option<bool> {
     let Some((id, sub)) = remote::parse_location(path) else {
         return Some(path.exists());
     };
@@ -1088,7 +1088,7 @@ fn exists_any(path: &Path, clients: &HashMap<String, Arc<Dav>>) -> Option<bool> 
 }
 
 /// 本地或远程，删掉这一项。
-fn remove_any(path: &Path, clients: &HashMap<String, Arc<Dav>>) -> Result<(), String> {
+fn remove_any(path: &Path, clients: &HashMap<String, Client>) -> Result<(), String> {
     let Some((id, sub)) = remote::parse_location(path) else {
         let metadata = fs::symlink_metadata(path)
             .map_err(|_| "这一项已经不存在了".to_string())?;
@@ -1109,7 +1109,7 @@ fn remove_any(path: &Path, clients: &HashMap<String, Arc<Dav>>) -> Result<(), St
 }
 
 /// 撤销一次移动：把 `to` 搬回 `from`。两端各可能是本地或远程。
-fn move_back(from: &Path, to: &Path, clients: &HashMap<String, Arc<Dav>>) -> Result<(), String> {
+fn move_back(from: &Path, to: &Path, clients: &HashMap<String, Client>) -> Result<(), String> {
     let from_remote = remote::parse_location(from);
     let to_remote = remote::parse_location(to);
     // 先按“两边各是什么位置”取好客户端，后面哪个分支用得上就用。
@@ -1180,7 +1180,7 @@ impl History {
     }
 
     /// 弹出并执行撤销，返回被撤销操作的描述。
-    pub fn pop_undo(&mut self, clients: &HashMap<String, Arc<Dav>>) -> Result<String, String> {
+    pub fn pop_undo(&mut self, clients: &HashMap<String, Client>) -> Result<String, String> {
         let entry = self
             .entries
             .pop()
@@ -1542,10 +1542,10 @@ mod tests {
     // ---- 跨本地与远程（真连一次假服务器）----
 
     /// 起一个假服务器并连上它，返回客户端和"它都收到了什么"。
-    fn remote_client() -> (std::sync::Arc<Dav>, remote::fake::Server) {
+    fn remote_client() -> (Client, remote::fake::Server) {
         let server = remote::fake::start();
-        let client = Dav::new(&remote::fake::config(&server.url), "secret").unwrap();
-        (std::sync::Arc::new(client), server)
+        let client = remote::open(&remote::fake::config(&server.url), "secret").unwrap();
+        (client, server)
     }
 
     fn seen_requests(server: &remote::fake::Server) -> Vec<String> {
@@ -1687,12 +1687,8 @@ mod tests {
     fn carrying_between_two_servers_is_refused() {
         let first = remote::fake::start();
         let second = remote::fake::start();
-        let from = std::sync::Arc::new(
-            Dav::new(&remote::fake::config_with("t1", &first.url), "secret").unwrap(),
-        );
-        let to = std::sync::Arc::new(
-            Dav::new(&remote::fake::config_with("t2", &second.url), "secret").unwrap(),
-        );
+        let from = remote::open(&remote::fake::config_with("t1", &first.url), "secret").unwrap();
+        let to = remote::open(&remote::fake::config_with("t2", &second.url), "secret").unwrap();
 
         let source = remote::location("t1", "folder/a.txt");
         let dest = remote::location("t2", "folder");

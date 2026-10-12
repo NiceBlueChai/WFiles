@@ -117,10 +117,14 @@ enum PaletteAction {
 /// 连接对话框的当前状态。输入框随开随建、随关随毁，密码不留在别处。
 #[derive(Clone)]
 struct ConnectState {
+    /// 选了哪种协议。不同协议要填的栏位不一样（S3 多一个地区）。
+    kind: RemoteKind,
     name: Entity<InputState>,
     url: Entity<InputState>,
     user: Entity<InputState>,
     password: Entity<InputState>,
+    /// 地区。只有 S3 用得上，其余协议这一栏不显示。
+    region: Entity<InputState>,
     /// 正在后台试连：按钮变灰，也不再重复发起。
     busy: bool,
     /// 上一次试连失败的原因。
@@ -148,6 +152,13 @@ fn host_of(url: &str) -> Option<String> {
     }
 }
 
+/// 协议选择按钮的 id：测试要能点它，就给它一个稳的名字。
+fn kind_id(kind: RemoteKind) -> String {
+    match kind {
+        RemoteKind::WebDav => "connect-kind-webdav".to_string(),
+        RemoteKind::S3 => "connect-kind-s3".to_string(),
+    }
+}
 
 /// 应用级快捷键：不依赖任何上下文，任何地方按下都生效。
 pub fn init(cx: &mut App) {
@@ -972,12 +983,15 @@ impl WFilesApp {
         let url = field(RemoteKind::WebDav.url_hint(), window, cx);
         let user = field("用户名（可留空）", window, cx);
         let password = field("密码或应用专用密码", window, cx);
+        let region = field("us-east-1", window, cx);
         name.update(cx, |input, cx| input.focus(window, cx));
         self.connect = Some(ConnectState {
+            kind: RemoteKind::WebDav,
             name,
             url,
             user,
             password,
+            region,
             busy: false,
             error: None,
         });
@@ -1020,7 +1034,18 @@ impl WFilesApp {
         let id = self
             .remotes
             .update(cx, |remotes, cx| remotes.fresh_id(&name, cx));
-        let config = remote::Config::new(id, name, RemoteKind::WebDav, url, user);
+        let mut config = remote::Config::new(id, name, state.kind, url, user);
+        if state.kind == RemoteKind::S3 {
+            // 地区是签名的一部分：填错了会一直 403，
+            // 而 403 看起来跟"密钥错了"一模一样，所以留空时按地址自己推并写进配置。
+            let region = state.region.read(cx).value().trim().to_string();
+            let region = if region.is_empty() {
+                crate::s3::region_from_url(&config.url)
+            } else {
+                region
+            };
+            config = config.with_region(region);
+        }
 
         state.busy = true;
         state.error = None;
@@ -2850,26 +2875,57 @@ impl WFilesApp {
                 .child(Input::new(input).w_full())
         };
 
+        // 先挑协议：不同协议要填的栏位不一样，选错了填也是白填。
+        let kinds = RemoteKind::ALL
+            .iter()
+            .map(|kind| {
+                let id = kind_id(*kind);
+                Button::new(id.clone())
+                    .label(kind.label())
+                    .ghost()
+                    .selected(state.kind == *kind)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = this.connect.as_mut() {
+                            state.kind = *kind;
+                            state.error = None;
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
         let mut body = v_flex()
             .gap_3()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_xs().text_color(muted).child("协议"))
+                    .child(h_flex().gap_2().children(kinds)),
+            )
             .child(labeled("名称（可留空，默认取主机名）", &state.name))
             .child(labeled("服务器地址", &state.url))
-            .child(labeled("用户名", &state.user))
-            .child(labeled("密码", &state.password))
-            .child(
+            .child(labeled(state.kind.user_label(), &state.user))
+            .child(labeled(state.kind.password_label(), &state.password));
+        // 地区只有 S3 用：它是签名的一部分，填错的表现跟密钥错了一模一样，
+        // 所以这一栏要能自己填、也写进配置让人事后看得见。
+        if state.kind == RemoteKind::S3 {
+            body = body.child(
                 div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!(
-                        "支持：{}；地址形如 {}。密码只进系统钥匙串，不写进配置文件。",
-                        RemoteKind::ALL
-                            .iter()
-                            .map(|kind| kind.label())
-                            .collect::<Vec<_>>()
-                            .join("、"),
-                        RemoteKind::WebDav.url_hint()
-                    )),
+                    .id("connect-region")
+                    .test_support()
+                    .child(labeled("地区（MinIO 留空即可）", &state.region)),
             );
+        }
+        body = body.child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child(format!(
+                    "地址形如 {}。密码只进系统钥匙串，不写进配置文件。",
+                    state.kind.url_hint()
+                )),
+        );
 
         if let Some(error) = &state.error {
             body = body.child(

@@ -12,13 +12,12 @@ use std::{
 use gpui_kit::{AsyncApp, WeakEntity, *};
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::bulk_rename::{self, BulkRename, BulkRenamePreview};
 use crate::ops::{
     self, ConflictPolicy, Control, ControlState, History, Outcome, Progress, RemoteSides,
 };
-use crate::remote::{self, Dav};
+use crate::remote::{self, Client};
 use crate::remotes::Remotes;
 
 /// 广播给窗格的事件：文件系统变了，该刷新的自己对照路径判断。
@@ -740,7 +739,7 @@ impl Ops {
     /// 当场执行撤销（只涉及本地路径时）：一次 `rename` 的事，不必惊动后台。
     fn undo_now(
         &mut self,
-        clients: &HashMap<String, Arc<Dav>>,
+        clients: &HashMap<String, Client>,
         involved: &[PathBuf],
         cx: &mut Context<Self>,
     ) {
@@ -766,7 +765,7 @@ impl Ops {
     // ---- 远程 ----
 
     /// 取某个远程路径所属连接的客户端。本地路径或没有这条连接时是 `None`。
-    fn client_for(&self, path: &Path, cx: &mut App) -> Option<Arc<Dav>> {
+    fn client_for(&self, path: &Path, cx: &mut App) -> Option<Client> {
         let (id, _) = remote::parse_location(path)?;
         self.remotes
             .as_ref()?
@@ -790,7 +789,7 @@ impl Ops {
     ///
     /// 撤销是后来才按的，那时候才去取客户端——客户端可能被删掉重建过
     /// （改密码会清掉旧的），早取一份存着反而会用上失效的那个。
-    fn clients_for(&self, paths: &[PathBuf], cx: &mut App) -> HashMap<String, Arc<Dav>> {
+    fn clients_for(&self, paths: &[PathBuf], cx: &mut App) -> HashMap<String, Client> {
         let mut clients = HashMap::new();
         for path in paths {
             let Some((id, _)) = remote::parse_location(path) else {
@@ -844,7 +843,7 @@ impl Ops {
                         .filter(|source| {
                             source
                                 .file_name()
-                                .is_some_and(|name| ops::remote_exists(&client, &into.join(name)))
+                                .is_some_and(|name| ops::remote_exists(client.as_ref(), &into.join(name)))
                         })
                         .count();
                     let _ = tx.try_send(WorkerMessage::Done(JobResult::Preflight {

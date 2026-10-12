@@ -12,7 +12,7 @@
 //!    永远是 `/`，而 Windows 的 `PathBuf` 会把 `/` 也认成分隔符又会把 `\`
 //!    也认成分隔符——混在一起迟早出事。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -20,16 +20,20 @@ use serde::{Deserialize, Serialize};
 /// 远程位置有哪几种。加协议就在这里加一支，并配一个客户端。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
-    /// WebDAV：坚果云、Nextcloud、ownCloud、ownCloud 一类的网盘与自建 NAS。
+    /// WebDAV：坚果云、Nextcloud、ownCloud 一类的网盘与自建 NAS。
     WebDav,
+    /// S3 兼容对象存储：AWS S3、MinIO、Cloudflare R2、Backblaze B2，
+    /// 以及各家云厂商的 S3 兼容端点。
+    S3,
 }
 
 impl Kind {
-    pub const ALL: [Self; 1] = [Self::WebDav];
+    pub const ALL: [Self; 2] = [Self::WebDav, Self::S3];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::WebDav => "WebDAV",
+            Self::S3 => "S3 对象存储",
         }
     }
 
@@ -37,6 +41,23 @@ impl Kind {
     pub fn url_hint(self) -> &'static str {
         match self {
             Self::WebDav => "https://dav.jianguoyun.com/dav/",
+            Self::S3 => "https://s3.cn-north-1.amazonaws.com.cn/bucket/",
+        }
+    }
+
+    /// 这一栏填的是"用户名"还是"Access Key"——说清楚免得照着 WebDAV 填。
+    pub fn user_label(self) -> &'static str {
+        match self {
+            Self::WebDav => "用户名",
+            Self::S3 => "Access Key ID",
+        }
+    }
+
+    /// 这一栏填的是"密码"还是"Secret Key"。
+    pub fn password_label(self) -> &'static str {
+        match self {
+            Self::WebDav => "密码",
+            Self::S3 => "Secret Access Key",
         }
     }
 }
@@ -58,6 +79,9 @@ pub struct Config {
     /// 进去之后先落在哪个子目录；空就是根。
     #[serde(default)]
     pub root: String,
+    /// 地区。只有 S3 用得上（签名的一部分）；留空就按地址自己推。
+    #[serde(default)]
+    pub region: String,
 }
 
 impl Config {
@@ -69,7 +93,14 @@ impl Config {
             url,
             user,
             root: String::new(),
+            region: String::new(),
         }
+    }
+
+    /// 指定地区（S3 用）。
+    pub fn with_region(mut self, region: String) -> Self {
+        self.region = region;
+        self
     }
 
     /// 钥匙串里这个密码挂在哪个"账号"下。
@@ -133,6 +164,72 @@ pub struct Entry {
 }
 
 // ---------------------------------------------------------------------------
+// 各协议统一的客户端接口
+// ---------------------------------------------------------------------------
+
+/// 一个连上的远程位置该会做的事。
+///
+/// 界面和文件操作只认这个 trait，不认具体协议——
+/// 加一种协议就是加一个 impl，搬运、撤销、判重那几处一行都不用动。
+///
+/// 一律同步：调用方本来就在后台线程里，同步代码比"再拖一个异步运行时进来"
+/// 好懂得多，出错也少一层。
+pub trait Remote: Send + Sync {
+    /// 属于哪条连接。同一条连接上的两个客户端才能走服务器自己的 MOVE/COPY。
+    fn id(&self) -> &str;
+
+    /// 列一个目录（`""` 是根）。
+    fn list(&self, path: &str) -> Result<Vec<Entry>, String>;
+
+    /// 问一项在不在；`None` 是没有这一项。
+    fn stat(&self, path: &str) -> Result<Option<Entry>, String>;
+
+    /// 下载一项，`sink` 收到的是原始字节，返回写出去的字节数。
+    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String>;
+
+    /// 上传一项。`reader` 从头读到尾，内容不先进内存；
+    /// `length` 必须已知——对象存储要知道一次收多少。
+    fn upload(&self, path: &str, reader: &mut dyn Read, length: u64) -> Result<(), String>;
+
+    /// 建目录。父目录必须已经存在。
+    fn mkdir(&self, path: &str) -> Result<(), String>;
+
+    /// 删文件或目录。
+    fn remove(&self, path: &str) -> Result<(), String>;
+
+    /// 改名/移动。
+    fn rename(&self, from: &str, to: &str) -> Result<(), String>;
+
+    /// 复制一份（服务器自己拷，不用下载再上传）。
+    fn copy(&self, from: &str, to: &str) -> Result<(), String>;
+}
+
+/// 一个连上的远程位置。
+///
+/// 包在 `Arc` 里是因为它要在主线程上取好、再搬进后台线程；
+/// 具体是哪一种协议由调用方决定，用不着知道。
+pub type Client = std::sync::Arc<dyn Remote>;
+
+/// 按配置建一个客户端（不联网，成功不代表地址对）。
+pub fn open(config: &Config, password: &str) -> Result<Client, String> {
+    let client: Client = match config.kind {
+        Kind::WebDav => std::sync::Arc::new(Dav::new(config, password)?),
+        Kind::S3 => std::sync::Arc::new(crate::s3::S3::new(config, password)?),
+    };
+    Ok(client)
+}
+
+/// 连一次并顺便验货：能列根目录就算通。
+///
+/// 不验的话，用户填错一个字母要等到第一次刷新列表才发现，
+/// 那时候的报错（"列不出来"）远不如"连不上"好懂。
+pub fn probe(config: &Config, password: &str) -> Result<Client, String> {
+    let client = open(config, password)?;
+    client.list("")?;
+    Ok(client)
+}
+
+// ---------------------------------------------------------------------------
 // WebDAV
 // ---------------------------------------------------------------------------
 
@@ -145,23 +242,12 @@ pub struct Dav {
     base: String,
     /// 根地址里的路径部分（如 `/dav/`），用来把服务器回的 href 变回相对路径。
     base_path: String,
-    user: String,
     agent: ureq::Agent,
     /// `Authorization` 头的值，建连接时算一次。
     auth: String,
 }
 
 impl Dav {
-    /// 连一次并顺便验货：能列根目录就算通。
-    ///
-    /// 不验的话，用户填错一个字母要等到第一次刷新列表才发现，
-    /// 那时候的报错（"列不出来"）远不如"连不上"好懂。
-    pub fn connect(config: &Config, password: &str) -> Result<Self, String> {
-        let dav = Self::new(config, password)?;
-        dav.list("")?;
-        Ok(dav)
-    }
-
     /// 建一个客户端（不联网，成功不代表地址对）。
     pub fn new(config: &Config, password: &str) -> Result<Self, String> {
         let base = with_slash(&config.url);
@@ -176,21 +262,9 @@ impl Dav {
             id: config.id.clone(),
             base,
             base_path,
-            user: config.user.clone(),
             agent,
             auth: format!("Basic {}", basic(&config.user, password)),
         })
-    }
-
-    /// 属于哪条连接。
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// 登录用户名。界面上要提示"当前以谁的身份连着"。
-    #[allow(dead_code)]
-    pub fn user(&self) -> &str {
-        &self.user
     }
 
     /// 把相对路径拼成完整 URL。
@@ -378,11 +452,49 @@ impl Dav {
     }
 }
 
+impl Remote for Dav {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
+        self.list(path)
+    }
+
+    fn stat(&self, path: &str) -> Result<Option<Entry>, String> {
+        self.stat(path)
+    }
+
+    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
+        self.download(path, sink)
+    }
+
+    fn upload(&self, path: &str, reader: &mut dyn Read, length: u64) -> Result<(), String> {
+        self.upload_stream(path, reader, length)
+    }
+
+    fn mkdir(&self, path: &str) -> Result<(), String> {
+        self.mkdir(path)
+    }
+
+    fn remove(&self, path: &str) -> Result<(), String> {
+        self.remove(path)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+        self.rename(from, to)
+    }
+
+    fn copy(&self, from: &str, to: &str) -> Result<(), String> {
+        self.copy(from, to)
+    }
+}
+
 /// 把 `ureq` 的错误翻成人话。
 ///
 /// 它自带的 `Display` 会把状态码、IO 错误、TLS 错误全糊在一起，
 /// 用户看到的是一长串看不懂的东西。这里只留最关键的那一条。
-fn explain(doing: &str, error: ureq::Error) -> String {
+pub(crate) fn explain(doing: &str, error: ureq::Error) -> String {
     let detail = match &error {
         ureq::Error::Status(code, _) => format!("服务器回 {code}"),
         ureq::Error::Transport(transport) => transport.to_string(),
@@ -393,7 +505,7 @@ fn explain(doing: &str, error: ureq::Error) -> String {
 /// `path` 那一段 URL 编码：只动该动的字符。
 ///
 /// 斜杠要留着（那是路径分隔），中文与空格必须编码。
-fn encode(path: &str) -> String {
+pub(crate) fn encode(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
         let keep = byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~');
@@ -473,7 +585,7 @@ fn basic(user: &str, password: &str) -> String {
 }
 
 /// 保证结尾有一个 `/`：后面拼路径时不用再想这件事。
-fn with_slash(url: &str) -> String {
+pub(crate) fn with_slash(url: &str) -> String {
     if url.ends_with('/') {
         url.to_string()
     } else {
@@ -613,7 +725,7 @@ fn name_of(href: &str) -> Option<String> {
 ///
 /// 手写是为了不拖一个时间解析库：HTTP 日期只有这一种写法（RFC 7231），
 /// 而且我们只要秒——解析不出来就当没有时间，那一列空着也不影响浏览。
-fn parse_http_date(text: &str) -> Option<u64> {
+pub(crate) fn parse_http_date(text: &str) -> Option<u64> {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -958,7 +1070,7 @@ mod tests {
     fn connecting_checks_that_the_root_is_reachable() {
         let fake = fake::start();
         // 用 "" 列根：连不上会在这一步就报错，而不是等到用户点进去才发现。
-        assert!(Dav::connect(&fake::config(&fake.url), "secret").is_ok());
+        assert!(probe(&fake::config(&fake.url), "secret").is_ok());
     }
 
     #[test]

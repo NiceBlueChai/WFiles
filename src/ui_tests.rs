@@ -3146,6 +3146,32 @@ fn the_connect_dialog_refuses_an_empty_address(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn switching_to_s3_reveals_the_region_field(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    open_connect_dialog(cx, handle);
+
+    // 默认按 WebDAV 填：地区是 S3 才有的概念，摆在那里只会让人填错。
+    let before = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.try_find("connect-region").is_some()
+    });
+    assert!(!before, "WebDAV 时不该问地区");
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("connect-kind-s3", cx);
+    });
+
+    let after = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.try_find("connect-region").is_some()
+    });
+    assert!(after, "切到 S3 之后该能填地区：它是签名的一部分");
+}
+
+#[gpui_kit::test]
 fn pasting_into_a_remote_folder_uploads_over_http(cx: &mut TestAppContext) {
     let _session = isolate_session();
     let root = tempfile::tempdir().expect("临时目录");

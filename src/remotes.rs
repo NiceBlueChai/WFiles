@@ -8,11 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use gpui_kit::{AsyncApp, Context, EventEmitter, WeakEntity};
 
-use crate::remote::{self, Config, Dav, Entry};
+use crate::remote::{self, Client, Config, Entry};
 use crate::settings::Settings;
 
 /// 后台回来了什么。
@@ -31,7 +30,7 @@ pub enum RemotesEvent {
 
 pub struct Remotes {
     /// 已建好的客户端，按连接 id 存。改密码或删连接时清掉对应的一条。
-    clients: HashMap<String, Arc<Dav>>,
+    clients: HashMap<String, Client>,
     /// 列过的目录内容，按远程路径存。
     listed: HashMap<PathBuf, Vec<Entry>>,
     /// 正在取的，别重复排队。
@@ -134,7 +133,7 @@ impl Remotes {
         let spawn = std::thread::Builder::new()
             .name("wfiles-connect".to_string())
             .spawn(move || {
-                let result = Dav::connect(&worker, &for_thread);
+                let result = remote::probe(&worker, &for_thread);
                 tx.try_send(result).ok();
             });
         if let Err(error) = spawn {
@@ -199,18 +198,18 @@ impl Remotes {
     /// 取一个客户端：有现成的就用，没有就按设置里的配置建一个。
     ///
     /// 公开是为了让操作层能在主线程上把客户端取好、再带进后台线程。
-    pub fn client(&mut self, id: &str, cx: &mut Context<Self>) -> Option<Arc<Dav>> {
+    pub fn client(&mut self, id: &str, cx: &mut Context<Self>) -> Option<Client> {
         if let Some(client) = self.clients.get(id) {
             return Some(client.clone());
         }
         let config = self.saved(cx).into_iter().find(|it| it.id == id)?;
         let password = remote::load_password(&config).unwrap_or_default();
-        let client = Arc::new(Dav::new(&config, &password).ok()?);
+        let client = remote::open(&config, &password).ok()?;
         self.clients.insert(id.to_string(), client.clone());
         Some(client)
     }
 
-    fn spawn_list(client: Arc<Dav>, path: PathBuf, sub: String, cx: &mut Context<Self>) {
+    fn spawn_list(client: Client, path: PathBuf, sub: String, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::bounded(1);
         let spawn = std::thread::Builder::new()
             .name("wfiles-remote-list".to_string())
@@ -264,7 +263,7 @@ impl Remotes {
         let spawn = std::thread::Builder::new()
             .name("wfiles-remote-open".to_string())
             .spawn(move || {
-                let result = download_to_temp(&client, &sub, &name);
+                let result = download_to_temp(client.as_ref(), &sub, &name);
                 tx.try_send(result).ok();
             });
         if let Err(error) = spawn {
@@ -289,7 +288,7 @@ impl Remotes {
 }
 
 /// 下载到临时目录并用系统打开（跑在后台线程上）。
-fn download_to_temp(client: &Dav, sub: &str, name: &str) -> Result<(), String> {
+fn download_to_temp(client: &dyn remote::Remote, sub: &str, name: &str) -> Result<(), String> {
     let dir = std::env::temp_dir().join("wfiles-remote");
     std::fs::create_dir_all(&dir).map_err(|error| format!("建不了临时目录：{error}"))?;
     let target = dir.join(name);

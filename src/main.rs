@@ -22,6 +22,7 @@ mod preview;
 mod query;
 mod remote;
 mod remotes;
+mod s3;
 mod search;
 mod search_entity;
 mod session;

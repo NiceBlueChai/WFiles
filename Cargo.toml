@@ -25,6 +25,9 @@ sha1 = "0.10"
 sha2 = "0.10"
 # 上面三个哈希库共用的 trait；直接声明是为了 `Digest` 的方法能用在它们三家身上。
 digest = "0.10"
+# S3 的签名是 HMAC 链（SigV4）：拿现成的 `hmac` 而不是自己写，
+# 自己写 HMAC 最容易错在 padding 上，而错了只能拿到一堆 403。
+hmac = "0.12"
 # ---- 远程（P4）----
 # ureq 用 2.x 而不是 3.x：3 会把方法名卡在 HTTP/1.1 的名单里，
 # PROPFIND / MKCOL 这两个 WebDAV 必需的动作直接被拒。

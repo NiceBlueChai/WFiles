@@ -46,7 +46,7 @@ cargo fmt --check
 | `src/meta.rs` | 可选元数据列：六种探测的纯逻辑 + 缓存实体（后台线程、按 mtime 失效） |
 | `src/marks.rs` | 标签与颜色：一个路径上有什么记号，以及它的持久化格式（纯逻辑） |
 | `src/query.rs` | 搜索查询的纯逻辑：一句话 → 条件树，以及"这个文件过不过"的判定 |
-| `src/remote.rs` | 远程位置的纯逻辑：连接配置、钥匙串存取、WebDAV 客户端、`dav://id/子路径` 的拼拆 |
+| `src/remote.rs` | 远程位置的公共部分：连接配置、钥匙串存取、各协议统一的 `Remote` trait 与客户端出口、WebDAV 客户端、`dav://id/子路径` 的拼拆 |
 | `src/search.rs` | 后台搜索的纯逻辑：走目录、读文本、分批送结果、随时可中止 |
 | `src/search_entity.rs` | 搜索面板实体：输入 → 查询、结果列表、Enter 跳到那个文件 |
 | `src/term.rs` | 内嵌终端的纯逻辑：按键 → PTY 字节、屏幕与回滚、选中与取文本 |
@@ -55,6 +55,7 @@ cargo fmt --check
 | `src/format.rs` | 展示层格式化 |
 | `src/session.rs` | 会话持久化（含状态目录的定位规则） |
 | `src/remotes.rs` | 远程连接注册表实体：客户端、目录缓存、后台列目录与下载（界面线程不做网络） |
+| `src/s3.rs` | S3 兼容对象存储客户端：SigV4 签名、桶的两种写法、前缀当文件夹用 |
 | `src/watch.rs` | 文件系统监听（notify） |
 | `src/ui_tests.rs` | 无头窗口 UI 集成测试 |
 | `ROADMAP.md` | 产品路线图：功能范围、阶段划分、明确不做清单 |

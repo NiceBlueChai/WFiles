@@ -188,7 +188,16 @@ WFiles 是一个以“快、清楚、可撤销”为核心的跨平台文件管�
   - "保留两者"在远程那一端要靠服务器确认候选名没人用（`a.txt` → `a 2.txt`）
   - 撤销认得远程路径：`Created` / `Renamed` / `Copied` / `Moved` / `BulkRenamed`
     都能把东西从服务器上搬回来；涉及远程的撤销走后台队列，不堵界面
-- SFTP、FTP、SMB 连接；S3 兼容对象存储（阿里云 OSS、腾讯云 COS、MinIO 等）
+- ✅ S3 兼容对象存储：AWS S3、MinIO、Cloudflare R2、Backblaze B2 与各厂商的 S3 兼容端点
+  - 签名走 SigV4（`AWS4-HMAC-SHA256`）；上传用 `UNSIGNED-PAYLOAD`——
+    正文不进内存也就算不出正文哈希，完整性交给 HTTPS
+  - 桶的两种写法都认：虚拟主机式 `bucket.s3.<region>.amazonaws.com` 与
+    path 式 `host/bucket`；地区认不出来就退回 `us-east-1` 并写进配置让人看得见
+    （地区填错的表现是一直 403，跟"密钥错了"一模一样）
+  - 对象存储没有文件夹：列目录靠 `delimiter=/` + `CommonPrefixes`，
+    建目录是放一个 `dir/` 空对象，删/拷/改名"文件夹"都要把前缀底下的对象一个个搬
+  - 各协议先统一到一个 `Remote` trait 之后：搬运、判重、撤销那几处一行没改
+- FTP 连接；SFTP 连接
 - SFTP 支持密钥认证
 - OneDrive、iCloud、Dropbox、Google Drive 同步状态展示；国内云（坚果云 WebDAV、百度网盘、阿里云盘）按优先级接入
 - 远程编辑（可选）：本地编辑器直接改远程文件，保存自动上传
@@ -227,6 +236,7 @@ WFiles 是一个以“快、清楚、可撤销”为核心的跨平台文件管�
 | Drop Stack 暂存架、便携模式 | 单产品特色（Path Finder/XYplorer），非日常路径 |
 | Gallery 聚合视图、分割/合并文件、内置图片转换、App deleter、剪贴板历史 | 越界或已被系统/专门应用更好覆盖 |
 | FXP 服务器间直传、NFS、FTPS | SFTP + FTP + WebDAV + SMB + S3 覆盖 95% 远程场景 |
+| SMB/CIFS | 没有可用的成熟纯 Rust 实现；绑 C 库（libsmbclient）会让三平台的构建与行为分叉，先不做，等有纯 Rust 实现再评估 |
 | 自定义列（WDX 类脚本列） | 默认列 + 可选元数据列够用；接口留到插件 API 再评估 |
 | 压缩包内搜索、磁盘占用 treemap 可视化 | 低频；“文件夹大小计算”已覆盖清理场景 |
 | Git 完整工作流（stage/commit/push） | 保留状态列；提交推送归终端/IDE |
