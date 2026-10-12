@@ -20,17 +20,20 @@ use crate::terminal;
 
 /// 开一个装着 WFilesApp 的测试窗口。
 ///
-/// 窗格一打开就开始监听目录，而 notify 的回调线程随时可能把事件送回来
-/// 唤醒任务——测试调度器把"别的线程来唤醒"判成不确定行为并直接报错。
-/// 这不是被测代码的问题：监听本来就跨线程。所以开了窗口就统一放开。
+/// 见 [`open_app_of_width`]：放开"别的线程来唤醒"那一刀在它里面，
+/// 两个入口共用同一条路，不再有谁漏掉。
 fn open_app(cx: &mut TestAppContext) -> gpui_kit::WindowHandle<Root> {
-    let handle = open_app_of_width(cx, 1180.);
-    cx.background_executor.allow_parking();
-    handle
+    open_app_of_width(cx, 1180.)
 }
 
 /// 指定窗口宽度开一个：网格的列数取决于窗格有多宽，要测就得能改它。
+///
+/// 窗格一打开就开始监听目录，而 notify 的回调线程随时可能把事件送回来
+/// 唤醒任务——测试调度器把"别的线程来唤醒"判成不确定行为并直接报错。
+/// 这不是被测代码的问题：监听本来就跨线程。所以开了窗口就统一放开，
+/// 放在这里而不是 `open_app` 里，免得哪个测试直接调这一个入口时漏掉。
 fn open_app_of_width(cx: &mut TestAppContext, width: f32) -> gpui_kit::WindowHandle<Root> {
+    cx.background_executor.allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::app::init(cx);
@@ -2004,4 +2007,203 @@ fn backspace_in_the_capture_restores_the_factory_key(cx: &mut TestAppContext) {
         "退格该把这条清回出厂：{:?}",
         saved.keys.0
     );
+}
+
+// ---- 内嵌终端面板 ----
+
+/// 终端面板里当前可见的文本（读的是格子区的 aria_label）。
+fn terminal_text(window: &mut gpui_kit::Window) -> String {
+    window
+        .try_find("term-grid")
+        .and_then(|grid| grid.label().map(|text| text.to_string()))
+        .unwrap_or_default()
+}
+
+/// 开关键：绑定、放行、测试三处都得是同一个，所以从实体那边拿。
+fn toggle_terminal(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
+    window.press(crate::term_entity::TOGGLE_KEY, cx);
+}
+
+#[gpui_kit::test]
+fn the_terminal_panel_opens_and_the_same_key_closes_it(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("terminal").is_none(),
+            "启动时不该自己开着终端面板"
+        );
+    });
+
+    step(cx, handle, |window, cx| {
+        toggle_terminal(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("terminal").is_some(),
+            "开关键应该打开终端面板"
+        );
+    });
+
+    // 面板一开就把焦点拿走了。焦点在终端里的时候，同一个键也必须还能收起它——
+    // 否则用户就得先点回文件列表才能关掉，那一下很别扭。
+    step(cx, handle, |window, cx| {
+        toggle_terminal(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("terminal").is_none(),
+            "终端聚焦时开关键也要能收起面板"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_embedded_terminal_runs_a_real_command(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        toggle_terminal(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("terminal").is_some(), "面板要先打开");
+    });
+    // 真敲一条命令：敲进去的字节要真的顺着 PTY 到 shell 那儿。
+    step(cx, handle, |window, cx| {
+        window.input("echo wfiles-ok", cx);
+        window.press("enter", cx);
+    });
+
+    // shell 是真正的子进程，不在测试调度器里，只能给它一点真实时间；
+    // 每一轮都要画帧，输出是通过事件送回来的。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = false;
+    while Instant::now() < deadline && !seen {
+        cx.run_until_parked();
+        seen = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                terminal_text(window).contains("wfiles-ok")
+            })
+            .expect("窗口还在");
+        if !seen {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(seen, "终端里敲的命令应该真的跑起来，屏幕上要能看到输出");
+}
+
+#[gpui_kit::test]
+fn the_terminal_panel_can_be_closed_from_its_own_button(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        toggle_terminal(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("term-close").is_some(), "面板上要有关闭按钮");
+        window.click("term-close", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("terminal").is_none(), "关闭按钮应该收起面板");
+    });
+}
+
+#[gpui_kit::test]
+fn the_terminal_panel_is_reachable_from_the_command_palette(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("终端面板", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("app:toggle-terminal").is_some(),
+            "命令面板里该能搜到终端面板"
+        );
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("terminal").is_some(), "回车应该打开面板");
+    });
+}
+
+#[gpui_kit::test]
+fn the_terminal_grid_follows_the_panel_instead_of_keeping_the_default(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        toggle_terminal(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let rows = terminal_text(window).lines().count();
+        // 面板高 220，扣掉标题栏与留白只剩十几行。出厂是 24 行——
+        // 还是 24 就说明格子没量出来、行数没跟着面板改。
+        assert!(
+            rows > 4 && rows < 24,
+            "行数该跟着面板高度走，实际是 {rows} 行"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn dragging_across_the_terminal_selects_a_block(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        toggle_terminal(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let grid = window
+            .try_find("term-grid")
+            .expect("面板里该有格子区")
+            .bounds();
+        window.drag(
+            gpui_kit::point(grid.origin.x + px(2.), grid.origin.y + px(2.)),
+            gpui_kit::point(grid.origin.x + px(70.), grid.origin.y + px(30.)),
+            cx,
+        );
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("term-selection").is_some(),
+            "拖过终端应该拖出一块选区"
+        );
+    });
+
+    // 只点一下（不动）不算选中：那一下是"取消选中"。
+    step(cx, handle, |window, cx| {
+        window.click_at("term-grid", gpui_kit::point(px(2.), px(2.)), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("term-selection").is_none(),
+            "原地点一下应该取消选区"
+        );
+    });
 }

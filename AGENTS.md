@@ -39,6 +39,8 @@ cargo fmt --check
 | `src/bulk_rename.rs` | 批量重命名规则与预览（纯逻辑） |
 | `src/settings.rs` | 用户设置持久化（默认终端、每目录的排序与视图模式、窗口布局） |
 | `src/terminal.rs` | 系统终端探测与启动（纯逻辑） |
+| `src/term.rs` | 内嵌终端的纯逻辑：按键 → PTY 字节、屏幕与回滚、选中与取文本 |
+| `src/term_entity.rs` | 内嵌终端实体：起 PTY、跨线程收输出、量格子画屏幕、收键盘与鼠标 |
 | `src/clipboard.rs` | 剪贴板 |
 | `src/format.rs` | 展示层格式化 |
 | `src/session.rs` | 会话持久化（含状态目录的定位规则） |

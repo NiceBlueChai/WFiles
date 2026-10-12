@@ -985,7 +985,7 @@ impl Pane {
     ///
     /// “我正看着这个文件夹，想在这底下敲命令”是最常见的意图，
     /// 而选中一个子目录时显然是想去那里面。
-    fn terminal_target(&self) -> PathBuf {
+    pub(crate) fn terminal_target(&self) -> PathBuf {
         if self.selection.len() == 1
             && let Some(path) = self.selected_paths().into_iter().next()
             && path.is_dir()

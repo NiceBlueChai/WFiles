@@ -26,6 +26,7 @@ use crate::pane::{Pane, PaneCommand, PaneEvent};
 use crate::session::Session;
 use crate::thumbnails::Thumbnails;
 use crate::settings::{Layout, Settings};
+use crate::term_entity::{Terminal, TerminalEvent, TOGGLE_KEY};
 use crate::terminal;
 
 gpui_kit::actions!(
@@ -40,6 +41,7 @@ gpui_kit::actions!(
         ToggleSync,
         CopyToOther,
         MoveToOther,
+        ToggleTerminal,
     ]
 );
 
@@ -83,6 +85,8 @@ enum PaletteAction {
     EditKey(PaneCommand),
     /// 把某个终端设为默认；只改设置，不打开窗口。
     SetTerminal(String),
+    /// 开关底部的内嵌终端面板。
+    ToggleTerminal,
     NewTab,
     CloseTab,
     NextTab,
@@ -113,6 +117,9 @@ pub fn init(cx: &mut App) {
         // F5/F6 拷到/移到另一栏，同样是双栏管理器沿用多年的键位。
         KeyBinding::new("f5", CopyToOther, None),
         KeyBinding::new("f6", MoveToOther, None),
+        // 内嵌终端面板。Ctrl+Alt+T 是 Linux 桌面上"打开终端"的老键位，
+        // 换成 Ctrl 也和"打开系统终端"的 Cmd+Alt+T 区分得开。
+        KeyBinding::new(TOGGLE_KEY, ToggleTerminal, None),
     ]);
 }
 
@@ -144,6 +151,9 @@ pub struct WFilesApp {
     /// 退出时存盘的订阅；必须一直持有，否则回调会被丢弃。
     quit_subscription: Option<Subscription>,
     subscriptions: Vec<Subscription>,
+    /// 底部的内嵌终端。`None` = 收起来；收起来时实体也一起丢掉，
+    /// 于是里面的 shell 一定会被杀掉（见 `Terminal` 的 `Drop`）。
+    term: Option<Entity<Terminal>>,
 }
 
 impl WFilesApp {
@@ -187,6 +197,7 @@ impl WFilesApp {
             layout: None,
             quit_subscription: None,
             subscriptions: Vec::new(),
+            term: None,
         };
 
         app.subscriptions.push(cx.subscribe_in(
@@ -575,6 +586,35 @@ impl WFilesApp {
         cx.notify();
     }
 
+    /// 开关底部的内嵌终端面板。
+    ///
+    /// 打开时起在当前窗格（或唯一选中的那个目录）里；收起来就把实体丢掉，
+    /// 于是里面的 shell 一定跟着没——不留下一个看不见还在跑的进程。
+    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.term.is_some() {
+            self.term = None;
+            cx.notify();
+            return;
+        }
+        let dir = self.tabs[self.active].read(cx).terminal_target();
+        let terminal = cx.new(|cx| Terminal::new(dir, cx));
+        self.subscriptions.push(cx.subscribe_in(
+            &terminal,
+            window,
+            |this, _, event: &TerminalEvent, _, cx| match event {
+                TerminalEvent::Close => {
+                    this.term = None;
+                    cx.notify();
+                }
+            },
+        ));
+        // 一开就把键盘交过去：打开终端却还要点一下才能打字，那一下很别扭。
+        let handle = terminal.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.term = Some(terminal);
+        cx.notify();
+    }
+
     /// 把选中项拷（或移）到另一栏正在看的目录。
     ///
     /// 走的是和 Cmd+C / Cmd+X 同一条路：先放剪贴板再粘贴，
@@ -929,6 +969,7 @@ impl WFilesApp {
             PaletteAction::SetTerminal(id) => {
                 Settings::update(cx, |settings| settings.terminal = id.clone());
             }
+            PaletteAction::ToggleTerminal => self.toggle_terminal(window, cx),
             PaletteAction::NewTab => self.new_tab(window, cx),
             PaletteAction::CloseTab => self.close_tab(self.active, window, cx),
             PaletteAction::NextTab => self.next_tab(cx),
@@ -1118,6 +1159,21 @@ impl WFilesApp {
                 "tab 切换",
             ),
             action: PaletteAction::NextTab,
+        });
+
+        items.push(PaletteItem {
+            command: PaletteCommand::new(
+                "app:toggle-terminal",
+                if self.term.is_some() {
+                    "收起终端面板"
+                } else {
+                    "打开终端面板"
+                },
+                "Ctrl+Alt+T",
+                "终端",
+                "terminal 内嵌 面板 shell 命令行 抽屉",
+            ),
+            action: PaletteAction::ToggleTerminal,
         });
 
         // 换默认终端：只列装了的，免得选一个按下去报错的。
@@ -2142,8 +2198,13 @@ impl Render for WFilesApp {
                     .min_h_0()
                     .child(self.render_sidebar(cx))
                     .child(self.render_panes(cx)),
-            )
-            .child(self.render_status_bar(cx))
+            );
+        // 终端面板压在窗格下面、状态栏上面：它属于"当前窗口"而不是某个窗格，
+        // 所以不去动窗格那一栏的布局。
+        if let Some(terminal) = self.term.clone() {
+            root = root.child(terminal.into_any_element());
+        }
+        root = root.child(self.render_status_bar(cx))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| {
                 this.new_tab(window, cx)
             }))
@@ -2168,6 +2229,9 @@ impl Render for WFilesApp {
             }))
             .on_action(cx.listener(|this, _: &MoveToOther, _, cx| {
                 this.transfer_to_other(true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                this.toggle_terminal(window, cx)
             }));
 
         if has_overlay {

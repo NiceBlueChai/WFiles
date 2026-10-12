@@ -13,6 +13,8 @@ mod pane;
 mod preview;
 mod session;
 mod settings;
+mod term;
+mod term_entity;
 mod terminal;
 mod thumbnails;
 mod watch;
