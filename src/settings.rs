@@ -55,6 +55,12 @@ pub struct Settings {
     /// 不会让整份配置解析失败——那会把终端、标记、快捷键一起弄丢。
     #[serde(default)]
     pub meta_column: String,
+    /// 搬运限速，单位是**字节每秒**；`0` = 不限速。
+    ///
+    /// 存裸数字而不是"1 MB/s"这样的字符串：解析一句人话要写一个
+    /// 单位解析器，而写错了还得猜用户想说的是 1000 还是 1024。
+    #[serde(default)]
+    pub speed_limit: u64,
 }
 
 /// 一个存下来的搜索。
@@ -138,6 +144,7 @@ impl Default for Settings {
             saved_searches: Vec::new(),
             remotes: Vec::new(),
             meta_column: String::new(),
+            speed_limit: 0,
         }
     }
 }

@@ -32,6 +32,7 @@ mod session;
 mod settings;
 mod term;
 mod term_entity;
+mod throttle;
 mod terminal;
 mod thumbnails;
 mod watch;

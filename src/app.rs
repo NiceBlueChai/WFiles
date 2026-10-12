@@ -112,6 +112,8 @@ enum PaletteAction {
     Connect,
     /// 打开一条存下来的连接（存的是连接 id）。
     OpenRemote(String),
+    /// 设一个搬运限速（字节每秒，0 = 不限速）。
+    SetSpeedLimit(u64),
 }
 
 /// 连接对话框的当前状态。输入框随开随建、随关随毁，密码不留在别处。
@@ -1551,6 +1553,13 @@ impl WFilesApp {
         self.run_palette_action(action, window, cx);
     }
 
+    /// 设一个搬运限速。正在跑的那一趟立刻按新的来，不用等它结束。
+    fn set_speed_limit(&mut self, bytes_per_second: u64, cx: &mut Context<Self>) {
+        Settings::update(cx, |settings| settings.speed_limit = bytes_per_second);
+        self.ops.update(cx, |ops, cx| ops.set_speed_limit(bytes_per_second, cx));
+        cx.notify();
+    }
+
     fn run_palette_action(
         &mut self,
         action: PaletteAction,
@@ -1581,6 +1590,7 @@ impl WFilesApp {
             PaletteAction::MetaColumn(field) => self.set_meta_column(field, cx),
             PaletteAction::Connect => self.open_connect(window, cx),
             PaletteAction::OpenRemote(id) => self.open_remote(id, window, cx),
+            PaletteAction::SetSpeedLimit(rate) => self.set_speed_limit(rate, cx),
             PaletteAction::ToggleTerminal => self.toggle_terminal(window, cx),
             PaletteAction::SavedSearch(name) => {
                 let Some(saved) = Settings::read(cx).saved_search(&name).cloned() else {
@@ -1931,6 +1941,21 @@ impl WFilesApp {
                     "terminal shell 命令行",
                 ),
                 action: PaletteAction::SetTerminal(option.id.to_string()),
+            });
+        }
+
+        // 限速：一次大拷贝会把整块磁盘吃掉，同一时间想干点别的就全卡住。
+        let limit = Settings::read(cx).speed_limit;
+        for (rate, label) in crate::throttle::presets() {
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("speed:{rate}"),
+                    format!("传输限速：{label}"),
+                    if rate == limit { "当前" } else { "" },
+                    "传输",
+                    "speed limit 限速 带宽 传输 拷贝 慢一点",
+                ),
+                action: PaletteAction::SetSpeedLimit(rate),
             });
         }
 
@@ -2468,6 +2493,13 @@ impl WFilesApp {
                 let waiting = format!("还有 {queued} 个任务");
                 detail = detail.child(div().flex_shrink_0().child(waiting.clone()));
                 text.push_str(&format!(" {waiting}"));
+            }
+            // 限着速就写明：不然"怎么这么慢"看起来跟卡住了没两样。
+            let limit = self.ops.read(cx).speed_limit();
+            if limit > 0 {
+                let note = format!("限速 {}", format::speed(limit));
+                detail = detail.child(div().flex_shrink_0().child(note.clone()));
+                text.push_str(&format!(" {note}"));
             }
 
             v_flex()

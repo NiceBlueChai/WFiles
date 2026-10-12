@@ -6,6 +6,7 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -19,6 +20,8 @@ use crate::ops::{
 };
 use crate::remote::{self, Client};
 use crate::remotes::Remotes;
+use crate::settings::Settings;
+use crate::throttle::Limiter;
 
 /// 广播给窗格的事件：文件系统变了，该刷新的自己对照路径判断。
 #[derive(Clone, Debug)]
@@ -275,6 +278,9 @@ pub struct Ops {
     last_message: Option<String>,
     /// 远程连接注册表：只在主线程上用——取客户端，然后把客户端搬进后台线程。
     remotes: Option<Entity<Remotes>>,
+    /// 限速用的令牌桶。搬进后台线程的只是这一个 `Arc`：
+    /// 改限速是主线程上的事，改完正在跑的那一趟立刻按新的来。
+    limiter: Arc<Mutex<Limiter>>,
     /// 上一条消息是不是错误（决定显示颜色）。
     last_message_is_error: bool,
 }
@@ -284,6 +290,7 @@ impl Ops {
     pub fn new(remotes: Option<Entity<Remotes>>) -> Self {
         Self {
             remotes,
+            limiter: Arc::new(Mutex::new(Limiter::new(0))),
             clipboard: Clipboard::default(),
             history: History::default(),
             running: None,
@@ -303,6 +310,13 @@ impl Ops {
 
     pub fn clipboard(&self) -> &Clipboard {
         &self.clipboard
+    }
+
+    /// 此刻生效的限速（字节每秒，0 = 不限速）。
+    ///
+    /// 问令牌桶而不是问设置：正在跑的那一趟用的就是它手上的这个数。
+    pub fn speed_limit(&self) -> u64 {
+        self.limiter.lock().map(|it| it.rate()).unwrap_or(0)
     }
 
     pub fn running(&self) -> Option<&Running> {
@@ -893,6 +907,12 @@ impl Ops {
             return;
         }
         let remote = self.remote_sides(&sources, &dest, cx);
+        // 限速可能刚在面板里改过：每一趟开工前都照设置重设一次，
+        // 这样不必在"改设置"那条路上到处找谁来同步。
+        let limit = Settings::read(cx).speed_limit;
+        if let Ok(mut limiter) = self.limiter.lock() {
+            limiter.set_rate(limit);
+        }
         let total = ops::count_entries(&sources, remote.source.as_deref());
         let label = if cut {
             format!("正在移动 {} 项", sources.len())
@@ -901,6 +921,7 @@ impl Ops {
         };
         let retry_dest = dest.clone();
 
+        let limiter = self.limiter.clone();
         self.enqueue(
             Job {
                 label,
@@ -909,9 +930,27 @@ impl Ops {
                 run: Box::new(move |control, tx| {
                     // 每来一次进度都先看一眼手柄：暂停就在这里等到恢复，
                     // 中止就返回 false，拷贝随即停在当前数据块的边界。
+                    let mut accounted = 0u64;
                     let mut report = |progress: &Progress| {
                         if !control.should_continue() {
                             return false;
+                        }
+                        // 限速：上报的是累计字节，要记的是这一趟新添的那些。
+                        let fresh = progress.bytes_done.saturating_sub(accounted);
+                        accounted = progress.bytes_done;
+                        if fresh > 0 && let Ok(mut limiter) = limiter.lock() {
+                            limiter.take(fresh);
+                            // 一个数据块有 1 MB，欠的账一次睡不完：接着睡完，
+                            // 每一小段之间都再看一眼手柄，这样"限速 100 KB/s
+                            // 拷一个 10 GB 的文件"也还是按得动中止。
+                            while limiter.still_owing() {
+                                if !control.should_continue() {
+                                    return false;
+                                }
+                                if limiter.take(0).is_zero() {
+                                    break;
+                                }
+                            }
                         }
                         tx.try_send(WorkerMessage::Progress(progress.clone()))
                             .is_ok()
@@ -933,6 +972,21 @@ impl Ops {
             },
             cx,
         );
+    }
+
+    /// 改限速：写进设置，同时把令牌桶换上新的速率
+    /// ——正在跑的那一趟下一块就按新的来。
+    pub fn set_speed_limit(&mut self, bytes_per_second: u64, cx: &mut Context<Self>) {
+        if let Ok(mut limiter) = self.limiter.lock() {
+            limiter.set_rate(bytes_per_second);
+        }
+        self.last_message = Some(if bytes_per_second == 0 {
+            "已取消限速".to_string()
+        } else {
+            format!("限速 {}", crate::format::speed(bytes_per_second))
+        });
+        self.last_message_is_error = false;
+        cx.notify();
     }
 
     fn start_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {

@@ -3408,3 +3408,52 @@ fn the_webdav_preset_fills_in_a_domestic_provider(cx: &mut TestAppContext) {
     let after = cx.update(|cx| app.read(cx).connect_url(cx));
     assert_eq!(after, "https://dav.jianguoyun.com/dav/", "实际是 {after}");
 }
+
+#[gpui_kit::test]
+fn a_speed_limit_slows_the_transfer_down(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let from = root.path().join("from.bin");
+    // 1 MB：限速 500 KB/s 时，头一秒的免费额度用完之后还得再等约一秒。
+    std::fs::write(&from, vec![7u8; 1_000_000]).unwrap();
+
+    let ops = new_ops(cx);
+
+    // 先不限速跑一趟做对照：同样的数据该一眨眼就完。
+    let free = run_one_copy(cx, &ops, &from, &root.path().join("free"));
+    assert!(
+        free < Duration::from_millis(800),
+        "不限速时不该慢：{free:?}"
+    );
+
+    // 走设置这一条路：它才是限速的唯一来源（面板改的也是它）。
+    cx.update(|cx| Settings::update(cx, |settings| settings.speed_limit = 500_000));
+    let limited = run_one_copy(cx, &ops, &from, &root.path().join("slow"));
+    assert!(
+        limited > Duration::from_millis(800),
+        "限速 500 KB/s 传 1 MB 该慢下来：{limited:?}"
+    );
+
+    // 撤掉限速之后立刻按不限速跑：不用等重启。
+    cx.update(|cx| Settings::update(cx, |settings| settings.speed_limit = 0));
+    let again = run_one_copy(cx, &ops, &from, &root.path().join("fast"));
+    assert!(again < Duration::from_millis(800), "撤销限速该立刻生效：{again:?}");
+}
+
+/// 拷同一个文件到一个新目录，返回花了多久。
+fn run_one_copy(
+    cx: &mut TestAppContext,
+    ops: &gpui_kit::Entity<Ops>,
+    from: &Path,
+    dest: &Path,
+) -> Duration {
+    std::fs::create_dir_all(dest).unwrap();
+    cx.update(|cx| {
+        ops.update(cx, |ops, cx| {
+            ops.copy(vec![from.to_path_buf()], cx);
+            ops.request_paste(dest.to_path_buf(), cx);
+        })
+    });
+    let started = Instant::now();
+    wait_until_idle(cx, ops);
+    started.elapsed()
+}
