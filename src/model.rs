@@ -131,6 +131,43 @@ impl Sort {
     }
 }
 
+/// 窗格用哪种方式显示当前目录。
+///
+/// 派生 `Serialize` 是为了"每个目录记住它的视图"能落盘；
+/// 和 [`Sort`] 一样，旧配置里没有这个字段时必须还能读出来。
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewMode {
+    /// 一行一项，带大小、修改时间、类型三列。
+    #[default]
+    List,
+    /// 缩略图格子：看图挑图时一行一项太浪费。
+    Grid,
+}
+
+impl ViewMode {
+    /// 工具栏和命令面板上怎么写。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::List => "列表",
+            Self::Grid => "网格",
+        }
+    }
+
+    /// 快捷键提示里用的那一位数字。
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            Self::List => "Cmd+1",
+            Self::Grid => "Cmd+2",
+        }
+    }
+
+    /// 所有视图，按工具栏上的排列顺序。
+    pub const ALL: [Self; 2] = [Self::List, Self::Grid];
+}
+
 /// 一个目录的内容，连同它的排序与过滤状态。
 ///
 /// `order` 是排序并过滤后的下标序列，界面只按它渲染，
@@ -451,6 +488,32 @@ mod tests {
             .filter_map(|ix| listing.visible_entry(ix))
             .map(|entry| entry.name.clone())
             .collect()
+    }
+
+    #[test]
+    fn every_view_has_a_label_and_a_shortcut() {
+        for mode in ViewMode::ALL {
+            assert!(!mode.label().is_empty());
+            assert!(mode.shortcut().starts_with("Cmd+"));
+        }
+    }
+
+    #[test]
+    fn a_view_mode_survives_the_roundtrip() {
+        for mode in ViewMode::ALL {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<ViewMode>(&json).unwrap(), mode);
+        }
+        // 旧配置里没有这个字段：读出默认值而不是报错。
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            #[serde(default)]
+            view: ViewMode,
+        }
+        assert_eq!(
+            serde_json::from_str::<Holder>("{}").unwrap().view,
+            ViewMode::List
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ cargo fmt --check
 |---|---|
 | `src/main.rs` | 入口：application 初始化 + 开窗 |
 | `src/app.rs` | `WFilesApp` 应用外壳与全局状态 |
-| `src/pane.rs` | 面板系统（导航/列表 UI） |
+| `src/pane.rs` | 面板系统（导航/列表与网格 UI、视图模式） |
 | `src/model.rs` | 数据模型（目录/条目/会话） |
 | `src/ops.rs` | 文件操作（复制/移动/删除/重命名）、字节计数与任务控制手柄 `Control` |
 | `src/ops_entity.rs` | 文件操作的 UI 枢纽：任务队列、进度与速度、冲突、撤销栈 |
@@ -34,7 +34,7 @@ cargo fmt --check
 | `src/preview.rs` | Quick Look 内容层：类型判定、文本/二进制读取（纯逻辑） |
 | `src/thumbnails.rs` | 缩略图：后台解码 + 有上限的缓存 |
 | `src/bulk_rename.rs` | 批量重命名规则与预览（纯逻辑） |
-| `src/settings.rs` | 用户设置持久化（当前只有默认终端） |
+| `src/settings.rs` | 用户设置持久化（默认终端、每目录的排序与视图模式、窗口布局） |
 | `src/terminal.rs` | 系统终端探测与启动（纯逻辑） |
 | `src/clipboard.rs` | 剪贴板 |
 | `src/format.rs` | 展示层格式化 |

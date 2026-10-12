@@ -4,6 +4,7 @@
 //! 文件操作不在这里执行：窗格只向 [`Ops`] 发起请求，完成后根据事件刷新自己。
 
 use std::{
+    cell::Cell,
     path::{Path, PathBuf},
     rc::Rc,
     time::Duration,
@@ -24,7 +25,7 @@ use gpui_kit::{AsyncApp, Size, Task, WeakEntity, *};
 
 use crate::clipboard;
 use crate::format;
-use crate::model::{Listing, Selection, Sort, SortKey};
+use crate::model::{Listing, Selection, Sort, SortKey, ViewMode};
 use crate::ops_entity::{Ops, OpsEvent};
 use crate::preview::{self, Preview};
 use crate::settings::Settings;
@@ -36,6 +37,16 @@ const ROW_HEIGHT: f32 = 40.;
 const COL_SIZE: f32 = 100.;
 const COL_MODIFIED: f32 = 130.;
 const COL_KIND: f32 = 90.;
+
+/// 网格里一个格子的尺寸（逻辑像素）。
+const TILE_WIDTH: f32 = 112.;
+const TILE_HEIGHT: f32 = 132.;
+/// 格子之间的间距，也是网格的左右留白（`px_3`）。
+const TILE_GAP: f32 = 12.;
+/// 格子里的缩略图区边长。
+const TILE_ART: f32 = 64.;
+/// 宽度还没量出来时先按这个列数排，量到了立刻纠正。
+const FALLBACK_COLUMNS: usize = 4;
 
 /// 键盘绑定的作用域。
 ///
@@ -76,6 +87,8 @@ gpui_kit::actions!(
         Undo,
         OpenTerminal,
         QuickLook,
+        ViewList,
+        ViewGrid,
     ]
 );
 
@@ -112,6 +125,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-t", OpenTerminal, context),
         // 空格是 Quick Look 的通用键位（macOS Finder、Dolphin 都是它）。
         KeyBinding::new("space", QuickLook, context),
+        // 视图切换：Cmd+1/2 与工具栏那两颗按钮是同一件事。
+        KeyBinding::new("cmd-1", ViewList, context),
+        KeyBinding::new("cmd-2", ViewGrid, context),
     ]);
 }
 
@@ -143,6 +159,10 @@ pub enum PaneCommand {
     CopyFileName,
     OpenTerminal,
     QuickLook,
+    /// 换成列表视图。
+    ViewList,
+    /// 换成网格视图。
+    ViewGrid,
 }
 
 /// 一次 Quick Look 的快照。
@@ -172,8 +192,19 @@ pub struct Pane {
     error: Option<String>,
     status: String,
     scroll: VirtualListScrollHandle,
-    /// 虚拟列表要一份逐行高度，行数变化时才重建。
+    /// 虚拟列表要一份逐行高度，行数或行高变化时才重建。
+    ///
+    /// 列表模式下一项一行；网格模式下一"行"是 [`Self::columns`] 个格子。
     row_sizes: Rc<Vec<Size<Pixels>>>,
+    /// 当前目录用什么视图显示。
+    view: ViewMode,
+    /// 量出来的列表可用宽度，网格据此算一行放几格。
+    ///
+    /// GPUI 没有元素级的 `on_resize`，也读不到兄弟元素的 bounds，
+    /// 所以插一个零高度探针（[`Self::render_width_probe`]）把宽度带回实体。
+    /// 探针是**上一帧**写的，因此宽度的变化会比窗口拉伸晚一帧跟上。
+    width_probe: Rc<Cell<Pixels>>,
+    known_width: Pixels,
     /// 当前目录的监听任务；丢掉它就等于停止监听。
     watch_task: Option<Task<()>>,
     /// Quick Look 浮层；`None` 就是没开。
@@ -208,6 +239,9 @@ impl Pane {
             status: String::new(),
             scroll: VirtualListScrollHandle::new(),
             row_sizes: Rc::new(Vec::new()),
+            view: ViewMode::default(),
+            width_probe: Rc::new(Cell::new(px(0.))),
+            known_width: px(0.),
             watch_task: None,
             quick_look: None,
             subscriptions: Vec::new(),
@@ -243,10 +277,11 @@ impl Pane {
             },
         ));
 
+        // 先套用记住的视图：网格的一"行"是好几项，行高和行数都跟着变。
+        pane.apply_remembered_view(cx);
         pane.sync_row_sizes();
         pane.update_status();
         pane.start_watching(cx);
-        pane.apply_remembered_sort(cx);
         // 一打开就能用方向键，不需要先点一下列表。
         pane.focus.focus(window, cx);
         pane
@@ -271,10 +306,11 @@ impl Pane {
         self.listing.path().parent().is_some()
     }
 
-    /// 套用这个目录上次记住的排序；没去过就保持原样。
-    fn apply_remembered_sort(&mut self, cx: &mut Context<Self>) {
-        if let Some(sort) = Settings::read(cx).view_for(self.listing.path()) {
-            self.listing.set_sort(sort);
+    /// 套用这个目录上次记住的排序与视图；没去过就保持原样。
+    fn apply_remembered_view(&mut self, cx: &mut Context<Self>) {
+        if let Some(remembered) = Settings::read(cx).view_for(self.listing.path()) {
+            self.listing.set_sort(remembered.sort);
+            self.view = remembered.view;
         }
     }
 
@@ -288,11 +324,75 @@ impl Pane {
         cx.notify();
     }
 
-    fn sync_row_sizes(&mut self) {
-        let count = self.listing.visible_count();
-        if self.row_sizes.len() != count {
-            self.row_sizes = Rc::new(vec![size(px(0.), px(ROW_HEIGHT)); count]);
+    /// 一行放得下几个格子。列表模式恒为 1。
+    fn columns(&self) -> usize {
+        match self.view {
+            ViewMode::List => 1,
+            ViewMode::Grid => {
+                if self.known_width <= px(0.) {
+                    return FALLBACK_COLUMNS;
+                }
+                // 左右留白之外，每列还要吃掉一个间距（最后一列后面没有）。
+                let usable = self.known_width.as_f32() - 2. * TILE_GAP + TILE_GAP;
+                (usable / (TILE_WIDTH + TILE_GAP)).floor() as usize
+            }
         }
+        .max(1)
+    }
+
+    /// 第 `position` 项落在第几个虚拟行里。
+    ///
+    /// 滚动要按行算：网格里一行好几项，按项号滚会滚过头。
+    fn row_of(&self, position: usize) -> usize {
+        position / self.columns()
+    }
+
+    /// 虚拟列表一共要多少行。
+    fn row_count(&self) -> usize {
+        self.listing.visible_count().div_ceil(self.columns())
+    }
+
+    /// 一行多高：网格的行比列表高得多，中间还夹一个间距。
+    fn row_height(&self) -> Pixels {
+        match self.view {
+            ViewMode::List => px(ROW_HEIGHT),
+            ViewMode::Grid => px(TILE_HEIGHT + TILE_GAP),
+        }
+    }
+
+    fn sync_row_sizes(&mut self) {
+        let rows = self.row_count();
+        let height = self.row_height();
+        let stale = self.row_sizes.len() != rows
+            || self.row_sizes.first().is_some_and(|size| size.height != height);
+        if stale {
+            self.row_sizes = Rc::new(vec![size(px(0.), height); rows]);
+        }
+    }
+
+    /// 换视图。排序和视图都记进设置：下次回到这个目录照旧。
+    fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
+        if self.view == view {
+            return;
+        }
+        self.view = view;
+        self.remember_view(cx);
+        self.sync_row_sizes();
+        // 视图换了，光标那一项的"第几行"也变了，把它滚回视野。
+        if let Some(position) = self.selection.focus_position(&self.listing) {
+            let row = self.row_of(position);
+            self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        cx.notify();
+    }
+
+    /// 把当前排序与视图写进设置。改排序和改视图都要走这里，
+    /// 否则改完视图再改排序，视图会被写回默认值。
+    fn remember_view(&mut self, cx: &mut Context<Self>) {
+        let path = self.listing.path().to_path_buf();
+        let sort = self.listing.sort();
+        let view = self.view;
+        Settings::update(cx, |settings| settings.remember_view(path, sort, view));
     }
 
     fn scroll_to_top(&self) {
@@ -349,8 +449,9 @@ impl Pane {
                     self.forward.clear();
                 }
                 self.listing = listing;
-                // 这个目录上次用什么排序就还用什么；没去过的地方沿用当前的。
-                self.apply_remembered_sort(cx);
+                // 这个目录上次用什么排序、什么视图就还用什么；
+                // 没去过的地方沿用当前的。
+                self.apply_remembered_view(cx);
                 self.selection.clear();
                 self.error = None;
                 self.clear_filter(window, cx);
@@ -442,14 +543,12 @@ impl Pane {
     fn toggle_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
         self.listing.toggle_sort(key);
         // 记住这个目录的排序：下次回到这里还是这个顺序。
-        let path = self.listing.path().to_path_buf();
-        let sort = self.listing.sort();
-        Settings::update(cx, |settings| settings.remember_view(path, sort));
+        self.remember_view(cx);
         self.sync_row_sizes();
         // 选中项按路径记，换排序之后还是原来那批文件；只把光标那行滚回视野。
         if let Some(position) = self.selection.focus_position(&self.listing) {
-            self.scroll
-                .scroll_to_item(position, ScrollStrategy::Nearest);
+            let row = self.row_of(position);
+            self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
         }
         self.update_status();
         cx.notify();
@@ -512,7 +611,8 @@ impl Pane {
             .scroll
             .bottom_item()
             .saturating_sub(self.scroll.top_item());
-        let page = rows.max(1) as isize;
+        // 网格里一屏是"几行 × 每行几格"项，按行数翻只会翻过去一小截。
+        let page = (rows.max(1) * self.columns()) as isize;
         self.move_cursor(page * direction, false, cx);
     }
 
@@ -528,7 +628,7 @@ impl Pane {
             self.selection.select(path);
         }
         self.scroll
-            .scroll_to_item(position, ScrollStrategy::Nearest);
+            .scroll_to_item(self.row_of(position), ScrollStrategy::Nearest);
         self.update_status();
         cx.notify();
     }
@@ -726,6 +826,8 @@ impl Pane {
             PaneCommand::CopyFileName => self.copy_file_names(cx),
             PaneCommand::OpenTerminal => self.open_terminal(cx),
             PaneCommand::QuickLook => self.toggle_quick_look(cx),
+            PaneCommand::ViewList => self.set_view(ViewMode::List, cx),
+            PaneCommand::ViewGrid => self.set_view(ViewMode::Grid, cx),
         }
     }
 
@@ -844,12 +946,43 @@ impl Pane {
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .children(self.render_file_ops(cx))
+            .children(self.render_view_buttons(cx))
             .child(
                 Input::new(&self.filter)
                     .prefix(Icon::new(IconName::Search).size_4())
                     .cleanable(true)
                     .w(px(200.)),
             )
+    }
+
+    /// 视图切换：每种视图一颗按钮，当前那种亮着。
+    ///
+    /// 不用"一颗按钮轮流切"：那种要点好几下才知道自己切到哪儿了，
+    /// 而这里总共就两种，直接点名字更快。
+    fn render_view_buttons(&mut self, cx: &mut Context<Self>) -> Vec<Button> {
+        ViewMode::ALL
+            .iter()
+            .map(|&mode| {
+                let id = match mode {
+                    ViewMode::List => "view-list",
+                    ViewMode::Grid => "view-grid",
+                };
+                Button::new(id)
+                    .icon(Self::icon_for_view(mode))
+                    .ghost()
+                    .small()
+                    .selected(self.view == mode)
+                    .tooltip(format!("{}视图（{}）", mode.label(), mode.shortcut()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_view(mode, cx)))
+            })
+            .collect()
+    }
+
+    fn icon_for_view(mode: ViewMode) -> IconName {
+        match mode {
+            ViewMode::List => IconName::List,
+            ViewMode::Grid => IconName::LayoutGrid,
+        }
     }
 
     /// 文件操作按钮组：选中状态决定哪些能按。
@@ -1215,31 +1348,15 @@ impl Pane {
 
     fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.listing.visible_count() == 0 {
-            let (icon, label) = if self.listing.query().is_empty() {
-                (IconName::FolderOpen, "这个文件夹是空的")
-            } else {
-                (IconName::SearchX, "没有匹配的项目")
-            };
-            return div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .items_center()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(Icon::new(icon).size_8())
-                        .child(div().text_sm().child(label)),
-                )
-                .into_any_element();
+            return self.render_empty(cx);
         }
 
         let row_sizes = self.row_sizes.clone();
         v_flex()
             .id("file-list")
+            // 让集成测试能一眼看出"现在是列表还是网格"，顺带给读屏软件报一声。
+            .test_support()
+            .aria_label("列表视图")
             .relative()
             .flex_1()
             .min_h_0()
@@ -1259,6 +1376,215 @@ impl Pane {
             )
             .scrollbar(&self.scroll, ScrollbarAxis::Vertical)
             .into_any_element()
+    }
+
+    /// 空目录（或筛选后一个都不剩）时的居中提示，两种视图共用。
+    fn render_empty(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let (icon, label) = if self.listing.query().is_empty() {
+            (IconName::FolderOpen, "这个文件夹是空的")
+        } else {
+            (IconName::SearchX, "没有匹配的项目")
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .gap_3()
+                    .items_center()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(Icon::new(icon).size_8())
+                    .child(div().text_sm().child(label)),
+            )
+            .into_any_element()
+    }
+
+    /// 网格：一个虚拟列表，但每一项是"一行格子"而不是一个文件。
+    ///
+    /// 之所以不直接用 `flex_wrap` 一把铺开：那样十万项会全部进布局树，
+    /// 而 P2 的硬指标是十万项不卡。虚拟列表只画看得见的那几行。
+    fn render_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.listing.visible_count() == 0 {
+            return self.render_empty(cx);
+        }
+
+        let row_sizes = self.row_sizes.clone();
+        let columns = self.columns();
+        v_flex()
+            .id("file-grid")
+            .test_support()
+            .aria_label("网格视图")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(
+                v_virtual_list(
+                    cx.entity().clone(),
+                    "rows",
+                    row_sizes,
+                    move |pane, visible_range, _, cx| {
+                        visible_range
+                            .map(|row| pane.render_tile_row(row, columns, cx))
+                            .collect()
+                    },
+                )
+                .track_scroll(&self.scroll)
+                .p(px(TILE_GAP)),
+            )
+            .scrollbar(&self.scroll, ScrollbarAxis::Vertical)
+            .into_any_element()
+    }
+
+    /// 第 `row` 行：把这一行该有的格子横排出来，末尾不足就少放几个。
+    fn render_tile_row(
+        &mut self,
+        row: usize,
+        columns: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let first = row * columns;
+        h_flex()
+            .gap(px(TILE_GAP))
+            .children((0..columns).filter_map(|column| self.render_tile(first + column, cx)))
+            .into_any_element()
+    }
+
+    /// 一个格子：缩略图（或类型图标）、名字、大小。
+    ///
+    /// 名字那个内层 div 沿用列表行的 id（`row-name`）：集成测试同一套
+    /// `row_names` 助手在两种视图下都能用，不用为网格再写一遍。
+    fn render_tile(&mut self, position: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let entry = self.listing.visible_entry(position)?;
+        let path = entry.path.clone();
+        let open_path = entry.path.clone();
+        let name = entry.name.clone();
+        let is_dir = entry.is_dir;
+        let size = entry.size;
+        let is_selected = self.selection.contains(&entry.path);
+        // 到此 `entry` 不再被用到，它对 `self.listing` 的借用也就到头了：
+        // 下面问缩略图要 `&mut self`，两笔借用不能重叠。
+        let thumbnail = if is_dir {
+            None
+        } else {
+            self.thumbnail_of_size(&path, thumbnails::GRID_EDGE, cx)
+        };
+        let caption = if is_dir {
+            "文件夹".to_string()
+        } else {
+            format::file_size(size)
+        };
+        let icon_color = if is_dir {
+            cx.theme().primary
+        } else {
+            cx.theme().muted_foreground
+        };
+        let radius = cx.theme().radius;
+        let muted = cx.theme().muted_foreground;
+
+        let tile = div()
+            .id(("tile", position))
+            // 集成测试靠格子之间的相对位置断言"一行放了几格"。
+            .test_support()
+            .w(px(TILE_WIDTH))
+            .h(px(TILE_HEIGHT))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .p_1()
+            .cursor_pointer()
+            .rounded(radius)
+            .child(
+                div()
+                    .w(px(TILE_ART))
+                    .h(px(TILE_ART))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius)
+                    .bg(cx.theme().muted)
+                    .overflow_hidden()
+                    .text_color(icon_color)
+                    .child(match thumbnail {
+                        Some(thumbnail) => img(ImageSource::Render(thumbnail.image))
+                            .size_full()
+                            .object_fit(ObjectFit::Contain)
+                            .into_any_element(),
+                        None => Icon::new(if is_dir {
+                            IconName::Folder
+                        } else {
+                            IconName::File
+                        })
+                        .size_10()
+                        .into_any_element(),
+                    }),
+            )
+            .child(
+                div()
+                    .id(("row-name", position))
+                    .test_support()
+                    .aria_label(name.clone())
+                    .w_full()
+                    .text_xs()
+                    .text_center()
+                    .line_clamp(2)
+                    .child(name),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .truncate()
+                    .child(caption),
+            );
+
+        Some(
+            tile.when(is_selected, |tile| {
+                tile.bg(cx.theme().muted)
+                    .border_1()
+                    .border_color(cx.theme().primary)
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.select_row(path.clone(), event.modifiers);
+                    this.update_status();
+                    let plain_double_click = event.click_count >= 2
+                        && !event.modifiers.shift
+                        && !event.modifiers.secondary();
+                    if plain_double_click {
+                        this.open_path(open_path.clone(), window, cx);
+                    }
+                    if !this.focus.is_focused(window) {
+                        this.focus.focus(window, cx);
+                    }
+                    cx.notify();
+                }),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// 量出"这一栏有多宽"。
+    ///
+    /// 网格要知道宽度才能算一行放几格，而 GPUI 既没有元素级的 `on_resize`，
+    /// 也没有"读兄弟元素的 bounds"这种接口。于是插一个零高度的 canvas：
+    /// 它布局完拿到自己的宽度（等于父容器可用宽度）写进共享单元格，
+    /// 下一帧渲染时 [`Pane::render`] 读出来。零高度所以看不见，
+    /// 窗口拉伸时每帧重排，宽度自己会跟上。
+    fn render_width_probe(&self) -> AnyElement {
+        let probe = self.width_probe.clone();
+        canvas(
+            move |bounds: Bounds<Pixels>, _, _| probe.set(bounds.size.width),
+            |_, _, _, _| {},
+        )
+        .w_full()
+        .h(px(0.))
+        .into_any_element()
     }
 
     /// 表头 + 列表 + 状态栏，也就是键盘绑定生效的那一块。
@@ -1347,8 +1673,20 @@ impl Pane {
             .on_action(cx.listener(|this, _: &QuickLook, window, cx| {
                 this.run_command(PaneCommand::QuickLook, window, cx)
             }))
-            .child(self.render_header(cx))
-            .child(self.render_list(cx))
+            .on_action(cx.listener(|this, _: &ViewList, window, cx| {
+                this.run_command(PaneCommand::ViewList, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ViewGrid, window, cx| {
+                this.run_command(PaneCommand::ViewGrid, window, cx)
+            }))
+            .child(self.render_width_probe())
+            .when(self.view == ViewMode::List, |body| {
+                body.child(self.render_header(cx))
+            })
+            .child(match self.view {
+                ViewMode::List => self.render_list(cx),
+                ViewMode::Grid => self.render_grid(cx),
+            })
             .child(self.render_status_bar(cx))
     }
 
@@ -1726,6 +2064,15 @@ fn icon_for_kind(kind: preview::Kind) -> IconName {
 
 impl Render for Pane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 探针写的是上一帧量到的宽度。网格的行数跟着列数走，
+        // 所以宽度一变就得重排行高并再画一次；宽度稳定后自然收敛。
+        let measured = self.width_probe.get();
+        if measured > px(0.) && measured != self.known_width {
+            self.known_width = measured;
+            self.sync_row_sizes();
+            cx.notify();
+        }
+
         let mut root = h_flex()
             .size_full()
             .min_w_0()

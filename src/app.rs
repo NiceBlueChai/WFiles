@@ -899,17 +899,19 @@ impl WFilesApp {
             PaneCommand::CopyFileName,
             PaneCommand::OpenTerminal,
             PaneCommand::QuickLook,
+            PaneCommand::ViewList,
+            PaneCommand::ViewGrid,
         ] {
             if !self.pane_command_enabled(command, cx) {
                 continue;
             }
-            let (title, hint, keywords) = Self::describe_pane_command(command);
+            let (title, hint, group, keywords) = Self::describe_pane_command(command);
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     format!("pane:{command:?}"),
                     title,
                     hint,
-                    "文件",
+                    group,
                     keywords,
                 ),
                 action: PaletteAction::Pane(command),
@@ -1104,26 +1106,37 @@ impl WFilesApp {
         }
     }
 
-    fn describe_pane_command(command: PaneCommand) -> (&'static str, &'static str, &'static str) {
+    /// (标题, 快捷键提示, 分组, 搜索关键词)
+    fn describe_pane_command(
+        command: PaneCommand,
+    ) -> (&'static str, &'static str, &'static str, &'static str) {
         match command {
-            PaneCommand::NewFolder => ("新建文件夹", "Cmd+Shift+N", "folder 创建 目录"),
-            PaneCommand::Rename => ("重命名", "F2", "rename 改名"),
-            PaneCommand::BulkRename => ("批量重命名", "Cmd+Shift+R", "batch 序号 模板"),
-            PaneCommand::Trash => ("移到回收站", "Cmd+Backspace", "delete 删除 trash"),
-            PaneCommand::Copy => ("拷贝选中项", "Cmd+C", "copy"),
-            PaneCommand::Cut => ("剪切选中项", "Cmd+X", "cut 移动"),
-            PaneCommand::Paste => ("粘贴到当前目录", "Cmd+V", "paste"),
-            PaneCommand::Undo => ("撤销上一步操作", "Cmd+Z", "undo 恢复"),
-            PaneCommand::Refresh => ("刷新当前目录", "Cmd+R", "refresh 重新读取"),
-            PaneCommand::GoUp => ("前往上一级", "Backspace", "up parent 上级"),
-            PaneCommand::CopyPath => ("复制路径", "Cmd+Alt+C", "path 剪贴板"),
-            PaneCommand::CopyFileName => ("复制文件名", "Cmd+Shift+C", "name 剪贴板"),
-            PaneCommand::OpenTerminal => {
-                ("在这里打开终端", "Cmd+Alt+T", "terminal 终端 shell 命令行")
+            PaneCommand::NewFolder => ("新建文件夹", "Cmd+Shift+N", "文件", "folder 创建 目录"),
+            PaneCommand::Rename => ("重命名", "F2", "文件", "rename 改名"),
+            PaneCommand::BulkRename => {
+                ("批量重命名", "Cmd+Shift+R", "文件", "batch 序号 模板")
             }
+            PaneCommand::Trash => ("移到回收站", "Cmd+Backspace", "文件", "delete 删除 trash"),
+            PaneCommand::Copy => ("拷贝选中项", "Cmd+C", "文件", "copy"),
+            PaneCommand::Cut => ("剪切选中项", "Cmd+X", "文件", "cut 移动"),
+            PaneCommand::Paste => ("粘贴到当前目录", "Cmd+V", "文件", "paste"),
+            PaneCommand::Undo => ("撤销上一步操作", "Cmd+Z", "文件", "undo 恢复"),
+            PaneCommand::Refresh => ("刷新当前目录", "Cmd+R", "文件", "refresh 重新读取"),
+            PaneCommand::GoUp => ("前往上一级", "Backspace", "文件", "up parent 上级"),
+            PaneCommand::CopyPath => ("复制路径", "Cmd+Alt+C", "文件", "path 剪贴板"),
+            PaneCommand::CopyFileName => ("复制文件名", "Cmd+Shift+C", "文件", "name 剪贴板"),
+            PaneCommand::OpenTerminal => (
+                "在这里打开终端",
+                "Cmd+Alt+T",
+                "文件",
+                "terminal 终端 shell 命令行",
+            ),
             PaneCommand::QuickLook => {
-                ("快速查看", "空格", "preview 预览 quick look 查看")
+                ("快速查看", "空格", "文件", "preview 预览 quick look 查看")
             }
+            // 换视图不作用于文件，归到"视图"组里更好找。
+            PaneCommand::ViewList => ("列表视图", "Cmd+1", "视图", "view list 列表 一行一项"),
+            PaneCommand::ViewGrid => ("网格视图", "Cmd+2", "视图", "view grid 网格 缩略图"),
         }
     }
 

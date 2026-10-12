@@ -12,7 +12,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::Sort;
+use crate::model::{Sort, ViewMode};
 use crate::terminal;
 
 /// 最多记住多少个目录的视图。
@@ -38,13 +38,15 @@ pub struct Settings {
 
 /// 一个目录记住的视图设置。
 ///
-/// 目前只有排序——等有了网格/Miller 视图和可拖动列宽，往这里加字段就行，
-/// 读取侧不必改（旧配置缺字段会走 `Default`）。
+/// 排序之外现在还有视图模式（列表/网格/分列）——等有了可拖动列宽，
+/// 往这里加字段就行，读取侧不必改（旧配置缺字段会走 `Default`）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderView {
     pub path: PathBuf,
     #[serde(default)]
     pub sort: Sort,
+    #[serde(default)]
+    pub view: ViewMode,
 }
 
 /// 工作区布局：窗口左上角与尺寸，单位像素。
@@ -128,25 +130,25 @@ impl Settings {
         })
     }
 
-    /// 这个目录上次用的排序；没记住过就是 `None`，由调用方决定默认值。
-    pub fn view_for(&self, path: &Path) -> Option<Sort> {
+    /// 这个目录上次用的排序与视图；没记住过就是 `None`，由调用方决定默认值。
+    pub fn view_for(&self, path: &Path) -> Option<FolderView> {
         self.folder_views
             .iter()
             .find(|view| view.path == path)
-            .map(|view| view.sort)
+            .cloned()
     }
 
-    /// 记住这个目录的排序。
+    /// 记住这个目录的排序与视图。
     ///
     /// 同一个目录再来就更新并挪到最前面，超过上限丢最久没用的那个——
     /// 这是"最近用过的目录"，不是"去过的所有目录"。
-    pub fn remember_view(&mut self, path: PathBuf, sort: Sort) {
-        if let Some(position) = self.folder_views.iter().position(|view| view.path == path) {
+    pub fn remember_view(&mut self, path: PathBuf, sort: Sort, view: ViewMode) {
+        if let Some(position) = self.folder_views.iter().position(|entry| entry.path == path) {
             self.folder_views.remove(position);
         } else if self.folder_views.len() >= MAX_FOLDER_VIEWS {
             self.folder_views.pop();
         }
-        self.folder_views.insert(0, FolderView { path, sort });
+        self.folder_views.insert(0, FolderView { path, sort, view });
     }
 
     pub fn file_path() -> Option<PathBuf> {
@@ -203,6 +205,11 @@ mod tests {
         }
     }
 
+    /// 这个目录记住的排序；视图模式单独断言。
+    fn sort_for(stored: &Settings, path: &Path) -> Option<Sort> {
+        stored.view_for(path).map(|view| view.sort)
+    }
+
     #[test]
     fn roundtrip_preserves_the_terminal_choice() {
         let root = tempfile::tempdir().unwrap();
@@ -220,15 +227,24 @@ mod tests {
         let downloads = PathBuf::from("/Users/me/Downloads");
         let projects = PathBuf::from("/Users/me/Projects");
 
-        stored.remember_view(downloads.clone(), sort_by(SortKey::Modified));
-        stored.remember_view(projects.clone(), sort_by(SortKey::Name));
+        stored.remember_view(
+            downloads.clone(),
+            sort_by(SortKey::Modified),
+            ViewMode::Grid,
+        );
+        stored.remember_view(projects.clone(), sort_by(SortKey::Name), ViewMode::default());
 
-        assert_eq!(stored.view_for(&downloads), Some(sort_by(SortKey::Modified)));
-        assert_eq!(stored.view_for(&projects), Some(sort_by(SortKey::Name)));
+        assert_eq!(sort_for(&stored, &downloads), Some(sort_by(SortKey::Modified)));
+        assert_eq!(sort_for(&stored, &projects), Some(sort_by(SortKey::Name)));
         assert_eq!(
             stored.view_for(&PathBuf::from("/Users/me/Music")),
             None,
             "没去过的地方就该说没记住"
+        );
+        // 视图模式和排序是一起记住的：换视图不该丢排序，换排序也不该丢视图。
+        assert_eq!(
+            stored.view_for(&downloads).map(|view| view.view),
+            Some(ViewMode::Grid)
         );
     }
 
@@ -236,20 +252,24 @@ mod tests {
     fn remembering_twice_updates_instead_of_duplicating() {
         let mut stored = Settings::default();
         let path = PathBuf::from("/a");
-        stored.remember_view(path.clone(), sort_by(SortKey::Name));
-        stored.remember_view(path.clone(), sort_by(SortKey::Size));
+        stored.remember_view(path.clone(), sort_by(SortKey::Name), ViewMode::default());
+        stored.remember_view(path.clone(), sort_by(SortKey::Size), ViewMode::Grid);
 
         assert_eq!(stored.folder_views.len(), 1);
-        assert_eq!(stored.view_for(&path), Some(sort_by(SortKey::Size)));
+        assert_eq!(sort_for(&stored, &path), Some(sort_by(SortKey::Size)));
+        assert_eq!(
+            stored.view_for(&path).map(|view| view.view),
+            Some(ViewMode::Grid)
+        );
     }
 
     #[test]
     fn the_most_recent_folder_stays_at_the_front() {
         let mut stored = Settings::default();
-        stored.remember_view(PathBuf::from("/a"), Sort::default());
-        stored.remember_view(PathBuf::from("/b"), Sort::default());
+        stored.remember_view(PathBuf::from("/a"), Sort::default(), ViewMode::default());
+        stored.remember_view(PathBuf::from("/b"), Sort::default(), ViewMode::default());
         // 再回一次 /a：它该重新排到最前面。
-        stored.remember_view(PathBuf::from("/a"), Sort::default());
+        stored.remember_view(PathBuf::from("/a"), Sort::default(), ViewMode::default());
 
         assert_eq!(stored.folder_views[0].path, PathBuf::from("/a"));
         assert_eq!(stored.folder_views.len(), 2);
@@ -259,7 +279,11 @@ mod tests {
     fn the_view_list_stops_growing() {
         let mut stored = Settings::default();
         for index in 0..MAX_FOLDER_VIEWS + 50 {
-            stored.remember_view(PathBuf::from(format!("/d{index}")), Sort::default());
+            stored.remember_view(
+                PathBuf::from(format!("/d{index}")),
+                Sort::default(),
+                ViewMode::default(),
+            );
         }
 
         assert_eq!(stored.folder_views.len(), MAX_FOLDER_VIEWS);
@@ -279,7 +303,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("settings.json");
         let mut stored = settings();
-        stored.remember_view(PathBuf::from("/Users/me/Downloads"), sort_by(SortKey::Modified));
+        stored.remember_view(
+            PathBuf::from("/Users/me/Downloads"),
+            sort_by(SortKey::Modified),
+            ViewMode::Grid,
+        );
         stored.layout = Some(Layout {
             x: 10.,
             y: 20.,
@@ -291,10 +319,36 @@ mod tests {
         let loaded = Settings::load_from(&path).expect("读回来");
 
         assert_eq!(
-            loaded.view_for(&PathBuf::from("/Users/me/Downloads")),
+            sort_for(&loaded, &PathBuf::from("/Users/me/Downloads")),
             Some(sort_by(SortKey::Modified))
         );
+        assert_eq!(
+            loaded
+                .view_for(&PathBuf::from("/Users/me/Downloads"))
+                .map(|view| view.view),
+            Some(ViewMode::Grid)
+        );
         assert_eq!(loaded.layout, stored.layout);
+    }
+
+    #[test]
+    fn an_old_settings_file_without_a_view_mode_still_loads() {
+        // 视图模式是新加的：升级上来的人那份配置里没有这个字段，
+        // 读出来必须退回列表，不能直接报"配置损坏"。
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"auto","folder_views":[{"path":"/a","sort":{"key":"Name","descending":false}}]}"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_from(&path).expect("老配置也要读得进");
+        assert_eq!(sort_for(&loaded, &PathBuf::from("/a")), Some(Sort::default()));
+        assert_eq!(
+            loaded.view_for(&PathBuf::from("/a")).map(|view| view.view),
+            Some(ViewMode::List)
+        );
     }
 
     #[test]

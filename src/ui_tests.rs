@@ -12,13 +12,18 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::app::WFilesApp;
-use crate::model::{Sort, SortKey};
+use crate::model::{Sort, SortKey, ViewMode};
 use crate::session::Session;
 use crate::settings::Settings;
 use crate::terminal;
 
 /// 开一个装着 WFilesApp 的测试窗口。
 fn open_app(cx: &mut TestAppContext) -> gpui_kit::WindowHandle<Root> {
+    open_app_of_width(cx, 1180.)
+}
+
+/// 指定窗口宽度开一个：网格的列数取决于窗格有多宽，要测就得能改它。
+fn open_app_of_width(cx: &mut TestAppContext, width: f32) -> gpui_kit::WindowHandle<Root> {
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::app::init(cx);
@@ -26,7 +31,7 @@ fn open_app(cx: &mut TestAppContext) -> gpui_kit::WindowHandle<Root> {
 
         let bounds = Bounds {
             origin: Point::default(),
-            size: size(px(1180.), px(760.)),
+            size: size(px(width), px(760.)),
         };
         let (window, _view) = gpui_kit::open_window(
             WindowOptions {
@@ -346,7 +351,7 @@ fn a_folder_keeps_its_sort_between_visits(cx: &mut TestAppContext) {
     // 这个目录的排序应该已经写进设置了。
     let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置应该落盘");
     assert_eq!(
-        saved.view_for(dir.path()),
+        saved.view_for(dir.path()).map(|view| view.sort),
         Some(Sort {
             key: SortKey::Size,
             descending: false
@@ -370,6 +375,7 @@ fn a_remembered_sort_is_applied_when_the_folder_opens(cx: &mut TestAppContext) {
             key: SortKey::Size,
             descending: true,
         },
+        ViewMode::default(),
     );
     seeded
         .save_to(&session.path().join("settings.json"))
@@ -1111,5 +1117,239 @@ fn synced_panes_follow_each_other(cx: &mut TestAppContext) {
         settle(window, cx);
         assert_eq!(row_names_in(window, 0), vec!["inner"], "左栏退回去了");
         assert_eq!(row_names_in(window, 1), vec!["only.txt"], "右栏留在原地");
+    });
+}
+
+// ---- 视图模式（列表 / 网格）----
+
+/// 现在是列表还是网格：两种视图的容器 id 不同，只看哪个在。
+fn view_of(window: &mut gpui_kit::Window) -> &'static str {
+    if window.try_find("file-grid").is_some() {
+        "网格"
+    } else if window.try_find("file-list").is_some() {
+        "列表"
+    } else {
+        "空"
+    }
+}
+
+/// 第一行上并排放了几个格子。
+///
+/// 拿它断言"窗口越宽一行放得越多"：网格的列数是从量出来的窗格宽度算的，
+/// 而这个数字在界面上没有一个能直接读出来的地方。
+fn tiles_in_first_row(window: &mut gpui_kit::Window) -> usize {
+    let Some(first) = window.try_find(("tile", 0usize)) else {
+        return 0;
+    };
+    let row_top = first.bounds().origin.y;
+    (0usize..64)
+        .map(|position| window.try_find(("tile", position)))
+        .take_while(|tile| {
+            tile.as_ref()
+                .is_some_and(|tile| tile.bounds().origin.y == row_top)
+        })
+        .count()
+}
+
+#[gpui_kit::test]
+fn switching_to_the_grid_shows_the_same_files(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.path().join(name), "x").unwrap();
+    }
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(view_of(window), "列表");
+        assert_eq!(row_names(window), ["a.txt", "b.txt", "c.txt"]);
+    });
+
+    // 点工具栏那颗网格按钮。
+    step(cx, handle, |window, cx| {
+        window.click("view-grid", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(view_of(window), "网格", "点完按钮该换成网格");
+        assert!(
+            window.try_find(("tile", 0usize)).is_some(),
+            "网格里该有格子"
+        );
+        // 换视图只是换画法，里面还是同一批文件、同一个顺序。
+        assert_eq!(row_names(window), ["a.txt", "b.txt", "c.txt"]);
+    });
+
+    // 再点回列表。
+    step(cx, handle, |window, cx| {
+        window.click("view-list", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(view_of(window), "列表");
+        assert!(
+            window.try_find("header").is_none()
+                && window.try_find(("header", 0usize)).is_some(),
+            "回到列表该有表头"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn cmd_1_and_cmd_2_switch_the_view(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(view_of(window), "列表");
+    });
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-2", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(view_of(window), "网格", "Cmd+2 切到网格");
+    });
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-1", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(view_of(window), "列表", "Cmd+1 切回列表");
+    });
+}
+
+#[gpui_kit::test]
+fn the_grid_packs_several_tiles_into_one_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..12 {
+        std::fs::write(dir.path().join(format!("f{index:02}.txt")), "x").unwrap();
+    }
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        window.click("view-grid", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let columns = tiles_in_first_row(window);
+        assert!(
+            columns >= 2,
+            "窗格这么宽，一行至少该放两个格子，实际 {columns}"
+        );
+        assert!(
+            window.try_find(("tile", 11usize)).is_some(),
+            "12 项都在，一个都不能少"
+        );
+        // 12 项装不进一行：最后一项必须落在更下面的一行。
+        let first = window.find(("tile", 0usize)).bounds().origin;
+        let last = window.find(("tile", 11usize)).bounds().origin;
+        assert!(last.y > first.y, "第 12 项该换行到下面去：{first:?} {last:?}");
+    });
+}
+
+#[gpui_kit::test]
+fn a_narrower_pane_gets_fewer_columns(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..12 {
+        std::fs::write(dir.path().join(format!("f{index:02}.txt")), "x").unwrap();
+    }
+
+    // 同一个目录各开一次：宽窗口和窄窗口的一行列数必须不一样，
+    // 否则说明"按窗格宽度算列数"根本没生效（比如宽度没量出来）。
+    let wide = columns_at_width(cx, dir.path(), 1180.);
+    let narrow = columns_at_width(cx, dir.path(), 620.);
+
+    assert!(narrow >= 1, "窄窗口也得画出格子来，实际 {narrow} 列");
+    assert!(
+        wide > narrow,
+        "窗口窄了，一行该少放几格：宽窗口 {wide} 列，窄窗口 {narrow} 列"
+    );
+}
+
+/// 在指定宽度的窗口里打开这个目录、切到网格，返回第一行有几个格子。
+///
+/// 用 Cmd+2 而不是点工具栏按钮：窄窗口下工具栏本来就摆不开，
+/// 按钮会被挤到看不见的地方，而按键不受布局影响。
+fn columns_at_width(cx: &mut TestAppContext, dir: &Path, width: f32) -> usize {
+    let session = isolate_session();
+    Session {
+        tabs: vec![dir.to_path_buf()],
+        active: 0,
+        split: None,
+        focus_on_left: true,
+        sync: false,
+    }
+    .save_to(&session.path().join("session.json"))
+    .expect("写测试会话");
+    let handle = open_app_of_width(cx, width);
+
+    let mut columns = 0;
+    step(cx, handle, |window, cx| {
+        window.press("cmd-2", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        columns = tiles_in_first_row(window);
+    });
+    columns
+}
+
+#[gpui_kit::test]
+fn a_folder_keeps_its_view_between_visits(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        window.click("view-grid", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(view_of(window), "网格");
+    });
+
+    // 视图和排序一样，是这个目录的属性：得跟着目录记住，不是跟着窗格。
+    let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置应该落盘");
+    let remembered = saved.view_for(dir.path()).expect("这个目录该记住了");
+    assert_eq!(remembered.view, ViewMode::Grid);
+}
+
+#[gpui_kit::test]
+fn a_remembered_view_is_applied_when_the_folder_opens(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+
+    let session = isolate_session();
+    let mut seeded = Settings::default();
+    seeded.remember_view(dir.path().to_path_buf(), Sort::default(), ViewMode::Grid);
+    seeded
+        .save_to(&session.path().join("settings.json"))
+        .expect("写测试设置");
+    Session {
+        tabs: vec![dir.path().to_path_buf()],
+        active: 0,
+        split: None,
+        focus_on_left: true,
+        sync: false,
+    }
+    .save_to(&session.path().join("session.json"))
+    .expect("写测试会话");
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            view_of(window),
+            "网格",
+            "打开这个目录时该套用记住的视图"
+        );
     });
 }

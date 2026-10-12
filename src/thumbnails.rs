@@ -22,6 +22,8 @@ use gpui_kit::{AsyncApp, Context, EventEmitter, RenderImage, WeakEntity};
 
 /// 列表里的小图边长（像素，逻辑尺寸）。
 pub const LIST_EDGE: u32 = 40;
+/// 网格视图里的图边长：格子里的缩略图是 64 逻辑像素，按 2 倍屏取。
+pub const GRID_EDGE: u32 = 128;
 /// Quick Look 里的大图边长。
 pub const PREVIEW_EDGE: u32 = 512;
 

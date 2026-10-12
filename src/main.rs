@@ -18,11 +18,34 @@ mod watch;
 mod ui_tests;
 
 use app::WFilesApp;
-use gpui_kit::assets::Assets;
+use gpui_kit::assets::{self, Assets};
 use gpui_kit::*;
+use std::borrow::Cow;
+
+// 组件默认那套图标里没有"列表/网格"这两个视图图标，
+// 而全量图标（AllAssets）会把 1800 个 SVG 全打进二进制（7 MB）。
+// 只挑出真正用到的这几个，其余的回落到默认那套。
+assets::icon_assets!(ViewIcons, [List, LayoutGrid]);
+
+struct WFilesAssets;
+
+impl AssetSource for WFilesAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(data) = ViewIcons.load(path)? {
+            return Ok(Some(data));
+        }
+        Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut all = ViewIcons.list(path)?;
+        all.extend(Assets.list(path)?);
+        Ok(all)
+    }
+}
 
 fn main() {
-    let application = gpui_kit::application().with_assets(Assets);
+    let application = gpui_kit::application().with_assets(WFilesAssets);
     application.run(|cx| {
         gpui_kit::init(cx);
         app::init(cx);
