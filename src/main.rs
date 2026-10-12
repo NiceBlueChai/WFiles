@@ -4,6 +4,7 @@ mod bulk_rename;
 mod clipboard;
 mod drag;
 mod format;
+mod keymap;
 mod model;
 mod ops;
 mod ops_entity;

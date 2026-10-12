@@ -79,6 +79,8 @@ enum PaletteAction {
     GoTo(PathBuf),
     SwitchTab(usize),
     Pane(PaneCommand),
+    /// 改某条命令的快捷键；会打开按键捕获浮层。
+    EditKey(PaneCommand),
     /// 把某个终端设为默认；只改设置，不打开窗口。
     SetTerminal(String),
     NewTab,
@@ -920,6 +922,10 @@ impl WFilesApp {
                 self.tabs[self.active]
                     .update(cx, |pane, cx| pane.run_command(command, window, cx));
             }
+            PaletteAction::EditKey(command) => {
+                self.tabs[self.active]
+                    .update(cx, |pane, cx| pane.start_capture(command, window, cx));
+            }
             PaletteAction::SetTerminal(id) => {
                 Settings::update(cx, |settings| settings.terminal = id.clone());
             }
@@ -1142,6 +1148,8 @@ impl WFilesApp {
             });
         }
 
+        self.push_key_binding_items(&mut items, cx);
+
         items
     }
 
@@ -1170,6 +1178,26 @@ impl WFilesApp {
     }
 
     /// (标题, 快捷键提示, 分组, 搜索关键词)
+    /// 命令面板里的"改键"分组：一条命令一项，点进去按个键就改好了。
+    fn push_key_binding_items(&self, items: &mut Vec<PaletteItem>, cx: &Context<Self>) {
+        let map = crate::keymap::KeyMap::read(cx);
+        for command in PaneCommand::ALL {
+            let (title, ..) = Self::describe_pane_command(command);
+            let key = map.key_for(command);
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("key:{}", command.id()),
+                    format!("改键：{title}"),
+                    key.clone(),
+                    "快捷键",
+                    // 关键词里带上"快捷键"这一类词，搜"改键"就能把整组拉出来。
+                    command.keywords(),
+                ),
+                action: PaletteAction::EditKey(command),
+            });
+        }
+    }
+
     fn describe_pane_command(
         command: PaneCommand,
     ) -> (&'static str, &'static str, &'static str, &'static str) {

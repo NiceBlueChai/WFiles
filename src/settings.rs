@@ -34,6 +34,9 @@ pub struct Settings {
     /// 上次退出时的窗口位置与尺寸。
     #[serde(default)]
     pub layout: Option<Layout>,
+    /// 用户改过的快捷键。没改过的命令不在这里，走出厂按键。
+    #[serde(default)]
+    pub keys: crate::keymap::KeyMap,
 }
 
 /// 一个目录记住的视图设置。
@@ -100,6 +103,7 @@ impl Default for Settings {
             terminal: default_terminal(),
             folder_views: Vec::new(),
             layout: None,
+            keys: crate::keymap::KeyMap::default(),
         }
     }
 }

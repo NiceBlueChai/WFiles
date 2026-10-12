@@ -29,6 +29,7 @@ use crate::archive;
 use crate::clipboard;
 use crate::drag::{self, DraggedPaths};
 use crate::format;
+use crate::keymap;
 use crate::model::{Listing, Selection, Sort, SortKey, ViewMode};
 use crate::ops_entity::{Ops, OpsEvent};
 use crate::preview::{self, Preview};
@@ -101,11 +102,17 @@ gpui_kit::actions!(
         ViewList,
         ViewGrid,
         ViewColumns,
+        // 压缩包这两条出厂不绑键（命令面板里用），但用户配了就得有对应动作。
+        ViewArchive,
+        CreateArchive,
     ]
 );
 
 pub fn init(cx: &mut App) {
     let context = Some(KEY_CONTEXT);
+    // 导航那一组固定不给改：上下左右、翻页、打开、前进后退、全选、Esc。
+    // 它们是"在列表里走路"，跟滚动和选择绑在一起，改坏一个就走不动了；
+    // 而且各家文件管理器这几条早就是肌肉记忆，没有理由让用户重学。
     cx.bind_keys([
         KeyBinding::new("up", MoveUp, context),
         KeyBinding::new("down", MoveDown, context),
@@ -117,31 +124,52 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("pagedown", PageDown, context),
         KeyBinding::new("enter", Open, context),
         KeyBinding::new("cmd-down", Open, context),
-        KeyBinding::new("backspace", OpenParent, context),
-        KeyBinding::new("cmd-up", OpenParent, context),
         KeyBinding::new("cmd-[", GoBack, context),
         KeyBinding::new("cmd-]", GoForward, context),
-        KeyBinding::new("cmd-r", Refresh, context),
         KeyBinding::new("cmd-a", SelectAll, context),
         KeyBinding::new("escape", ClearSelection, context),
-        KeyBinding::new("cmd-shift-n", NewFolder, context),
-        KeyBinding::new("f2", Rename, context),
-        KeyBinding::new("cmd-shift-r", BulkRename, context),
-        KeyBinding::new("cmd-backspace", Trash, context),
-        KeyBinding::new("cmd-c", CopySelection, context),
-        KeyBinding::new("cmd-x", CutSelection, context),
-        KeyBinding::new("cmd-alt-c", CopyPath, context),
-        KeyBinding::new("cmd-shift-c", CopyFileName, context),
-        KeyBinding::new("cmd-v", Paste, context),
-        KeyBinding::new("cmd-z", Undo, context),
-        KeyBinding::new("cmd-alt-t", OpenTerminal, context),
-        // 空格是 Quick Look 的通用键位（macOS Finder、Dolphin 都是它）。
-        KeyBinding::new("space", QuickLook, context),
-        // 视图切换：Cmd+1/2 与工具栏那两颗按钮是同一件事。
-        KeyBinding::new("cmd-1", ViewList, context),
-        KeyBinding::new("cmd-2", ViewGrid, context),
-        KeyBinding::new("cmd-3", ViewColumns, context),
     ]);
+
+    // 剩下的都走可配置那一套：出厂键 + 用户改过的，一次性绑好。
+    let map = keymap::KeyMap::read(cx);
+    let bindings = map
+        .bindings()
+        .into_iter()
+        .filter_map(|(command, key)| key_binding_for(command, &key, context));
+    cx.bind_keys(bindings);
+}
+
+/// 一条命令配一个键。`KeyBinding::new` 遇到解不开的写法会 panic，
+/// 手改坏了的配置文件不能让应用起不来，所以解不开就跳过（那条回到没键）。
+fn key_binding_for(
+    command: PaneCommand,
+    key: &str,
+    context: Option<&'static str>,
+) -> Option<KeyBinding> {
+    if !keymap::is_usable(key) || Keystroke::parse(key).is_err() {
+        return None;
+    }
+    Some(match command {
+        PaneCommand::NewFolder => KeyBinding::new(key, NewFolder, context),
+        PaneCommand::Rename => KeyBinding::new(key, Rename, context),
+        PaneCommand::BulkRename => KeyBinding::new(key, BulkRename, context),
+        PaneCommand::Trash => KeyBinding::new(key, Trash, context),
+        PaneCommand::Copy => KeyBinding::new(key, CopySelection, context),
+        PaneCommand::Cut => KeyBinding::new(key, CutSelection, context),
+        PaneCommand::Paste => KeyBinding::new(key, Paste, context),
+        PaneCommand::Undo => KeyBinding::new(key, Undo, context),
+        PaneCommand::Refresh => KeyBinding::new(key, Refresh, context),
+        PaneCommand::GoUp => KeyBinding::new(key, OpenParent, context),
+        PaneCommand::CopyPath => KeyBinding::new(key, CopyPath, context),
+        PaneCommand::CopyFileName => KeyBinding::new(key, CopyFileName, context),
+        PaneCommand::OpenTerminal => KeyBinding::new(key, OpenTerminal, context),
+        PaneCommand::QuickLook => KeyBinding::new(key, QuickLook, context),
+        PaneCommand::ViewList => KeyBinding::new(key, ViewList, context),
+        PaneCommand::ViewGrid => KeyBinding::new(key, ViewGrid, context),
+        PaneCommand::ViewColumns => KeyBinding::new(key, ViewColumns, context),
+        PaneCommand::ViewArchive => KeyBinding::new(key, ViewArchive, context),
+        PaneCommand::CreateArchive => KeyBinding::new(key, CreateArchive, context),
+    })
 }
 
 /// 窗格广播给应用的事件：当前目录变了，会话该存盘了。
@@ -182,6 +210,89 @@ pub enum PaneCommand {
     ViewGrid,
     /// 换成分列（Miller）视图。
     ViewColumns,
+}
+
+impl PaneCommand {
+    /// 全部命令。配置层与命令面板都靠它枚举，加一条命令只改这一处。
+    pub const ALL: [Self; 19] = [
+        Self::NewFolder,
+        Self::Rename,
+        Self::BulkRename,
+        Self::Trash,
+        Self::Copy,
+        Self::Cut,
+        Self::Paste,
+        Self::Undo,
+        Self::Refresh,
+        Self::GoUp,
+        Self::CopyPath,
+        Self::CopyFileName,
+        Self::OpenTerminal,
+        Self::QuickLook,
+        Self::ViewArchive,
+        Self::CreateArchive,
+        Self::ViewList,
+        Self::ViewGrid,
+        Self::ViewColumns,
+    ];
+
+    /// 配置文件里用的名字。
+    ///
+    /// 不用 Rust 的变体名（`{:?}`）：那个写法一旦重命名变体就会变，
+    /// 等于把内部实现的名字钉死在用户的磁盘上。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::NewFolder => "new_folder",
+            Self::Rename => "rename",
+            Self::BulkRename => "bulk_rename",
+            Self::Trash => "trash",
+            Self::Copy => "copy",
+            Self::Cut => "cut",
+            Self::Paste => "paste",
+            Self::Undo => "undo",
+            Self::Refresh => "refresh",
+            Self::GoUp => "go_up",
+            Self::CopyPath => "copy_path",
+            Self::CopyFileName => "copy_file_name",
+            Self::OpenTerminal => "open_terminal",
+            Self::QuickLook => "quick_look",
+            Self::ViewArchive => "view_archive",
+            Self::CreateArchive => "create_archive",
+            Self::ViewList => "view_list",
+            Self::ViewGrid => "view_grid",
+            Self::ViewColumns => "view_columns",
+        }
+    }
+
+    /// 反查。配置文件是手改的，认不出来的名字要能报出来而不是崩。
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|command| command.id() == id)
+    }
+
+    /// 命令面板里搜这个词也能找到它。
+    pub fn keywords(self) -> &'static str {
+        match self {
+            Self::NewFolder => "folder 创建 目录 快捷键 按键 keybinding",
+            Self::Rename => "rename 改名 快捷键 按键 keybinding",
+            Self::BulkRename => "batch 序号 模板 快捷键 按键 keybinding",
+            Self::Trash => "delete 删除 快捷键 按键 keybinding",
+            Self::Copy => "copy 快捷键 按键 keybinding",
+            Self::Cut => "cut 移动 快捷键 按键 keybinding",
+            Self::Paste => "paste 快捷键 按键 keybinding",
+            Self::Undo => "undo 恢复 快捷键 按键 keybinding",
+            Self::Refresh => "refresh 重新读取 快捷键 按键 keybinding",
+            Self::GoUp => "up parent 上级 快捷键 按键 keybinding",
+            Self::CopyPath => "path 剪贴板 快捷键 按键 keybinding",
+            Self::CopyFileName => "name 剪贴板 快捷键 按键 keybinding",
+            Self::OpenTerminal => "terminal 终端 shell 快捷键 按键 keybinding",
+            Self::QuickLook => "preview 预览 查看 快捷键 按键 keybinding",
+            Self::ViewArchive => "zip 压缩包 解压 快捷键 按键 keybinding",
+            Self::CreateArchive => "zip 压缩包 打包 快捷键 按键 keybinding",
+            Self::ViewList => "view list 列表 快捷键 按键 keybinding",
+            Self::ViewGrid => "view grid 网格 缩略图 快捷键 按键 keybinding",
+            Self::ViewColumns => "view miller 分列 层级 快捷键 按键 keybinding",
+        }
+    }
 }
 
 /// 分列视图里一行的全部信息。
@@ -334,6 +445,10 @@ pub struct Pane {
     /// 正在后台打包/解压时把任务握在手里（丢掉即放弃），
     /// 顺带让按钮知道自己该灰着。
     archive_busy: Option<Task<()>>,
+    /// 正在给哪条命令录新按键；`None` 就是没在录。
+    capturing: Option<PaneCommand>,
+    /// 录按键浮层的焦点；录的时候焦点必须在这上面才收得到键。
+    capture_focus: FocusHandle,
     subscriptions: Vec<Subscription>,
 }
 
@@ -378,6 +493,8 @@ impl Pane {
             quick_look: None,
             archive_view: None,
             archive_busy: None,
+            capturing: None,
+            capture_focus: cx.focus_handle(),
             subscriptions: Vec::new(),
         };
 
@@ -2452,6 +2569,10 @@ impl Pane {
             .on_action(cx.listener(|this, _: &ViewColumns, window, cx| {
                 this.run_command(PaneCommand::ViewColumns, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ViewArchive, _, cx| this.toggle_archive(cx)))
+            .on_action(cx.listener(|this, _: &CreateArchive, _, cx| {
+                this.create_archive(cx)
+            }))
             .child(self.render_width_probe())
             .when(self.view == ViewMode::List, |body| {
                 body.child(self.render_header(cx))
@@ -2595,10 +2716,141 @@ impl Pane {
 }
 
 impl Pane {
-    /// Quick Look 浮层：居中卡片，内容按类型分派。
+    // ---- 快捷键 ----
+
+    /// 开始给一条命令录新按键。
     ///
-    /// **没做"点背景关掉"**：GPUI 的点击会冒泡到父元素，卡片里选中一段文字
-    /// 也会被当成点了背景，一选就关太难受。关闭走 Esc、再按一次空格，
+    /// 焦点要挪到浮层上：GPUI 的按键事件只送到"焦点所在的那条链"，
+    /// 浮层不在焦点链上就一个键也收不到。
+    pub fn start_capture(&mut self, command: PaneCommand, window: &mut Window, cx: &mut Context<Self>) {
+        self.capturing = Some(command);
+        self.capture_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// 录到了一个键。
+    ///
+    /// 退格/删除是"恢复出厂"——空着的命令没法按出来，得有路可退。
+    /// Esc 是取消。其余的按键就当新键记下来。
+    fn capture_key(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(command) = self.capturing.take() else {
+            return;
+        };
+        let mut map = keymap::KeyMap::read(cx);
+        if matches!(key.as_str(), "backspace" | "delete") {
+            map.clear(command);
+            self.status = format!("{} 已恢复出厂按键", Self::command_title(command));
+        } else {
+            map.set(command, key.clone());
+            self.status = format!(
+                "{} 改为 {}，重启后生效",
+                Self::command_title(command),
+                key
+            );
+        }
+        map.save(cx);
+        // 浮层一撤，焦点就没了着落；不还回列表，Cmd+P 这类带上下文的键会失灵。
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// 收起录按键的浮层（按 Esc 或录完都走这里）。
+    fn end_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.capturing = None;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn command_title(command: PaneCommand) -> &'static str {
+        match command {
+            PaneCommand::NewFolder => "新建文件夹",
+            PaneCommand::Rename => "重命名",
+            PaneCommand::BulkRename => "批量重命名",
+            PaneCommand::Trash => "移到回收站",
+            PaneCommand::Copy => "拷贝",
+            PaneCommand::Cut => "剪切",
+            PaneCommand::Paste => "粘贴",
+            PaneCommand::Undo => "撤销",
+            PaneCommand::Refresh => "刷新",
+            PaneCommand::GoUp => "上一级",
+            PaneCommand::CopyPath => "复制路径",
+            PaneCommand::CopyFileName => "复制文件名",
+            PaneCommand::OpenTerminal => "打开终端",
+            PaneCommand::QuickLook => "快速查看",
+            PaneCommand::ViewArchive => "查看压缩包",
+            PaneCommand::CreateArchive => "打包成 Zip",
+            PaneCommand::ViewList => "列表视图",
+            PaneCommand::ViewGrid => "网格视图",
+            PaneCommand::ViewColumns => "分列视图",
+        }
+    }
+
+    /// 录按键的浮层：整个窗格盖住，等你按一下。
+    fn render_key_capture(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(command) = self.capturing else {
+            return div().into_any_element();
+        };
+        let title = Self::command_title(command);
+        let current = keymap::KeyMap::read(cx).key_for(command);
+        let muted = cx.theme().muted_foreground;
+
+        div()
+            .id("key-capture")
+            .test_support()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(cx.theme().overlay)
+            .track_focus(&self.capture_focus)
+            // 捕获阶段就收下：默认的按键绑定（比如 Esc 清选中）不该趁机执行。
+            .capture_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                // 捕获阶段就收下：默认绑定（比如 Esc 清选中）不该趁机执行。
+                cx.stop_propagation();
+                if event.keystroke.key == "escape" {
+                    this.end_capture(window, cx);
+                    return;
+                }
+                let key = event.keystroke.unparse();
+                if keymap::is_usable(&key) {
+                    this.capture_key(key, window, cx);
+                }
+            }))
+            .child(
+                v_flex()
+                    .id("key-capture-card")
+                    .w(px(420.))
+                    .gap_2()
+                    .p_5()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(div().font_semibold().child(format!("给「{title}」按个键")))
+                    .child(
+                        div()
+                            .id("key-capture-current")
+                            .test_support()
+                            .aria_label(current.clone())
+                            .text_sm()
+                            .text_color(muted)
+                            .child(if current.is_empty() {
+                                "现在是：没有按键".to_string()
+                            } else {
+                                format!("现在是：{current}")
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("退格 = 恢复出厂，Esc = 取消"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 压缩包面板：列出包里的条目，配一个"解压到这儿"。
     fn render_archive(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(state) = self.archive_view.clone() else {
@@ -2774,6 +3026,10 @@ impl Pane {
             .into_any_element()
     }
 
+    /// Quick Look 浮层：居中卡片，内容按类型分派。
+    ///
+    /// **没做"点背景关掉"**：GPUI 的点击会冒泡到父元素，卡片里选中一段文字
+    /// 也会被当成点了背景，一选就关太难受。关闭走 Esc、再按一次空格，
     /// 或者卡片底部的按钮。
     fn render_quick_look(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(look) = self.quick_look.clone() else {
@@ -3054,6 +3310,9 @@ impl Render for Pane {
         }
         if self.archive_view.is_some() {
             root = root.child(self.render_archive(cx));
+        }
+        if self.capturing.is_some() {
+            root = root.child(self.render_key_capture(cx));
         }
         root
     }

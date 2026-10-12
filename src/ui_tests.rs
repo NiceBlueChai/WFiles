@@ -1904,3 +1904,104 @@ fn packing_the_selection_makes_a_zip_next_to_it(cx: &mut TestAppContext) {
         vec!["a.txt", "b.txt"]
     );
 }
+
+#[gpui_kit::test]
+fn a_key_binding_can_be_changed_from_the_palette(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (session, handle) = open_in(cx, dir.path());
+
+    // 命令面板里搜"改键"能拉出快捷键那一组。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("改键：重命名", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("key:rename").is_some(),
+            "该找得到「改键：重命名」这一项"
+        );
+        window.press("enter", cx);
+    });
+
+    // 浮层开出来，按一个新键。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("key-capture").is_some(),
+            "该弹出录按键的浮层"
+        );
+        window.press("cmd-shift-k", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("key-capture").is_none(),
+            "录完就该收起浮层"
+        );
+    });
+
+    let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置该落盘");
+    assert_eq!(
+        saved.keys.0.get("rename").map(String::as_str),
+        Some("cmd-shift-k"),
+        "新按键该记进配置：{:?}",
+        saved.keys.0
+    );
+    assert!(
+        !saved.keys.0.contains_key("trash"),
+        "没改过的命令不该出现在配置里"
+    );
+}
+
+#[gpui_kit::test]
+fn backspace_in_the_capture_restores_the_factory_key(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("改键：重命名", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-shift-k", cx);
+    });
+    // 再改一次，这回用退格恢复出厂。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("改键：重命名", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("key-capture").is_some(),
+            "第二次也该弹出浮层"
+        );
+        window.press("backspace", cx);
+    });
+
+    let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置该落盘");
+    assert!(
+        !saved.keys.0.contains_key("rename"),
+        "退格该把这条清回出厂：{:?}",
+        saved.keys.0
+    );
+}
