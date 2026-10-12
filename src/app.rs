@@ -17,6 +17,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::bulk_rename::BulkRename;
+use crate::drag::{self, DraggedPaths};
 use crate::format;
 use crate::ops::{ConflictPolicy, ControlState};
 use crate::ops_entity::{Ops, OpsEvent, PendingAction};
@@ -266,6 +267,52 @@ impl WFilesApp {
         places
     }
 
+    /// 一批文件落到了这个目录里。
+    ///
+    /// 和窗格里那套是同一条链路（同样先预检冲突、同样走后台操作中心），
+    /// 只是发起方换成了标签栏或侧边栏。
+    fn drop_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        destination: PathBuf,
+        from_outside: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !drag::can_drop(&destination, &paths) {
+            return;
+        }
+        let action = drag::drop_action(from_outside, window.modifiers().alt);
+        self.ops.update(cx, |ops, cx| {
+            ops.drop_into(paths, destination, action == drag::DropAction::Move, cx)
+        });
+        cx.notify();
+    }
+
+    /// 把一个元素变成投放目标：落下来的文件进 `destination`。
+    ///
+    /// 标签页和侧边栏位置说到底都是"一个目录"，所以共用这一份接线。
+    fn drop_target<E>(element: E, destination: PathBuf, cx: &mut Context<Self>) -> AnyElement
+    where
+        E: StatefulInteractiveElement + Styled + IntoElement + 'static,
+    {
+        let guard = destination.clone();
+        let mut element = element.can_drop(move |value, _, _| {
+            crate::pane::dropped_paths(value)
+                .is_some_and(|paths| drag::can_drop(&guard, &paths))
+        });
+        let internal = destination.clone();
+        element = element.on_drop(cx.listener(move |this, drag: &DraggedPaths, window, cx| {
+            let paths = drag.paths.clone();
+            this.drop_paths(paths, internal.clone(), false, window, cx);
+        }));
+        element = element.on_drop(cx.listener(move |this, drag: &ExternalPaths, window, cx| {
+            let paths = drag.0.iter().cloned().collect();
+            this.drop_paths(paths, destination.clone(), true, window, cx);
+        }));
+        element.into_any_element()
+    }
+
     fn navigate_active_tab(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs[self.active].update(cx, |pane, cx| {
             pane.navigate_to(path, true, window, cx)
@@ -279,7 +326,7 @@ impl WFilesApp {
             .enumerate()
             .map(|(index, (label, icon, path))| {
                 let target = path.clone();
-                ListItem::new(("place", index))
+                let item = ListItem::new(("place", index))
                     .rounded(cx.theme().radius)
                     .selected(current == path)
                     .accessibility_label(label)
@@ -291,8 +338,18 @@ impl WFilesApp {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.navigate_active_tab(target.clone(), window, cx);
-                    }))
-            });
+                    }));
+                // 拖到侧边栏的位置上就是放进那个位置：
+                // `ListItem` 只实现了 `IntoElement`，挂不上拖放，外面套一层 div。
+                Self::drop_target(
+                    div().id(("place-drop", index)).child(item),
+                    path.clone(),
+                    cx,
+                )
+            })
+            // 马上收成 Vec：闭包里要用到 `cx`（挂投放回调），
+            // 懒迭代器会把 `cx` 一直借着，下面的 `cx.theme()` 就借不到了。
+            .collect::<Vec<_>>();
 
         v_flex()
             .w(px(210.))
@@ -1369,7 +1426,7 @@ impl WFilesApp {
                 .unwrap_or_else(|| path.display().to_string());
             let is_active = index == active;
 
-            h_flex()
+            let tab = h_flex()
                 .id(("tab", index))
                 // test_support 让集成测试能按标签序号定位；aria_label 顺带给读屏软件
                 // 报出这个标签打开的是哪个文件夹。
@@ -1413,8 +1470,13 @@ impl WFilesApp {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.focus_tab(index, cx)
-                }))
-        });
+                }));
+            // 拖到某个标签上就是放进它打开的那个目录：
+            // 双栏时也能这么把东西送到另一栏去。
+            Self::drop_target(tab, path, cx)
+        })
+        // 同上：闭包要借 `cx`，先把结果收下来再用 `cx`。
+        .collect::<Vec<_>>();
 
         h_flex()
             .h(px(38.))

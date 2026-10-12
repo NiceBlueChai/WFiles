@@ -456,6 +456,22 @@ impl Ops {
         self.begin_transfer(sources, dest, cut, cx);
     }
 
+    /// 拖放落下去：和粘贴同一条链路（同样先预检冲突），
+    /// 但**不动剪贴板**——用户剪贴板里放着待粘的东西时，
+    /// 拖一次就把那批待粘的顶掉，是最难解释的一类数据丢失。
+    pub fn drop_into(
+        &mut self,
+        sources: Vec<PathBuf>,
+        dest: PathBuf,
+        cut: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        self.begin_transfer(sources, dest, cut, cx);
+    }
+
     pub fn request_undo(&mut self, cx: &mut Context<Self>) {
         if self.history.is_empty() {
             self.last_message = Some("没有可撤销的操作".to_string());

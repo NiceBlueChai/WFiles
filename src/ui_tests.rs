@@ -7,6 +7,7 @@
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Bounds, Point, TestAppContext, WindowBounds, WindowOptions};
 use gpui_kit::{base::Root, px, size};
+use gpui_kit::point;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -854,6 +855,30 @@ fn wait_for_row(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>, s
     }
 }
 
+/// 等一个文件真的在磁盘上出现。拷贝在后台跑，得把执行器推到底。
+fn wait_for_file(cx: &mut TestAppContext, path: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        if path.exists() || Instant::now() > deadline {
+            return path.exists();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 等一个文件真的从磁盘上消失（移动走的那一半）。
+fn wait_until_file_gone(cx: &mut TestAppContext, path: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        if !path.exists() || Instant::now() > deadline {
+            return !path.exists();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// 等到某个元素消失（任务跑完、面板关掉之类）。
 fn wait_until_gone(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>, id: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1508,4 +1533,256 @@ fn a_remembered_view_is_applied_when_the_folder_opens(cx: &mut TestAppContext) {
             "打开这个目录时该套用记住的视图"
         );
     });
+}
+
+/// 把一批"从系统拖进来"的文件落在屏幕上的 `position` 处。
+///
+/// 系统拖放（Finder、资源管理器）走的是 `FileDropEvent`：
+/// 先 Entered 报"带着什么进来了"，再 Submit 报"松手了"。
+fn drop_from_outside(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    position: Point<gpui_kit::Pixels>,
+    paths: &[std::path::PathBuf],
+) {
+    step(cx, handle, |window, cx| {
+        window.dispatch_event(
+            gpui_kit::PlatformInput::FileDrop(gpui_kit::FileDropEvent::Entered {
+                position,
+                paths: gpui_kit::ExternalPaths(paths.iter().cloned().collect()),
+            }),
+            cx,
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.dispatch_event(
+            gpui_kit::PlatformInput::FileDrop(gpui_kit::FileDropEvent::Submit { position }),
+            cx,
+        );
+    });
+}
+
+/// 元素中心：投放坐标要落在元素里头，取中心最稳。
+fn center_of(window: &mut gpui_kit::Window, id: gpui_kit::ElementId) -> Point<gpui_kit::Pixels> {
+    let bounds = window.try_find(id).expect("找得到这个元素").bounds();
+    gpui_kit::point(
+        bounds.origin.x + bounds.size.width / 2.,
+        bounds.origin.y + bounds.size.height / 2.,
+    )
+}
+
+#[gpui_kit::test]
+fn a_file_dropped_from_outside_lands_in_the_folder(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let inbox = dir.path().join("inbox");
+    std::fs::create_dir(&inbox).unwrap();
+
+    // 拖进来的这个文件"属于系统"，我们无权删它，之后要断言它还在。
+    let outside = tempfile::tempdir().unwrap();
+    let dragged = outside.path().join("photo.png");
+    std::fs::write(&dragged, "png").unwrap();
+
+    let (_session, handle) = open_in(cx, dir.path());
+
+    let mut target = Point::default();
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(row_names(window), ["inbox"]);
+        target = center_of(window, ("row-drop", 0usize).into());
+    });
+
+    drop_from_outside(cx, handle, target, std::slice::from_ref(&dragged));
+
+    assert!(
+        wait_for_file(cx, &inbox.join("photo.png")),
+        "拖到文件夹上该拷进去"
+    );
+    assert!(
+        dragged.exists(),
+        "从系统拖来的只能拷：那些文件不属于我们，不能删"
+    );
+}
+
+#[gpui_kit::test]
+fn a_file_dropped_on_a_tab_lands_in_that_tabs_folder(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let left = root.path().join("left");
+    let right = root.path().join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    std::fs::write(left.join("report.txt"), "hi").unwrap();
+
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![left.clone(), right.clone()],
+            active: 0,
+            split: None,
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    let mut target = Point::default();
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        target = center_of(window, ("tab", 1usize).into());
+    });
+
+    // 拖的是当前目录里的文件：落到第二个标签上就是"移到那个标签打开的目录"。
+    drop_from_outside(cx, handle, target, &[left.join("report.txt")]);
+
+    assert!(
+        wait_for_file(cx, &right.join("report.txt")),
+        "落到哪个标签就进哪个标签的目录"
+    );
+    assert!(
+        left.join("report.txt").exists(),
+        "模拟的是系统拖放，所以是拷贝：原处还在"
+    );
+}
+
+/// 某一栏里指定名字的行在第几位（列表顺序会随排序变，按下标猜不稳）。
+fn row_position(window: &mut gpui_kit::Window, name: &str) -> usize {
+    row_names(window)
+        .iter()
+        .position(|row| row == name)
+        .unwrap_or_else(|| panic!("列表里该有 {name}"))
+}
+
+#[gpui_kit::test]
+fn hovering_a_folder_while_dragging_opens_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("inside.txt"), "x").unwrap();
+    std::fs::write(dir.path().join("note.txt"), "x").unwrap();
+
+    let (_session, handle) = open_in(cx, dir.path());
+
+    let mut source = Point::default();
+    let mut target = Point::default();
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let note = row_position(window, "note.txt");
+        let folder = row_position(window, "nested");
+        source = center_of(window, ("row-drop", note).into());
+        target = center_of(window, ("row-drop", folder).into());
+    });
+
+    // 拖到文件夹上面停住不松手。
+    press_and_drag_to(cx, handle, source, target);
+
+    // 才等了一小会儿：不该开，否则扫过一排文件夹会一路乱开。
+    cx.background_executor
+        .advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            row_names(window).iter().any(|row| row == "nested"),
+            "刚扫过就进目录的话，一路划过去会跳得一塌糊涂"
+        );
+    });
+
+    // 停够了：自己打开。
+    cx.background_executor
+        .advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            row_names(window),
+            ["inside.txt"],
+            "在同一个文件夹上停够时间，它该自己打开"
+        );
+    });
+}
+
+/// 窗格内部拖：按住 `from`，拖到 `to` 上方停住（还没松手）。
+///
+/// 移动要派两次：第一次才把"拖动"这个状态建立起来，
+/// 第二次起鼠标才算是真的停在目标上。
+fn press_and_drag_to(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    from: Point<gpui_kit::Pixels>,
+    to: Point<gpui_kit::Pixels>,
+) {
+    step(cx, handle, |window, cx| {
+        window.dispatch_event(
+            gpui_kit::PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
+                position: from,
+                button: gpui_kit::MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+    });
+    for offset in [0., 1.] {
+        step(cx, handle, |window, cx| {
+            window.dispatch_event(
+                gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+                    position: point(to.x + px(offset), to.y),
+                    pressed_button: Some(gpui_kit::MouseButton::Left),
+                    modifiers: Default::default(),
+                }),
+                cx,
+            );
+        });
+    }
+}
+
+/// 窗格内部拖：按住在起始行，拖到目标行松手。
+fn drag_between_rows(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    from: Point<gpui_kit::Pixels>,
+    to: Point<gpui_kit::Pixels>,
+) {
+    press_and_drag_to(cx, handle, from, to);
+    step(cx, handle, |window, cx| {
+        window.dispatch_event(
+            gpui_kit::PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
+                button: gpui_kit::MouseButton::Left,
+                position: point(to.x + px(1.), to.y),
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+            cx,
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn dragging_a_file_onto_a_folder_moves_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let inbox = dir.path().join("inbox");
+    std::fs::create_dir(&inbox).unwrap();
+    std::fs::write(dir.path().join("note.txt"), "hi").unwrap();
+
+    let (_session, handle) = open_in(cx, dir.path());
+
+    let mut from = Point::default();
+    let mut to = Point::default();
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let note = row_position(window, "note.txt");
+        let folder = row_position(window, "inbox");
+        from = center_of(window, ("row-drop", note).into());
+        to = center_of(window, ("row-drop", folder).into());
+    });
+
+    drag_between_rows(cx, handle, from, to);
+
+    assert!(
+        wait_for_file(cx, &inbox.join("note.txt")),
+        "拖到文件夹上该进去"
+    );
+    assert!(
+        wait_until_file_gone(cx, &dir.path().join("note.txt")),
+        "自己拖自己是移动，原处不该还留一份"
+    );
 }

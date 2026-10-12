@@ -4,6 +4,7 @@
 //! 文件操作不在这里执行：窗格只向 [`Ops`] 发起请求，完成后根据事件刷新自己。
 
 use std::{
+    any::Any,
     cell::Cell,
     collections::HashMap,
     path::{Path, PathBuf},
@@ -25,6 +26,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{AsyncApp, Size, Task, WeakEntity, *};
 
 use crate::clipboard;
+use crate::drag::{self, DraggedPaths};
 use crate::format;
 use crate::model::{Listing, Selection, Sort, SortKey, ViewMode};
 use crate::ops_entity::{Ops, OpsEvent};
@@ -193,8 +195,41 @@ struct ColumnRow {
 /// 行是 `Option`：`None` 表示"就是当前目录"，渲染时直接从 `listing` 取，
 /// 不给十万项再抄一份。
 type ColumnContent = (Option<Rc<Vec<ColumnRow>>>, Rc<Vec<Size<Pixels>>>);
+
 /// 分列视图里一列的缓存内容：内容版本加上 [`ColumnContent`]。
 type CachedColumn = (u64, Rc<Vec<ColumnRow>>, Rc<Vec<Size<Pixels>>>);
+
+/// 拖动时跟在鼠标后面那张小卡片。
+///
+/// 只有一个 Entity<W> 能被 GPUI 当成拖动预览画出来，
+/// 所以这里哪怕只是几个字也得是一个视图。
+struct DragPreview {
+    label: String,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_sm()
+            .text_color(cx.theme().foreground)
+            .child(self.label.clone())
+    }
+}
+
+/// 一次"弹簧文件夹"预约：鼠标停在哪个文件夹上、这一票是第几号。
+///
+/// 号票是关键：定时器起来的时候没法取消，只能靠对号判断——
+/// 用户中途挪到别的文件夹上会开新的一票，旧票对不上号就自己作废。
+struct SpringLoad {
+    path: PathBuf,
+    token: usize,
+}
 
 /// 分列视图里的一列：哪个目录、里面有什么、滚到哪儿了、哪一项是"通往下一层"的。
 struct Column {
@@ -267,6 +302,10 @@ pub struct Pane {
     /// 上次横向滚到最右时的层数：层数没变就不再动它，
     /// 否则用户自己往左翻看祖先会被下一次重画拽回去。
     column_depth: usize,
+    /// 拖动中鼠标正停在哪个文件夹上等着它"弹开"；`None` 就是没在等。
+    spring: Option<SpringLoad>,
+    /// 弹簧文件夹的号票计数器，只增不减，用来作废过期的定时器。
+    spring_token: usize,
     /// 当前目录的监听任务；丢掉它就等于停止监听。
     watch_task: Option<Task<()>>,
     /// Quick Look 浮层；`None` 就是没开。
@@ -309,6 +348,8 @@ impl Pane {
             column_scrolls: HashMap::new(),
             column_scroll: ScrollHandle::new(),
             column_depth: 0,
+            spring: None,
+            spring_token: 0,
             watch_task: None,
             quick_look: None,
             subscriptions: Vec::new(),
@@ -1336,7 +1377,9 @@ impl Pane {
             self.thumbnail_of(&thumbnail_path, cx)
         };
 
-        ListItem::new(("row", position))
+        let dragged = self.dragged_paths(&path);
+        let drop_here = is_dir.then(|| path.clone());
+        let item = ListItem::new(("row", position))
             .w_full()
             .h(px(ROW_HEIGHT))
             .px_3()
@@ -1417,17 +1460,29 @@ impl Pane {
                     }
                     cx.notify();
                 }),
-            )
-            .into_any_element()
+            );
+        // `ListItem` 只实现了 `IntoElement`，挂不上拖放那几个方法：
+        // 外面套一层同高的 div 专管拖放，视觉上看不出多了一层。
+        let row = div()
+            .id(("row-drop", position))
+            .test_support()
+            .w_full()
+            .h(px(ROW_HEIGHT))
+            .child(item);
+        let row = self.spring_load(row, drop_here.clone(), cx);
+        self.with_drag_and_drop(row, Some(dragged), drop_here, cx)
     }
 
     fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // 列表空白处也能接：落下来就进当前目录。
+        let drop_here = self.listing.path().to_path_buf();
         if self.listing.visible_count() == 0 {
-            return self.render_empty(cx);
+            let empty = self.render_empty(cx);
+            return self.with_drag_and_drop(empty, None, Some(drop_here), cx);
         }
 
         let row_sizes = self.row_sizes.clone();
-        v_flex()
+        let list = v_flex()
             .id("file-list")
             // 让集成测试能一眼看出"现在是列表还是网格"，顺带给读屏软件报一声。
             .test_support()
@@ -1449,18 +1504,20 @@ impl Pane {
                 .track_scroll(&self.scroll)
                 .py_1(),
             )
-            .scrollbar(&self.scroll, ScrollbarAxis::Vertical)
-            .into_any_element()
+            .scrollbar(&self.scroll, ScrollbarAxis::Vertical);
+        self.with_drag_and_drop(list, None, Some(drop_here), cx)
     }
 
     /// 空目录（或筛选后一个都不剩）时的居中提示，两种视图共用。
-    fn render_empty(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_empty(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let (icon, label) = if self.listing.query().is_empty() {
             (IconName::FolderOpen, "这个文件夹是空的")
         } else {
             (IconName::SearchX, "没有匹配的项目")
         };
         div()
+            // 带 id 才有 `Stateful<Div>`，拖放那几个方法挂在它上面。
+            .id("empty-hint")
             .flex_1()
             .min_h_0()
             .flex()
@@ -1474,7 +1531,6 @@ impl Pane {
                     .child(Icon::new(icon).size_8())
                     .child(div().text_sm().child(label)),
             )
-            .into_any_element()
     }
 
     /// 网格：一个虚拟列表，但每一项是"一行格子"而不是一个文件。
@@ -1482,13 +1538,16 @@ impl Pane {
     /// 之所以不直接用 `flex_wrap` 一把铺开：那样十万项会全部进布局树，
     /// 而 P2 的硬指标是十万项不卡。虚拟列表只画看得见的那几行。
     fn render_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // 网格空白处也能接：落下来就进当前目录。
+        let drop_here = self.listing.path().to_path_buf();
         if self.listing.visible_count() == 0 {
-            return self.render_empty(cx);
+            let empty = self.render_empty(cx);
+            return self.with_drag_and_drop(empty, None, Some(drop_here), cx);
         }
 
         let row_sizes = self.row_sizes.clone();
         let columns = self.columns();
-        v_flex()
+        let grid = v_flex()
             .id("file-grid")
             .test_support()
             .aria_label("网格视图")
@@ -1509,8 +1568,8 @@ impl Pane {
                 .track_scroll(&self.scroll)
                 .p(px(TILE_GAP)),
             )
-            .scrollbar(&self.scroll, ScrollbarAxis::Vertical)
-            .into_any_element()
+            .scrollbar(&self.scroll, ScrollbarAxis::Vertical);
+        self.with_drag_and_drop(grid, None, Some(drop_here), cx)
     }
 
     /// 第 `row` 行：把这一行该有的格子横排出来，末尾不足就少放几个。
@@ -1617,8 +1676,11 @@ impl Pane {
                     .child(caption),
             );
 
-        Some(
-            tile.when(is_selected, |tile| {
+        // 格子同样既是拖拽源也能接：拖到文件夹上就是放进去。
+        let dragged = self.dragged_paths(&path);
+        let drop_here = is_dir.then(|| path.clone());
+        let tile = tile
+            .when(is_selected, |tile| {
                 tile.bg(cx.theme().muted)
                     .border_1()
                     .border_color(cx.theme().primary)
@@ -1639,9 +1701,9 @@ impl Pane {
                     }
                     cx.notify();
                 }),
-            )
-            .into_any_element(),
-        )
+            );
+        let tile = self.spring_load(tile, drop_here.clone(), cx);
+        Some(self.with_drag_and_drop(tile, Some(dragged), drop_here, cx))
     }
 
     /// 分列视图：从根目录一级一列铺下来，最后一列是当前目录。
@@ -1793,8 +1855,10 @@ impl Pane {
         let scroll = column.scroll.clone();
         let active = column.active;
         let current = column.current;
+        // 列的空白处也能接：落在哪一列的空白就进哪一层的目录。
+        let drop_here = column.path.clone();
 
-        v_flex()
+        let element = v_flex()
             .id(("column", index))
             .test_support()
             .aria_label(title.clone())
@@ -1830,8 +1894,8 @@ impl Pane {
                 .track_scroll(&scroll)
                 .flex_1()
                 .min_h_0(),
-            )
-            .into_any_element()
+            );
+        self.with_drag_and_drop(element, None, Some(drop_here), cx)
     }
 
     /// 分列里的一行。
@@ -1863,13 +1927,16 @@ impl Pane {
         let is_dir = row.is_dir;
         let is_active = active == Some(position);
         let is_selected = current && self.selection.contains(&path);
+        // 拖起来的是哪些、能不能接：要在 `path` 被挪进鼠标闭包之前算好。
+        let dragged = self.dragged_paths(&path);
+        let drop_here = is_dir.then(|| path.clone());
         let icon_color = if is_dir {
             cx.theme().primary
         } else {
             cx.theme().muted_foreground
         };
 
-        div()
+        let element = div()
             .id(("column-row", position))
             .test_support()
             .aria_label(name.clone())
@@ -1920,8 +1987,154 @@ impl Pane {
                     }
                     cx.notify();
                 }),
-            )
-            .into_any_element()
+            );
+        let element = self.spring_load(element, drop_here.clone(), cx);
+        self.with_drag_and_drop(element, Some(dragged), drop_here, cx)
+    }
+
+    /// 拖起来的是哪些文件。
+    ///
+    /// 点在已选中的项上就是整批选中项；点在一个没选中的项上就是它自己——
+    /// 按下鼠标会把它选中，而那时候这一帧早就画完了，
+    /// 所以这里按"它此刻在不在选中里"判断，结果和按下之后的状态一致。
+    fn dragged_paths(&self, path: &Path) -> DraggedPaths {
+        let paths = if self.selection.contains(path) {
+            self.selected_paths()
+        } else {
+            vec![path.to_path_buf()]
+        };
+        DraggedPaths { paths }
+    }
+
+    /// 给一个元素挂上拖放：`dragged` 非空则它可以被拖出去，
+    /// `destination` 非空则它同时也能接。
+    ///
+    /// 只有文件夹能接：往一个文件上拖没有任何合理语义。
+    /// 列表空白处能接（落进当前目录），所以两种角色要能分开给。
+    fn with_drag_and_drop<E>(
+        &self,
+        mut element: E,
+        dragged: Option<DraggedPaths>,
+        destination: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement
+    where
+        E: StatefulInteractiveElement + Styled + IntoElement + 'static,
+    {
+        // 这些方法都是吃掉自己、吐回一个新的同类型，所以每次要接回来。
+        if let Some(dragged) = dragged {
+            let label = drag::label(&dragged.paths);
+            element = element.on_drag(dragged, move |_, _, _, cx: &mut App| {
+                cx.new(|_| DragPreview {
+                    label: label.clone(),
+                })
+            });
+            // 拖出窗口交给系统（比如拖到 Finder）：把手上的路径交出去，
+            // 系统自己会去拷，我们不再插手。
+            element = element.external_drag_payload::<DraggedPaths>(|drag, _, _| {
+                Some(ExternalDragPayload::Files(FileDragPaths::new(
+                    drag.paths
+                        .iter()
+                        .map(|path| (path.clone(), path.is_dir())),
+                )))
+            });
+        }
+
+        if let Some(destination) = destination {
+            let guard = destination.clone();
+            element = element.can_drop(move |value, _, _| {
+                dropped_paths(value).is_some_and(|paths| drag::can_drop(&guard, &paths))
+            });
+            let internal = destination.clone();
+            element = element.on_drop(cx.listener(move |this, drag: &DraggedPaths, window, cx| {
+                this.drop_paths(drag.paths.clone(), internal.clone(), false, window, cx);
+            }));
+            element = element.on_drop(cx.listener(move |this, drag: &ExternalPaths, window, cx| {
+                let paths = drag.0.iter().cloned().collect();
+                this.drop_paths(paths, destination.clone(), true, window, cx);
+            }));
+        }
+        element.into_any_element()
+    }
+
+    /// 给文件夹挂上"弹簧"：拖动时鼠标在它上面停一会儿就自己进去。
+    ///
+    /// 想拖到三层深的目录里，不这么做就得先一层层点开、再回来拖。
+    /// 挂在鼠标移动上而不是悬停上：拖动过程中照样派发移动事件，
+    /// 而悬停事件跟拖动不是一条链路，靠它判断会在某些平台上漏掉。
+    fn spring_load<E>(&self, element: E, path: Option<PathBuf>, cx: &mut Context<Self>) -> E
+    where
+        E: InteractiveElement,
+    {
+        let Some(path) = path else {
+            // 不是文件夹（或本来就不接），没有"里面"可进。
+            return element;
+        };
+        element.on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+            if !drag::wants_to_expand(true, event.dragging() && cx.has_active_drag()) {
+                return;
+            }
+            this.schedule_spring_load(path.clone(), window, cx);
+        }))
+    }
+
+    /// 预约一次"弹开"；已经停在同一个文件夹上就不重新计时。
+    fn schedule_spring_load(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.spring.as_ref().is_some_and(|spring| spring.path == path) {
+            // 还停在同一个上：让它继续走完原来那段时间，别每次移动都从头计时。
+            return;
+        }
+        self.spring_token += 1;
+        let token = self.spring_token;
+        let open = path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(drag::HOVER_EXPAND_AFTER)
+                .await;
+            let _ = this.update_in(cx, |pane, window, cx| {
+                let still_hovering = pane.spring.as_ref().is_some_and(|it| it.token == token);
+                pane.spring = None;
+                // 中途挪走了（号对不上）或者早就松手了，这一票作废。
+                if !still_hovering || !cx.has_active_drag() {
+                    return;
+                }
+                pane.navigate_to(open.clone(), true, window, cx);
+            });
+        })
+        .detach();
+        self.spring = Some(SpringLoad { path, token });
+    }
+
+    /// 一批文件落到了这个目录里。
+    fn drop_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        destination: PathBuf,
+        from_outside: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !drag::can_drop(&destination, &paths) {
+            return;
+        }
+        // 修饰键要在落下的这一刻读：拖动过程中随时可以按放 Alt 改主意。
+        let action = drag::drop_action(from_outside, window.modifiers().alt);
+        let cut = action == drag::DropAction::Move;
+        self.ops.update(cx, |ops, cx| {
+            ops.drop_into(paths.clone(), destination.clone(), cut, cx)
+        });
+        self.status = format!(
+            "{} {} 项到 {}",
+            action.label(),
+            paths.len(),
+            destination.display()
+        );
+        cx.notify();
     }
 
     /// 量出"这一栏有多宽"。
@@ -2408,6 +2621,16 @@ impl Pane {
         self.thumbs
             .update(cx, |thumbs, cx| thumbs.get(path, edge, cx))
     }
+}
+
+/// 从一次投放里取出被拖的路径：可能是窗格里拖出来的，也可能是系统拖进来的。
+pub(crate) fn dropped_paths(value: &dyn Any) -> Option<Vec<PathBuf>> {
+    if let Some(drag) = value.downcast_ref::<DraggedPaths>() {
+        return Some(drag.paths.clone());
+    }
+    value
+        .downcast_ref::<ExternalPaths>()
+        .map(|paths| paths.0.iter().cloned().collect())
 }
 
 /// 每种类型用什么图标。没有专门图标的就退回通用文件图标。
