@@ -26,8 +26,10 @@ use crate::clipboard;
 use crate::format;
 use crate::model::{Listing, Selection, Sort, SortKey};
 use crate::ops_entity::{Ops, OpsEvent};
+use crate::preview::{self, Preview};
 use crate::settings::Settings;
 use crate::terminal;
+use crate::thumbnails::{self, Thumbnails, ThumbnailsEvent};
 use crate::watch;
 
 const ROW_HEIGHT: f32 = 40.;
@@ -73,6 +75,7 @@ gpui_kit::actions!(
         Paste,
         Undo,
         OpenTerminal,
+        QuickLook,
     ]
 );
 
@@ -107,6 +110,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-v", Paste, context),
         KeyBinding::new("cmd-z", Undo, context),
         KeyBinding::new("cmd-alt-t", OpenTerminal, context),
+        // 空格是 Quick Look 的通用键位（macOS Finder、Dolphin 都是它）。
+        KeyBinding::new("space", QuickLook, context),
     ]);
 }
 
@@ -135,10 +140,26 @@ pub enum PaneCommand {
     CopyPath,
     CopyFileName,
     OpenTerminal,
+    QuickLook,
+}
+
+/// 一次 Quick Look 的快照。
+///
+/// 内容在**打开时**读一次就固定下来：预览浮层每帧都要画，
+/// 每帧重新读一遍文件既浪费又会让滚动发抖。
+///
+/// 名字带 State 是因为 `QuickLook` 已经是那个空格键动作的名字了。
+#[derive(Clone)]
+struct QuickLookState {
+    path: PathBuf,
+    name: String,
+    content: Preview,
 }
 
 pub struct Pane {
     ops: Entity<Ops>,
+    /// 缩略图缓存由应用持有、所有标签共用：同一个文件不用每个标签各解一遍。
+    thumbs: Entity<Thumbnails>,
     listing: Listing,
     selection: Selection,
     back: Vec<PathBuf>,
@@ -153,6 +174,8 @@ pub struct Pane {
     row_sizes: Rc<Vec<Size<Pixels>>>,
     /// 当前目录的监听任务；丢掉它就等于停止监听。
     watch_task: Option<Task<()>>,
+    /// Quick Look 浮层；`None` 就是没开。
+    quick_look: Option<QuickLookState>,
     subscriptions: Vec<Subscription>,
 }
 
@@ -160,6 +183,7 @@ impl Pane {
     pub fn new(
         path: PathBuf,
         ops: Entity<Ops>,
+        thumbs: Entity<Thumbnails>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -171,6 +195,7 @@ impl Pane {
 
         let mut pane = Self {
             ops,
+            thumbs,
             listing,
             selection: Selection::default(),
             back: Vec::new(),
@@ -182,6 +207,7 @@ impl Pane {
             scroll: VirtualListScrollHandle::new(),
             row_sizes: Rc::new(Vec::new()),
             watch_task: None,
+            quick_look: None,
             subscriptions: Vec::new(),
         };
 
@@ -198,6 +224,21 @@ impl Pane {
             &pane.ops,
             window,
             |this, _, event: &OpsEvent, _, cx| this.on_ops_event(event, cx),
+        ));
+        // 缩略图是后台生成的：图好了发一个事件，窗格重画一次就能看到。
+        pane.subscriptions.push(cx.subscribe_in(
+            &pane.thumbs,
+            window,
+            |this, _, event: &ThumbnailsEvent, _, cx| {
+                let ThumbnailsEvent::Ready(path) = event;
+                // 只在这个文件确实还看得见的时候才重画：后台任务回来的图，
+                // 用户可能早就滚过去了。
+                let visible = this.listing.entry(path).is_some()
+                    || this.quick_look.as_ref().is_some_and(|look| look.path == *path);
+                if visible {
+                    cx.notify();
+                }
+            },
         ));
 
         pane.sync_row_sizes();
@@ -573,6 +614,58 @@ impl Pane {
         cx.notify();
     }
 
+    /// 要看哪一项：光标所在的那一项，没有光标就退回唯一选中项。
+    ///
+    /// 多选时不预览——"多选然后按空格"用户通常是在勾选，不是想看五个文件。
+    fn quick_look_target(&self) -> Option<PathBuf> {
+        self.selection
+            .cursor()
+            .or_else(|| self.selection.single())
+            .map(Path::to_path_buf)
+    }
+
+    /// 打开或关掉 Quick Look。已经在看同一个文件就关掉，
+    /// 换了目标就直接切过去——连按空格在几个文件之间扫是常态。
+    fn toggle_quick_look(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.quick_look_target() else {
+            self.close_quick_look(cx);
+            return;
+        };
+        if self.quick_look.as_ref().is_some_and(|look| look.path == path) {
+            self.close_quick_look(cx);
+            return;
+        }
+
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        // 内容在这时读一次：浮层每帧都画，每帧重读既浪费又会让滚动发抖。
+        let content = preview::load(&path);
+        self.quick_look = Some(QuickLookState {
+            path,
+            name,
+            content,
+        });
+        cx.notify();
+    }
+
+    fn close_quick_look(&mut self, cx: &mut Context<Self>) {
+        if self.quick_look.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Quick Look 开着没有。Esc 要先关它，再谈取消选中。
+    pub fn quick_look_open(&self) -> bool {
+        self.quick_look.is_some()
+    }
+
+    /// 命令面板据此决定要不要列出"快速查看"。
+    pub fn quick_look_enabled(&self) -> bool {
+        self.quick_look_target().is_some()
+    }
+
     /// 执行一条命令。窗口参数是因为部分命令要弹对话框/移动焦点。
     pub fn run_command(
         &mut self,
@@ -594,6 +687,7 @@ impl Pane {
             PaneCommand::CopyPath => self.copy_paths(cx),
             PaneCommand::CopyFileName => self.copy_file_names(cx),
             PaneCommand::OpenTerminal => self.open_terminal(cx),
+            PaneCommand::QuickLook => self.toggle_quick_look(cx),
         }
     }
 
@@ -797,6 +891,13 @@ impl Pane {
                 .tooltip("在这里打开终端（Cmd+Alt+T）")
                 // 换终端在命令面板里做：工具栏保持“按下去就打开”的单一职责。
                 .on_click(cx.listener(|this, _, _, cx| this.open_terminal(cx))),
+            Button::new("op-quick-look")
+                .icon(IconName::Eye)
+                .ghost()
+                .small()
+                .tooltip("快速查看（空格）")
+                .disabled(self.quick_look_target().is_none())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_quick_look(cx))),
         ]
     }
 
@@ -975,6 +1076,16 @@ impl Pane {
             format::file_size(entry.size)
         };
         let modified_text = format::modified(entry.modified);
+        // 图片显示缩略图，其余的用类型图标。
+        // 第一次问会返回 `None` 并顺手登记一个后台任务，
+        // 图好了缩略图层发事件，这一行自己就会重画——列表全程不卡顿。
+        // 先克隆路径：`entry` 借的是 `self.listing`，问缩略图要 `&mut self`。
+        let thumbnail_path = entry.path.clone();
+        let thumbnail = if is_dir {
+            None
+        } else {
+            self.thumbnail_of(&thumbnail_path, cx)
+        };
 
         ListItem::new(("row", position))
             .w_full()
@@ -992,14 +1103,21 @@ impl Pane {
                             .w(px(20.))
                             .flex_shrink_0()
                             .text_color(icon_color)
-                            .child(
-                                Icon::new(if is_dir {
+                            .child(match thumbnail {
+                                Some(thumbnail) => img(ImageSource::Render(thumbnail.image))
+                                    .w(px(20.))
+                                    .h(px(20.))
+                                    .object_fit(ObjectFit::Contain)
+                                    .rounded(px(3.))
+                                    .into_any_element(),
+                                None => Icon::new(if is_dir {
                                     IconName::Folder
                                 } else {
                                     IconName::File
                                 })
-                                .size_4(),
-                            ),
+                                .size_4()
+                                .into_any_element(),
+                            }),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(name))
                     .child(
@@ -1136,7 +1254,14 @@ impl Pane {
             .on_action(cx.listener(|this, _: &Refresh, window, cx| {
                 this.run_command(PaneCommand::Refresh, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.clear_selection(cx)))
+            // Esc 有优先顺序：先看有没有浮层要关，没有才轮到清空选中。
+            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                if this.quick_look_open() {
+                    this.close_quick_look(cx);
+                } else {
+                    this.clear_selection(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &NewFolder, window, cx| {
                 this.run_command(PaneCommand::NewFolder, window, cx)
             }))
@@ -1169,6 +1294,9 @@ impl Pane {
             }))
             .on_action(cx.listener(|this, _: &OpenTerminal, window, cx| {
                 this.run_command(PaneCommand::OpenTerminal, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &QuickLook, window, cx| {
+                this.run_command(PaneCommand::QuickLook, window, cx)
             }))
             .child(self.render_header(cx))
             .child(self.render_list(cx))
@@ -1302,11 +1430,255 @@ impl Pane {
     }
 }
 
+impl Pane {
+    /// Quick Look 浮层：居中卡片，内容按类型分派。
+    ///
+    /// **没做"点背景关掉"**：GPUI 的点击会冒泡到父元素，卡片里选中一段文字
+    /// 也会被当成点了背景，一选就关太难受。关闭走 Esc、再按一次空格，
+    /// 或者卡片底部的按钮。
+    fn render_quick_look(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(look) = self.quick_look.clone() else {
+            return div().into_any_element();
+        };
+
+        // 大图在这一帧问一次就够了，标题和正文共用。
+        let thumbnail = self.thumbnail_of_size(&look.path, thumbnails::PREVIEW_EDGE, cx);
+        let subtitle = Self::quick_look_subtitle(&look, thumbnail.clone());
+        let body = match &look.content {
+            Preview::Text(text) => Self::render_quick_look_text(text, cx),
+            Preview::Hex(hex) => Self::render_quick_look_hex(hex, cx),
+            Preview::Opaque(preview::Kind::Image) => {
+                Self::render_quick_look_image(thumbnail.clone(), cx)
+            }
+            Preview::Opaque(kind) => Self::render_quick_look_placeholder(
+                icon_for_kind(*kind),
+                &look.name,
+                cx,
+            ),
+            Preview::Directory => {
+                Self::render_quick_look_placeholder(IconName::FolderOpen, &look.name, cx)
+            }
+            Preview::Unavailable(reason) => {
+                Self::render_quick_look_placeholder(IconName::File, reason, cx)
+            }
+        };
+
+        let muted = cx.theme().muted_foreground;
+        div()
+            .id("quick-look")
+            .test_support()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(cx.theme().overlay)
+            .child(
+                v_flex()
+                    .id("quick-look-card")
+                    .w(px(720.))
+                    .max_h(px(560.))
+                    .gap_3()
+                    .p_5()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .min_w_0()
+                            .child(div().font_semibold().truncate().child(look.name.clone()))
+                            .child(
+                                div()
+                                    .id("quick-look-subtitle")
+                                    .test_support()
+                                    .aria_label(subtitle.clone())
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(subtitle),
+                            ),
+                    )
+                    .child(body)
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .child(
+                                Button::new("quick-look-close")
+                                    .label("关闭（Esc）")
+                                    .ghost()
+                                    .small()
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.close_quick_look(cx)),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 卡片标题下面那一行：类型、规模，以及"这份不是全文"。
+    fn quick_look_subtitle(look: &QuickLookState, thumbnail: Option<thumbnails::Thumbnail>) -> String {
+        match &look.content {
+            Preview::Text(text) => {
+                let language = text.language.unwrap_or("文本");
+                format!(
+                    "{language} · {} 行{}",
+                    text.lines,
+                    if text.truncated { "（只显示开头）" } else { "" }
+                )
+            }
+            Preview::Hex(hex) => format!(
+                "二进制 · {} 字节（只显示前 {} 行）",
+                hex.total_bytes,
+                hex.rows.len()
+            ),
+            Preview::Opaque(kind) => match thumbnail {
+                Some(thumbnail) => format!(
+                    "{} · {} × {}",
+                    kind.label(),
+                    thumbnail.source_width,
+                    thumbnail.source_height
+                ),
+                None => kind.label().to_string(),
+            },
+            Preview::Directory => "文件夹".to_string(),
+            Preview::Unavailable(_) => "无法预览".to_string(),
+        }
+    }
+
+    /// 文本/代码：等宽 + 不折行 + 自带滚动。
+    fn render_quick_look_text(text: &preview::TextPreview, cx: &mut Context<Self>) -> AnyElement {
+        let mono = cx.theme().mono_font_family.clone();
+        div()
+            .id("quick-look-text")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .font_family(mono)
+            .text_sm()
+            .child(v_flex().children(
+                text.text
+                    .lines()
+                    .map(|line| div().whitespace_nowrap().child(line.to_string())),
+            ))
+            .into_any_element()
+    }
+
+    /// 二进制：hex 转储，每行已经排好版。
+    fn render_quick_look_hex(hex: &preview::HexPreview, cx: &mut Context<Self>) -> AnyElement {
+        let mono = cx.theme().mono_font_family.clone();
+        div()
+            .id("quick-look-hex")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .font_family(mono)
+            .text_sm()
+            .child(
+                v_flex().children(
+                    hex.rows
+                        .iter()
+                        .map(|row| div().whitespace_nowrap().child(row.format())),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// 图片：还没生成好就先显示占位，图到了会收到事件再画一次。
+    fn render_quick_look_image(
+        thumbnail: Option<thumbnails::Thumbnail>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(thumbnail) = thumbnail else {
+            return Self::render_quick_look_placeholder(
+                IconName::GalleryVerticalEnd,
+                "正在生成预览…",
+                cx,
+            );
+        };
+
+        div()
+            .id("quick-look-image")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().muted)
+            .child(
+                img(ImageSource::Render(thumbnail.image))
+                    .max_w_full()
+                    .max_h_full()
+                    .object_fit(ObjectFit::Contain)
+                    .rounded(cx.theme().radius),
+            )
+            .into_any_element()
+    }
+
+    /// 没有内容可显示时的占位：一个图标加一句话。
+    fn render_quick_look_placeholder(
+        icon: IconName,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .h(px(220.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().muted)
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(icon).size_12())
+            .child(div().text_sm().child(message.to_string()))
+            .into_any_element()
+    }
+
+    /// 向缩略图层要一张图；列表里用小图，Quick Look 用大图。
+    fn thumbnail_of(
+        &mut self,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> Option<thumbnails::Thumbnail> {
+        self.thumbnail_of_size(path, thumbnails::LIST_EDGE, cx)
+    }
+
+    fn thumbnail_of_size(
+        &mut self,
+        path: &Path,
+        edge: u32,
+        cx: &mut Context<Self>,
+    ) -> Option<thumbnails::Thumbnail> {
+        self.thumbs
+            .update(cx, |thumbs, cx| thumbs.get(path, edge, cx))
+    }
+}
+
+/// 每种类型用什么图标。没有专门图标的就退回通用文件图标。
+fn icon_for_kind(kind: preview::Kind) -> IconName {
+    match kind {
+        preview::Kind::Image => IconName::GalleryVerticalEnd,
+        preview::Kind::Pdf | preview::Kind::Text | preview::Kind::Code => IconName::FileText,
+        preview::Kind::Audio | preview::Kind::Video => IconName::Play,
+        preview::Kind::Archive => IconName::File,
+        preview::Kind::Other => IconName::File,
+    }
+}
+
 impl Render for Pane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+        let mut root = h_flex()
             .size_full()
             .min_w_0()
+            // 浮层是绝对定位的，父容器得先成为定位参照。
+            .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
@@ -1317,7 +1689,12 @@ impl Render for Pane {
                     .child(self.render_toolbar(cx))
                     .child(self.render_body(cx)),
             )
-            .child(self.render_details(cx))
+            .child(self.render_details(cx));
+
+        if self.quick_look.is_some() {
+            root = root.child(self.render_quick_look(cx));
+        }
+        root
     }
 }
 

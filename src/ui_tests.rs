@@ -9,8 +9,10 @@ use gpui_kit::{AppContext as _, Bounds, Point, TestAppContext, WindowBounds, Win
 use gpui_kit::{base::Root, px, size};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::app::WFilesApp;
+use crate::session::Session;
 use crate::settings::Settings;
 use crate::terminal;
 
@@ -86,6 +88,50 @@ impl SessionIsolation {
 fn settle(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
     window.render_frame(cx);
     window.render_frame(cx);
+}
+
+/// 等一个后台任务的产物出现。
+///
+/// 缩略图是在真正的 OS 线程上解码的，不在 GPUI 的后台执行器里，
+/// 所以只能给它一点真实时间；同时每一轮都得画帧——
+/// 结果是通过事件送回来的，不画帧事件就不会被消费。
+fn wait_for(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>, id: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // 把已经就绪的任务（解码线程送回来的那条消息）推到实体手里。
+        cx.run_until_parked();
+        let found = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                window.try_find(id.to_string()).is_some()
+            })
+            .expect("窗口还在");
+        if found || Instant::now() > deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 让应用打开指定目录：往隔离出来的会话目录里写一份 session.json。
+///
+/// 环境变量只挪得动状态目录，决定不了"从哪个目录开始"；
+/// 而测试要在自己造的文件上按空格，所以走会话恢复这条路。
+///
+/// 隔离句柄要交还给调用方并活到测试结束：它一被丢弃临时目录就没了。
+fn open_in(
+    cx: &mut TestAppContext,
+    dir: &Path,
+) -> (SessionIsolation, gpui_kit::WindowHandle<Root>) {
+    let session = isolate_session();
+    Session {
+        tabs: vec![dir.to_path_buf()],
+        active: 0,
+    }
+    .save_to(&session.path().join("session.json"))
+    .expect("写测试会话");
+    let handle = open_app(cx);
+    (session, handle)
 }
 
 #[gpui_kit::test]
@@ -220,6 +266,130 @@ fn command_palette_sets_and_persists_the_default_terminal(cx: &mut TestAppContex
     let saved = Settings::load_from(&session.path().join("settings.json"))
         .expect("设置应该已经落盘");
     assert_eq!(saved.terminal, expected);
+}
+
+#[gpui_kit::test]
+fn quick_look_shows_a_text_file_and_closes_on_escape(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.txt"), "第一行\n第二行\n第三行\n").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("quick-look").is_none(),
+            "启动时不该有预览浮层"
+        );
+    });
+
+    // 选中那一个文件，再按空格。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("space", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("quick-look").is_some(),
+            "空格应该打开 Quick Look"
+        );
+        assert!(
+            window.try_find("quick-look-text").is_some(),
+            "文本文件应该走文本预览，而不是十六进制"
+        );
+        let row = window
+            .try_find("quick-look-subtitle")
+            .expect("应该有副标题");
+        let subtitle = row.label().unwrap_or_default();
+        assert_eq!(subtitle, "文本 · 3 行", "副标题要报出真实行数：{subtitle}");
+    });
+
+    // Esc 关掉，而不是去清空选中。
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("quick-look").is_none(),
+            "Esc 应该先关掉预览浮层"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn quick_look_decodes_an_image_in_the_background(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pic.png");
+    image::RgbImage::from_fn(80, 40, |x, y| image::Rgb([x as u8, y as u8, 90]))
+        .save(&path)
+        .unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("space", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("quick-look").is_some(),
+            "空格应该打开预览浮层"
+        );
+    });
+
+    // 解码在别的线程上，等它回来。
+    assert!(
+        wait_for(cx, handle, "quick-look-image"),
+        "后台解码完之后应该换成真图"
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let row = window
+            .try_find("quick-look-subtitle")
+            .expect("应该有副标题");
+        let subtitle = row.label().unwrap_or_default();
+        assert!(
+            subtitle.contains("80 × 40"),
+            "副标题要报出原图尺寸，实际是 {subtitle}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn quick_look_dumps_a_binary_file_as_hex(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    // 带 NUL 的一小段二进制：既验证嗅探，也验证转储排版。
+    std::fs::write(dir.path().join("blob.bin"), b"\x00\x01Hello\xff\xfe").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("space", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("quick-look-hex").is_some(),
+            "二进制应该转储成十六进制"
+        );
+        assert!(
+            window.try_find("quick-look-text").is_none(),
+            "有 NUL 字节就不该当文本显示"
+        );
+        let row = window
+            .try_find("quick-look-subtitle")
+            .expect("应该有副标题");
+        let subtitle = row.label().unwrap_or_default();
+        assert!(subtitle.contains("二进制"), "实际是 {subtitle}");
+    });
 }
 
 #[gpui_kit::test]

@@ -29,9 +29,18 @@ cargo fmt --check
 | `src/pane.rs` | 面板系统（导航/列表 UI） |
 | `src/model.rs` | 数据模型（目录/条目/会话） |
 | `src/ops.rs` | 文件操作（复制/移动/删除/重命名） |
+| `src/ops_entity.rs` | 文件操作的 UI 枢纽：进度、冲突、撤销栈 |
+| `src/palette.rs` | 命令面板的匹配与排序（纯逻辑） |
+| `src/preview.rs` | Quick Look 内容层：类型判定、文本/二进制读取（纯逻辑） |
+| `src/thumbnails.rs` | 缩略图：后台解码 + 有上限的缓存 |
+| `src/bulk_rename.rs` | 批量重命名规则与预览（纯逻辑） |
+| `src/settings.rs` | 用户设置持久化（当前只有默认终端） |
+| `src/terminal.rs` | 系统终端探测与启动（纯逻辑） |
+| `src/clipboard.rs` | 剪贴板 |
 | `src/format.rs` | 展示层格式化 |
-| `src/session.rs` | 会话持久化 |
+| `src/session.rs` | 会话持久化（含状态目录的定位规则） |
 | `src/watch.rs` | 文件系统监听（notify） |
+| `src/ui_tests.rs` | 无头窗口 UI 集成测试 |
 | `ROADMAP.md` | 产品路线图：功能范围、阶段划分、明确不做清单 |
 | `docs/cross-platform-filesystem.md` | 三平台文件系统约束调研（文件名/路径/回收站元数据） |
 

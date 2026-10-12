@@ -9,6 +9,8 @@ publish = false
 gpui-kit = "0.7.1"
 async-channel = "2.5.0"
 dirs = "6"
+# 缩略图解码。GPUI 自己就带着 image，这里声明不会多编译一份。
+image = "0.25"
 open = "5"
 notify = "8.2.0"
 trash = "5.2.9"

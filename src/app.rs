@@ -22,6 +22,7 @@ use crate::ops_entity::{Ops, OpsEvent, PendingAction};
 use crate::palette::{self, Command as PaletteCommand};
 use crate::pane::{Pane, PaneCommand, PaneEvent};
 use crate::session::Session;
+use crate::thumbnails::Thumbnails;
 use crate::settings::Settings;
 use crate::terminal;
 
@@ -80,6 +81,8 @@ pub fn init(cx: &mut App) {
 
 pub struct WFilesApp {
     ops: Entity<Ops>,
+    /// 缩略图缓存：所有标签共用一份，同一个文件只解一次。
+    thumbs: Entity<Thumbnails>,
     tabs: Vec<Entity<Pane>>,
     active: usize,
     /// 输入对话框（新建文件夹/重命名）的输入框，随开随建。
@@ -101,22 +104,28 @@ impl WFilesApp {
         // 设置要在建窗格之前装好：窗格渲染时要读“默认终端”。
         Settings::install(cx);
         let ops = cx.new(|_| Ops::new());
+        let thumbs = cx.new(|_| Thumbnails::new());
 
         // 恢复上次的标签；一个都不剩就开主页。
         let session = Session::load().sanitized();
         let mut tabs: Vec<Entity<Pane>> = Vec::new();
         for path in &session.tabs {
-            let tab = cx.new(|cx| Pane::new(path.clone(), ops.clone(), window, cx));
+            let tab = cx.new(|cx| {
+                Pane::new(path.clone(), ops.clone(), thumbs.clone(), window, cx)
+            });
             tabs.push(tab);
         }
         if tabs.is_empty() {
-            let tab = cx.new(|cx| Pane::new(Self::initial_dir(), ops.clone(), window, cx));
+            let tab = cx.new(|cx| {
+                Pane::new(Self::initial_dir(), ops.clone(), thumbs.clone(), window, cx)
+            });
             tabs.push(tab);
         }
         let active = session.active.min(tabs.len() - 1);
 
         let mut app = Self {
             ops: ops.clone(),
+            thumbs,
             tabs,
             active,
             prompt_input: None,
@@ -271,7 +280,15 @@ impl WFilesApp {
     // ---- 标签管理 ----
 
     fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let tab = cx.new(|cx| Pane::new(Self::initial_dir(), self.ops.clone(), window, cx));
+        let tab = cx.new(|cx| {
+            Pane::new(
+                Self::initial_dir(),
+                self.ops.clone(),
+                self.thumbs.clone(),
+                window,
+                cx,
+            )
+        });
         self.subscriptions.push(cx.subscribe_in(
             &tab,
             window,
@@ -626,6 +643,7 @@ impl WFilesApp {
             PaneCommand::CopyPath,
             PaneCommand::CopyFileName,
             PaneCommand::OpenTerminal,
+            PaneCommand::QuickLook,
         ] {
             if !self.pane_command_enabled(command, cx) {
                 continue;
@@ -753,6 +771,8 @@ impl WFilesApp {
             PaneCommand::Paste => !self.ops.read(cx).clipboard().paths.is_empty(),
             PaneCommand::Undo => self.ops.read(cx).undo_label().is_some(),
             PaneCommand::GoUp => pane.has_parent(),
+            // 没有选中任何东西时可没什么可"快速查看"的。
+            PaneCommand::QuickLook => pane.quick_look_enabled(),
             _ => true,
         }
     }
@@ -773,6 +793,9 @@ impl WFilesApp {
             PaneCommand::CopyFileName => ("复制文件名", "Cmd+Shift+C", "name 剪贴板"),
             PaneCommand::OpenTerminal => {
                 ("在这里打开终端", "Cmd+Alt+T", "terminal 终端 shell 命令行")
+            }
+            PaneCommand::QuickLook => {
+                ("快速查看", "空格", "preview 预览 quick look 查看")
             }
         }
     }

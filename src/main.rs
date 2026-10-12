@@ -7,9 +7,11 @@ mod ops;
 mod ops_entity;
 mod palette;
 mod pane;
+mod preview;
 mod session;
 mod settings;
 mod terminal;
+mod thumbnails;
 mod watch;
 
 #[cfg(test)]
