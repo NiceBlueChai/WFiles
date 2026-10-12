@@ -56,7 +56,7 @@ cargo fmt --check
 | `src/clipboard.rs` | 剪贴板 |
 | `src/format.rs` | 展示层格式化 |
 | `src/session.rs` | 会话持久化（含状态目录的定位规则） |
-| `src/remotes.rs` | 远程连接注册表实体：客户端、目录缓存、后台列目录与下载（界面线程不做网络） |
+| `src/remotes.rs` | 远程连接注册表实体：客户端、目录缓存、后台列目录与下载（界面线程不做网络）；远程编辑：下载到临时目录 → 监听 → 按指纹去重回传 |
 | `src/s3.rs` | S3 兼容对象存储客户端：SigV4 签名、桶的两种写法、前缀当文件夹用 |
 | `src/watch.rs` | 文件系统监听（notify） |
 | `src/ui_tests.rs` | 无头窗口 UI 集成测试 |

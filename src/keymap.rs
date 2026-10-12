@@ -103,6 +103,7 @@ pub fn defaults(command: PaneCommand) -> &'static [&'static str] {
         PaneCommand::ViewGrid => &["cmd-2"],
         PaneCommand::ViewColumns => &["cmd-3"],
         PaneCommand::Analyze => &["cmd-alt-i"],
+        PaneCommand::EditRemote => &["cmd-alt-e"],
     }
 }
 

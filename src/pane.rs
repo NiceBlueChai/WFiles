@@ -118,6 +118,7 @@ gpui_kit::actions!(
         ViewArchive,
         CreateArchive,
         Analyze,
+        EditRemote,
     ]
 );
 
@@ -185,6 +186,7 @@ fn key_binding_for(
         PaneCommand::ViewArchive => KeyBinding::new(key, ViewArchive, context),
         PaneCommand::CreateArchive => KeyBinding::new(key, CreateArchive, context),
         PaneCommand::Analyze => KeyBinding::new(key, Analyze, context),
+        PaneCommand::EditRemote => KeyBinding::new(key, EditRemote, context),
     })
 }
 
@@ -232,11 +234,13 @@ pub enum PaneCommand {
     ViewGrid,
     /// 换成分列（Miller）视图。
     ViewColumns,
+    /// 编辑远程文件：下载到本地、系统打开，保存自动回传。
+    EditRemote,
 }
 
 impl PaneCommand {
     /// 全部命令。配置层与命令面板都靠它枚举，加一条命令只改这一处。
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::NewFolder,
         Self::Rename,
         Self::BulkRename,
@@ -259,6 +263,7 @@ impl PaneCommand {
         Self::ViewGrid,
         Self::ViewColumns,
         Self::Analyze,
+        Self::EditRemote,
     ];
 
     /// 配置文件里用的名字。
@@ -289,6 +294,7 @@ impl PaneCommand {
             Self::ViewGrid => "view_grid",
             Self::ViewColumns => "view_columns",
             Self::Analyze => "analyze",
+            Self::EditRemote => "edit_remote",
         }
     }
 
@@ -322,6 +328,7 @@ impl PaneCommand {
             Self::ViewGrid => "view grid 网格 缩略图 快捷键 按键 keybinding",
             Self::ViewColumns => "view miller 分列 层级 快捷键 按键 keybinding",
             Self::Analyze => "analyze 分析 大小 重复 校验和 md5 sha 快捷键 按键 keybinding",
+            Self::EditRemote => "edit 编辑 remote 远程 回传 上传 快捷键 按键 keybinding",
         }
     }
 }
@@ -623,7 +630,19 @@ impl Pane {
                     this.update_status();
                     cx.notify();
                 }
-                RemotesEvent::Connected { .. } | RemotesEvent::Failed(_) => {}
+                // 回了传：服务器上的大小和时间都变了，正在看的那一栏该重问一次。
+                RemotesEvent::Uploaded { error: None, .. } => {
+                    if let Some((id, sub)) = remote::parse_location(this.listing.path()) {
+                        this.remotes.update(cx, |remotes, cx| {
+                            remotes.reload(&id, &sub, cx);
+                        });
+                    }
+                    cx.notify();
+                }
+                RemotesEvent::Connected { .. }
+                | RemotesEvent::Failed(_)
+                | RemotesEvent::Editing { .. }
+                | RemotesEvent::Uploaded { .. } => {}
             },
         ));
 
@@ -1003,6 +1022,42 @@ impl Pane {
             self.update_status();
             cx.notify();
         }
+    }
+
+    /// 「编辑远程文件」此刻有没有意义：选中一个远程的、非目录的项。
+    ///
+    /// 命令面板用它决定列不列这条命令——在本地目录里按 Cmd+Alt+E
+    /// 不该弹一个"不在这里"的错误。
+    pub fn edit_remote_enabled(&self) -> bool {
+        Self::editable_remote(&self.selection, &self.listing).is_some()
+    }
+
+    /// 选中项里有没有一个"能编辑的远程文件"：是就给出 `(连接 id, 服务器上的路径)`。
+    ///
+    /// 不写成方法（`&self`）：这样它不碰界面状态，喂一批路径进去就能验。
+    fn editable_remote(selection: &Selection, listing: &Listing) -> Option<(String, String)> {
+        let path = selection.single()?;
+        let (id, sub) = remote::parse_location(path)?;
+        // 目录没有"内容"可编辑。
+        if listing.entry(path).is_some_and(|entry| entry.is_dir) {
+            return None;
+        }
+        Some((id, sub))
+    }
+
+    /// 编辑远程文件（命令）：下载到本地临时目录、系统打开，保存自动回传。
+    ///
+    /// 只对选中**一个**远程文件生效：多选、目录、本地文件都不在语义里，
+    /// 与其默默什么都不做，不如把原因写进状态栏。
+    fn edit_remote(&mut self, cx: &mut Context<Self>) {
+        let Some((id, sub)) = Self::editable_remote(&self.selection, &self.listing) else {
+            self.error = Some("先选中一个远程文件".to_string());
+            self.update_status();
+            cx.notify();
+            return;
+        };
+        self.remotes
+            .update(cx, |remotes, cx| remotes.edit_file(&id, &sub, cx));
     }
 
     fn toggle_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
@@ -1806,6 +1861,7 @@ impl Pane {
             PaneCommand::ViewGrid => self.set_view(ViewMode::Grid, cx),
             PaneCommand::ViewColumns => self.set_view(ViewMode::Columns, cx),
             PaneCommand::Analyze => self.toggle_analyze(window, cx),
+            PaneCommand::EditRemote => self.edit_remote(cx),
         }
     }
 
@@ -3232,6 +3288,9 @@ impl Pane {
             .on_action(cx.listener(|this, _: &Analyze, window, cx| {
                 this.run_command(PaneCommand::Analyze, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &EditRemote, window, cx| {
+                this.run_command(PaneCommand::EditRemote, window, cx)
+            }))
             .child(self.render_width_probe())
             .when(self.view == ViewMode::List, |body| {
                 body.child(self.render_header(cx))
@@ -3456,6 +3515,7 @@ impl Pane {
             PaneCommand::ViewGrid => "网格视图",
             PaneCommand::ViewColumns => "分列视图",
             PaneCommand::Analyze => "分析：大小 / 重复 / 校验和",
+            PaneCommand::EditRemote => "编辑远程文件（保存即回传）",
         }
     }
 
@@ -4055,3 +4115,84 @@ fn detail_row(label: &str, value: String, cx: &App) -> impl IntoElement {
         .child(div().text_sm().truncate().child(value))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use crate::model::{FileEntry, Listing, Selection};
+    use crate::pane::Pane;
+    use std::path::PathBuf;
+
+    /// 一个装着远程文件的列表：路径按 `remote://连接 id/服务器上路径` 拼。
+    ///
+    /// 不开窗口也能造——`editable_remote` 只看选中项和列表，不看界面。
+    fn remote_listing() -> (Listing, PathBuf, PathBuf) {
+        let dir = crate::remote::location("t1", "folder");
+        let file = crate::remote::location("t1", "folder/notes.txt");
+        let sub = crate::remote::location("t1", "folder/sub");
+        let listing = Listing::from_entries(
+            dir.clone(),
+            vec![
+                FileEntry::remote(file.clone(), "notes.txt", false, 1234, None),
+                FileEntry::remote(sub, "sub", true, 0, None),
+            ],
+        );
+        (listing, dir, file)
+    }
+
+    #[test]
+    fn a_single_remote_file_is_editable() {
+        let (listing, _, file) = remote_listing();
+        let mut selection = Selection::default();
+        selection.select(file);
+        assert_eq!(
+            Pane::editable_remote(&selection, &listing),
+            Some(("t1".to_string(), "folder/notes.txt".to_string())),
+            "选中一个远程文件就该能编辑，且回传路径要对"
+        );
+    }
+
+    #[test]
+    fn a_directory_is_not_editable() {
+        let (listing, _, _) = remote_listing();
+        let mut selection = Selection::default();
+        selection.select(crate::remote::location("t1", "folder/sub"));
+        assert_eq!(
+            Pane::editable_remote(&selection, &listing),
+            None,
+            "目录没有可编辑的内容"
+        );
+    }
+
+    #[test]
+    fn a_local_file_is_not_editable() {
+        let (listing, _, _) = remote_listing();
+        let mut selection = Selection::default();
+        selection.select(PathBuf::from("/Users/me/notes.txt"));
+        assert_eq!(
+            Pane::editable_remote(&selection, &listing),
+            None,
+            "本地文件走系统编辑器，不归这条命令管"
+        );
+    }
+
+    #[test]
+    fn two_selected_files_are_not_editable() {
+        let (listing, _, file) = remote_listing();
+        let also = crate::remote::location("t1", "folder/sub");
+        let mut selection = Selection::default();
+        selection.select(file);
+        selection.toggle(also);
+        assert_eq!(
+            Pane::editable_remote(&selection, &listing),
+            None,
+            "多选时说不清该编辑哪一个"
+        );
+    }
+
+    #[test]
+    fn nothing_selected_is_not_editable() {
+        let (listing, _, _) = remote_listing();
+        let selection = Selection::default();
+        assert_eq!(Pane::editable_remote(&selection, &listing), None);
+    }
+}

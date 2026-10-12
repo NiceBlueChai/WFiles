@@ -584,6 +584,8 @@ fn command_palette_hides_unavailable_commands(cx: &mut TestAppContext) {
         assert!(window.try_find("pane:Rename").is_none());
         assert!(window.try_find("pane:BulkRename").is_none());
         assert!(window.try_find("pane:Trash").is_none());
+        // 本地目录里没有"远程文件"这回事，回传那条命令不该列出来。
+        assert!(window.try_find("pane:EditRemote").is_none());
     });
 
     // 就算主动去搜，也搜不出来。

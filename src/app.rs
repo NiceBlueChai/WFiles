@@ -970,6 +970,17 @@ impl WFilesApp {
                     state.error = Some(reason.clone());
                 }
             }
+            // 编辑远程文件：改完自动回传，这句话得说清楚——
+            // 不然用户不知道自己动的是服务器上的原件。
+            RemotesEvent::Editing { name } => {
+                self.secret_note = Some(format!("「{name}」存一份在本地编辑，保存即回传"));
+            }
+            RemotesEvent::Uploaded { name, error } => {
+                self.secret_note = Some(match error {
+                    Some(reason) => format!("回传「{name}」失败：{reason}"),
+                    None => format!("「{name}」已回传"),
+                });
+            }
             RemotesEvent::Listed { .. } => {}
         }
         cx.notify();
@@ -1549,6 +1560,7 @@ impl WFilesApp {
             PaneCommand::Mark,
             PaneCommand::ViewArchive,
             PaneCommand::CreateArchive,
+            PaneCommand::EditRemote,
             PaneCommand::ViewList,
             PaneCommand::ViewGrid,
             PaneCommand::ViewColumns,
@@ -1877,6 +1889,8 @@ impl WFilesApp {
             // 光标得正指着一个 zip 才谈得上"看里面"；打包则要求有选中项。
             PaneCommand::ViewArchive => pane.archive_enabled(),
             PaneCommand::CreateArchive => selected >= 1,
+            // 选中一个远程文件才谈得上"编辑并回传"。
+            PaneCommand::EditRemote => pane.edit_remote_enabled(),
             // 标记是对一个文件做的事，多选时说不清该标谁。
             PaneCommand::Mark => selected == 1,
             _ => true,
@@ -1949,6 +1963,12 @@ impl WFilesApp {
             PaneCommand::CreateArchive => {
                 ("打包成 Zip", "", "文件", "zip 压缩包 archive 压缩 打包 compress")
             }
+            PaneCommand::EditRemote => (
+                "编辑远程文件",
+                "Cmd+Alt+E",
+                "文件",
+                "edit 编辑 remote 远程 回传 上传 upload",
+            ),
             // 换视图不作用于文件，归到"视图"组里更好找。
             PaneCommand::ViewList => ("列表视图", "Cmd+1", "视图", "view list 列表 一行一项"),
             PaneCommand::ViewGrid => ("网格视图", "Cmd+2", "视图", "view grid 网格 缩略图"),
@@ -2479,6 +2499,21 @@ impl WFilesApp {
             _ => div().into_any_element(),
         };
 
+        // 有几个远程文件正在本地编辑：这是个常驻提醒。不然关了连接之后，
+        // 用户根本记不起来还有东西正往服务器上写。
+        let editing: AnyElement = match self.remotes.read(cx).editing_count() {
+            0 => div().into_any_element(),
+            count => div()
+                .id("status-editing")
+                .test_support()
+                .flex_shrink_0()
+                .text_xs()
+                .whitespace_nowrap()
+                .text_color(muted)
+                .child(format!("{count} 个远程文件编辑中（保存即回传）"))
+                .into_any_element(),
+        };
+
         let undo_label = self.ops.read(cx).undo_label();
         let has_undo = undo_label.is_some();
         let undo_button = Button::new("undo")
@@ -2506,6 +2541,7 @@ impl WFilesApp {
             .border_color(cx.theme().border)
             .items_center()
             .child(content)
+            .child(editing)
             .child(transport)
             .child(retry)
             .child(undo_button)
