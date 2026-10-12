@@ -145,6 +145,8 @@ pub enum ViewMode {
     List,
     /// 缩略图格子：看图挑图时一行一项太浪费。
     Grid,
+    /// Miller 分列：从根目录一级一列铺下来，选定哪一层就展开下一层。
+    Columns,
 }
 
 impl ViewMode {
@@ -153,6 +155,7 @@ impl ViewMode {
         match self {
             Self::List => "列表",
             Self::Grid => "网格",
+            Self::Columns => "分列",
         }
     }
 
@@ -161,11 +164,12 @@ impl ViewMode {
         match self {
             Self::List => "Cmd+1",
             Self::Grid => "Cmd+2",
+            Self::Columns => "Cmd+3",
         }
     }
 
     /// 所有视图，按工具栏上的排列顺序。
-    pub const ALL: [Self; 2] = [Self::List, Self::Grid];
+    pub const ALL: [Self; 3] = [Self::List, Self::Grid, Self::Columns];
 }
 
 /// 一个目录的内容，连同它的排序与过滤状态。

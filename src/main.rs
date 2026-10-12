@@ -25,7 +25,7 @@ use std::borrow::Cow;
 // 组件默认那套图标里没有"列表/网格"这两个视图图标，
 // 而全量图标（AllAssets）会把 1800 个 SVG 全打进二进制（7 MB）。
 // 只挑出真正用到的这几个，其余的回落到默认那套。
-assets::icon_assets!(ViewIcons, [List, LayoutGrid]);
+assets::icon_assets!(ViewIcons, [List, LayoutGrid, Columns3]);
 
 struct WFilesAssets;
 

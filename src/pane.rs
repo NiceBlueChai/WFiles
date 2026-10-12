@@ -5,6 +5,7 @@
 
 use std::{
     cell::Cell,
+    collections::HashMap,
     path::{Path, PathBuf},
     rc::Rc,
     time::Duration,
@@ -48,6 +49,13 @@ const TILE_ART: f32 = 64.;
 /// 宽度还没量出来时先按这个列数排，量到了立刻纠正。
 const FALLBACK_COLUMNS: usize = 4;
 
+/// 分列视图里一列的宽度与列间距。
+///
+/// 定宽而不是"几列平分"：Finder 那一系的分列视图都是定宽加横向滚动，
+/// 平分会让深路径的每一列都窄到看不清名字。
+const COLUMN_WIDTH: f32 = 200.;
+const COLUMN_GAP: f32 = 1.;
+
 /// 键盘绑定的作用域。
 ///
 /// 只有列表区在这个上下文里，工具栏的筛选框不在，
@@ -89,6 +97,7 @@ gpui_kit::actions!(
         QuickLook,
         ViewList,
         ViewGrid,
+        ViewColumns,
     ]
 );
 
@@ -128,6 +137,7 @@ pub fn init(cx: &mut App) {
         // 视图切换：Cmd+1/2 与工具栏那两颗按钮是同一件事。
         KeyBinding::new("cmd-1", ViewList, context),
         KeyBinding::new("cmd-2", ViewGrid, context),
+        KeyBinding::new("cmd-3", ViewColumns, context),
     ]);
 }
 
@@ -163,6 +173,43 @@ pub enum PaneCommand {
     ViewList,
     /// 换成网格视图。
     ViewGrid,
+    /// 换成分列（Miller）视图。
+    ViewColumns,
+}
+
+/// 分列视图里一行的全部信息。
+///
+/// 渲染闭包是 `'static` 的，借不到窗格里的 `Listing`，
+/// 所以先把这一列要画的东西抄成一份可以搬进闭包的小结构。
+#[derive(Clone)]
+struct ColumnRow {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+}
+
+/// 分列视图里一列的行与行高。
+///
+/// 行是 `Option`：`None` 表示"就是当前目录"，渲染时直接从 `listing` 取，
+/// 不给十万项再抄一份。
+type ColumnContent = (Option<Rc<Vec<ColumnRow>>>, Rc<Vec<Size<Pixels>>>);
+/// 分列视图里一列的缓存内容：内容版本加上 [`ColumnContent`]。
+type CachedColumn = (u64, Rc<Vec<ColumnRow>>, Rc<Vec<Size<Pixels>>>);
+
+/// 分列视图里的一列：哪个目录、里面有什么、滚到哪儿了、哪一项是"通往下一层"的。
+struct Column {
+    path: PathBuf,
+    /// 这一列要画的行。`None` 表示"就是当前目录"：渲染时直接从 `listing` 取，
+    /// 不给十万项再抄一份缓存。
+    rows: Option<Rc<Vec<ColumnRow>>>,
+    /// 虚拟列表要的逐行高度。
+    sizes: Rc<Vec<Size<Pixels>>>,
+    /// 这一列自己的竖向滚动位置。最后一列用的是窗格那个，键盘要用。
+    scroll: VirtualListScrollHandle,
+    /// 通往下一层的那一项：祖先列里是路径上的下一级，最后一列里是光标所在项。
+    active: Option<usize>,
+    /// 是不是当前目录那一列。这一列的点击语义是"选中"，祖先列是"直接进去"。
+    current: bool,
 }
 
 /// 一次 Quick Look 的快照。
@@ -205,6 +252,21 @@ pub struct Pane {
     /// 探针是**上一帧**写的，因此宽度的变化会比窗口拉伸晚一帧跟上。
     width_probe: Rc<Cell<Pixels>>,
     known_width: Pixels,
+    /// 分列视图里祖先列的行缓存：路径 -> (内容版本, 行, 行高)。
+    ///
+    /// 每帧都把十万项的名字逐个克隆一遍太贵，所以只在内容真的变了
+    /// （换目录、刷新、改筛选、改排序）时才重抄一遍。
+    column_rows_cache: HashMap<PathBuf, CachedColumn>,
+    /// 目录内容的版本号：[`Self::sync_row_sizes`] 每跑一次就加一，
+    /// 而它恰好在所有会改变行集合的地方都被调用过。
+    listing_version: u64,
+    /// 每一列自己的竖向滚动位置，下标就是列号（最后一列不在这里，用 `scroll`）。
+    column_scrolls: HashMap<usize, VirtualListScrollHandle>,
+    /// 分列视图整体的横向滚动位置。
+    column_scroll: ScrollHandle,
+    /// 上次横向滚到最右时的层数：层数没变就不再动它，
+    /// 否则用户自己往左翻看祖先会被下一次重画拽回去。
+    column_depth: usize,
     /// 当前目录的监听任务；丢掉它就等于停止监听。
     watch_task: Option<Task<()>>,
     /// Quick Look 浮层；`None` 就是没开。
@@ -242,6 +304,11 @@ impl Pane {
             view: ViewMode::default(),
             width_probe: Rc::new(Cell::new(px(0.))),
             known_width: px(0.),
+            column_rows_cache: HashMap::new(),
+            listing_version: 0,
+            column_scrolls: HashMap::new(),
+            column_scroll: ScrollHandle::new(),
+            column_depth: 0,
             watch_task: None,
             quick_look: None,
             subscriptions: Vec::new(),
@@ -324,10 +391,10 @@ impl Pane {
         cx.notify();
     }
 
-    /// 一行放得下几个格子。列表模式恒为 1。
+    /// 一行放得下几个格子。列表和分列恒为 1。
     fn columns(&self) -> usize {
         match self.view {
-            ViewMode::List => 1,
+            ViewMode::List | ViewMode::Columns => 1,
             ViewMode::Grid => {
                 if self.known_width <= px(0.) {
                     return FALLBACK_COLUMNS;
@@ -355,12 +422,15 @@ impl Pane {
     /// 一行多高：网格的行比列表高得多，中间还夹一个间距。
     fn row_height(&self) -> Pixels {
         match self.view {
-            ViewMode::List => px(ROW_HEIGHT),
+            ViewMode::List | ViewMode::Columns => px(ROW_HEIGHT),
             ViewMode::Grid => px(TILE_HEIGHT + TILE_GAP),
         }
     }
 
     fn sync_row_sizes(&mut self) {
+        // 分列视图的行缓存跟着这个版本号走：凡是会改变行集合的地方
+        // （换目录、刷新、改筛选、改排序、换视图）都会走到这里。
+        self.listing_version += 1;
         let rows = self.row_count();
         let height = self.row_height();
         let stale = self.row_sizes.len() != rows
@@ -376,6 +446,8 @@ impl Pane {
             return;
         }
         self.view = view;
+        // 换成分列时重新滚到最右：新视图第一次画，用户还没自己翻过。
+        self.column_depth = 0;
         self.remember_view(cx);
         self.sync_row_sizes();
         // 视图换了，光标那一项的"第几行"也变了，把它滚回视野。
@@ -828,6 +900,7 @@ impl Pane {
             PaneCommand::QuickLook => self.toggle_quick_look(cx),
             PaneCommand::ViewList => self.set_view(ViewMode::List, cx),
             PaneCommand::ViewGrid => self.set_view(ViewMode::Grid, cx),
+            PaneCommand::ViewColumns => self.set_view(ViewMode::Columns, cx),
         }
     }
 
@@ -966,6 +1039,7 @@ impl Pane {
                 let id = match mode {
                     ViewMode::List => "view-list",
                     ViewMode::Grid => "view-grid",
+                    ViewMode::Columns => "view-columns",
                 };
                 Button::new(id)
                     .icon(Self::icon_for_view(mode))
@@ -982,6 +1056,7 @@ impl Pane {
         match mode {
             ViewMode::List => IconName::List,
             ViewMode::Grid => IconName::LayoutGrid,
+            ViewMode::Columns => IconName::Columns3,
         }
     }
 
@@ -1569,6 +1644,286 @@ impl Pane {
         )
     }
 
+    /// 分列视图：从根目录一级一列铺下来，最后一列是当前目录。
+    ///
+    /// 横向不虚拟化——列数等于路径深度，一般不超过十列，
+    /// 没有"十万列"这种场景；纵向每列各自虚拟化，深目录也扛得住。
+    fn render_columns(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let columns = self.build_columns();
+
+        // 新展开的一列在最右边，不横向滚到底就看不见它。只在层数变化时才滚：
+        // 否则用户往左翻看祖先时，随便一次重画都会把他拽回最右。
+        if self.column_depth != columns.len() {
+            self.column_depth = columns.len();
+            let content = px(columns.len() as f32 * (COLUMN_WIDTH + COLUMN_GAP));
+            let overflow = (content - self.known_width).max(px(0.));
+            self.column_scroll.set_offset(point(-overflow, px(0.)));
+        }
+
+        h_flex()
+            .id("columns")
+            .test_support()
+            .aria_label("分列视图")
+            .flex_1()
+            .min_h_0()
+            .gap(px(COLUMN_GAP))
+            .overflow_x_scroll()
+            .track_scroll(&self.column_scroll)
+            .horizontal_scrollbar(&self.column_scroll)
+            .children(
+                columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, column)| self.render_column(index, column, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// 从根目录到当前目录，每层一列。
+    fn build_columns(&mut self) -> Vec<Column> {
+        let mut chain: Vec<PathBuf> = self
+            .listing
+            .path()
+            .ancestors()
+            .map(Path::to_path_buf)
+            .collect();
+        chain.reverse();
+
+        let sort = self.listing.sort();
+        let cursor = self.selection.focus_position(&self.listing);
+        let current_sizes = self.row_sizes.clone();
+        let mut columns = Vec::with_capacity(chain.len());
+        for (index, path) in chain.iter().enumerate() {
+            let current = index + 1 == chain.len();
+            // 当前那一列的行高表就是窗格自己那份：分列模式下两者算法一致。
+            // 行不走缓存，渲染时直接从 `listing` 取。
+            let (rows, sizes) = if current {
+                (None, current_sizes.clone())
+            } else {
+                self.ancestor_column(path, sort)
+            };
+            // 祖先列各自记住自己滚到哪儿了；最后一列用窗格那个，键盘要用。
+            let scroll = if current {
+                self.scroll.clone()
+            } else {
+                self.column_scrolls
+                    .entry(index)
+                    .or_insert_with(VirtualListScrollHandle::new)
+                    .clone()
+            };
+            let active = if current {
+                cursor
+            } else {
+                // 通往下一层的那一项：就是在这一列里能找到下一级的那一行。
+                // 通往下一层的那一项：在这一列里能找到下一级的那一行。
+                let next = &chain[index + 1];
+                rows.as_ref()
+                    .and_then(|rows| rows.iter().position(|row| &row.path == next))
+            };
+
+            columns.push(Column {
+                path: path.clone(),
+                rows,
+                sizes,
+                scroll,
+                active,
+                current,
+            });
+        }
+        columns
+    }
+
+    /// 一个祖先列要画的行与行高，按版本号缓存。
+    ///
+    /// 渲染闭包是 `'static` 的、借不到窗格里的 `Listing`，
+    /// 所以先把这一列要画的东西抄成一份能搬进闭包的小结构。
+    /// 每帧都抄一遍太贵（十万项的祖先目录会拖死界面），
+    /// 于是只在目录内容真的变了时才重抄。
+    fn ancestor_column(
+        &mut self,
+        path: &Path,
+        sort: Sort,
+    ) -> ColumnContent {
+        if let Some((version, rows, sizes)) = self.column_rows_cache.get(path)
+            && *version == self.listing_version
+        {
+            return (Some(rows.clone()), sizes.clone());
+        }
+
+        let mut listing =
+            Listing::read(path).unwrap_or_else(|_| Listing::empty(path.to_path_buf()));
+        // 跟着当前目录的排序走：不然两列之间顺序不一致，看着像换了内容。
+        listing.set_sort(sort);
+        let rows: Vec<ColumnRow> = (0..listing.visible_count())
+            .filter_map(|position| listing.visible_entry(position))
+            .map(|entry| ColumnRow {
+                path: entry.path.clone(),
+                name: entry.name.clone(),
+                is_dir: entry.is_dir,
+            })
+            .collect();
+        let sizes = Rc::new(vec![size(px(0.), px(ROW_HEIGHT)); rows.len()]);
+
+        // 缓存不是无底洞：翻过的目录攒多了就整份丢掉，最坏是重读一次。
+        if self.column_rows_cache.len() >= 64 {
+            self.column_rows_cache.clear();
+        }
+        let rows = Rc::new(rows);
+        self.column_rows_cache.insert(
+            path.to_path_buf(),
+            (self.listing_version, rows.clone(), sizes.clone()),
+        );
+        (Some(rows), sizes)
+    }
+
+    fn render_column(
+        &mut self,
+        index: usize,
+        column: Column,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title = column
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            // 根目录没有文件名，直接用它的写法（"/" 或 "C:\"）。
+            .unwrap_or_else(|| column.path.display().to_string());
+        let rows = column.rows.clone();
+        let sizes = column.sizes.clone();
+        let scroll = column.scroll.clone();
+        let active = column.active;
+        let current = column.current;
+
+        v_flex()
+            .id(("column", index))
+            .test_support()
+            .aria_label(title.clone())
+            .w(px(COLUMN_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .bg(cx.theme().background)
+            .child(
+                div()
+                    .h(px(26.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child(title),
+            )
+            .child(
+                v_virtual_list(
+                    cx.entity().clone(),
+                    ("column-rows", index),
+                    sizes,
+                    move |pane, visible_range, _, cx| {
+                        visible_range
+                            .map(|position| {
+                                pane.render_column_row(&rows, position, active, current, cx)
+                            })
+                            .collect()
+                    },
+                )
+                .track_scroll(&scroll)
+                .flex_1()
+                .min_h_0(),
+            )
+            .into_any_element()
+    }
+
+    /// 分列里的一行。
+    ///
+    /// 祖先列点一下就进去（那才是分列视图的意义）；当前列点一下是选中，
+    /// 双击才进——否则想多选几个文件都没法多选。
+    fn render_column_row(
+        &mut self,
+        rows: &Option<Rc<Vec<ColumnRow>>>,
+        position: usize,
+        active: Option<usize>,
+        current: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // 当前那一列没有缓存：直接问窗格自己的 `listing` 要，省一份拷贝。
+        let row = match rows {
+            Some(rows) => rows.get(position).cloned(),
+            None => self.listing.visible_entry(position).map(|entry| ColumnRow {
+                path: entry.path.clone(),
+                name: entry.name.clone(),
+                is_dir: entry.is_dir,
+            }),
+        };
+        let Some(row) = row else {
+            return div().h(px(ROW_HEIGHT)).into_any_element();
+        };
+        let path = row.path.clone();
+        let name = row.name.clone();
+        let is_dir = row.is_dir;
+        let is_active = active == Some(position);
+        let is_selected = current && self.selection.contains(&path);
+        let icon_color = if is_dir {
+            cx.theme().primary
+        } else {
+            cx.theme().muted_foreground
+        };
+
+        div()
+            .id(("column-row", position))
+            .test_support()
+            .aria_label(name.clone())
+            .h(px(ROW_HEIGHT))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .rounded(cx.theme().radius)
+            .when(is_active || is_selected, |row| row.bg(cx.theme().muted))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(icon_color)
+                    .child(Icon::new(if is_dir {
+                        IconName::Folder
+                    } else {
+                        IconName::File
+                    })
+                    .size_4()),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(name))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    if !this.focus.is_focused(window) {
+                        this.focus.focus(window, cx);
+                    }
+                    if !current {
+                        // 祖先列：点文件夹就进去，点文件就打开。
+                        if is_dir {
+                            this.navigate_to(path.clone(), true, window, cx);
+                        } else if let Err(error) = open::that(&path) {
+                            this.error = Some(error.to_string());
+                            this.update_status();
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    this.select_row(path.clone(), event.modifiers);
+                    this.update_status();
+                    let plain_double_click = event.click_count >= 2
+                        && !event.modifiers.shift
+                        && !event.modifiers.secondary();
+                    if plain_double_click {
+                        this.open_path(path.clone(), window, cx);
+                    }
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+    }
+
     /// 量出"这一栏有多宽"。
     ///
     /// 网格要知道宽度才能算一行放几格，而 GPUI 既没有元素级的 `on_resize`，
@@ -1679,6 +2034,9 @@ impl Pane {
             .on_action(cx.listener(|this, _: &ViewGrid, window, cx| {
                 this.run_command(PaneCommand::ViewGrid, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ViewColumns, window, cx| {
+                this.run_command(PaneCommand::ViewColumns, window, cx)
+            }))
             .child(self.render_width_probe())
             .when(self.view == ViewMode::List, |body| {
                 body.child(self.render_header(cx))
@@ -1686,6 +2044,7 @@ impl Pane {
             .child(match self.view {
                 ViewMode::List => self.render_list(cx),
                 ViewMode::Grid => self.render_grid(cx),
+                ViewMode::Columns => self.render_columns(cx),
             })
             .child(self.render_status_bar(cx))
     }

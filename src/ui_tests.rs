@@ -18,8 +18,14 @@ use crate::settings::Settings;
 use crate::terminal;
 
 /// 开一个装着 WFilesApp 的测试窗口。
+///
+/// 窗格一打开就开始监听目录，而 notify 的回调线程随时可能把事件送回来
+/// 唤醒任务——测试调度器把"别的线程来唤醒"判成不确定行为并直接报错。
+/// 这不是被测代码的问题：监听本来就跨线程。所以开了窗口就统一放开。
 fn open_app(cx: &mut TestAppContext) -> gpui_kit::WindowHandle<Root> {
-    open_app_of_width(cx, 1180.)
+    let handle = open_app_of_width(cx, 1180.);
+    cx.background_executor.allow_parking();
+    handle
 }
 
 /// 指定窗口宽度开一个：网格的列数取决于窗格有多宽，要测就得能改它。
@@ -1122,15 +1128,18 @@ fn synced_panes_follow_each_other(cx: &mut TestAppContext) {
 
 // ---- 视图模式（列表 / 网格）----
 
-/// 现在是列表还是网格：两种视图的容器 id 不同，只看哪个在。
+/// 现在是哪种视图：三种视图的容器 id 各不相同，只看哪个在。
 fn view_of(window: &mut gpui_kit::Window) -> &'static str {
-    if window.try_find("file-grid").is_some() {
-        "网格"
-    } else if window.try_find("file-list").is_some() {
-        "列表"
-    } else {
-        "空"
+    for (id, name) in [
+        ("file-list", "列表"),
+        ("file-grid", "网格"),
+        ("columns", "分列"),
+    ] {
+        if window.try_find(id).is_some() {
+            return name;
+        }
     }
+    "空"
 }
 
 /// 第一行上并排放了几个格子。
@@ -1320,6 +1329,153 @@ fn a_folder_keeps_its_view_between_visits(cx: &mut TestAppContext) {
     let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置应该落盘");
     let remembered = saved.view_for(dir.path()).expect("这个目录该记住了");
     assert_eq!(remembered.view, ViewMode::Grid);
+}
+
+/// 分列视图里某一列的标题（就是那一列的目录名）。
+fn column_title(window: &mut gpui_kit::Window, index: usize) -> Option<String> {
+    window
+        .try_find(("column", index))
+        .map(|column| column.label().unwrap_or_default().to_string())
+}
+
+/// 分列视图里某一列前几行的名字。
+fn column_rows(window: &mut gpui_kit::Window, index: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    {
+        let scope = window.within(("column", index));
+        for position in 0usize..16 {
+            let Some(row) = scope.try_find(("column-row", position)) else {
+                break;
+            };
+            names.push(row.label().unwrap_or_default().to_string());
+        }
+    }
+    names
+}
+
+#[gpui_kit::test]
+fn the_column_view_shows_the_whole_path_one_level_per_column(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("inner")).unwrap();
+    std::fs::write(dir.path().join("inner").join("deep.txt"), "x").unwrap();
+    let (_session, handle) = open_in(cx, &dir.path().join("inner"));
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(view_of(window), "列表");
+    });
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-3", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(view_of(window), "分列", "Cmd+3 切到分列");
+
+        assert!(
+            window.try_find(("column", 0usize)).is_some(),
+            "至少要有一列"
+        );
+        // 最后一列的内容就是当前目录。
+        let mut last_index = 0usize;
+        while window.try_find(("column", last_index + 1)).is_some() {
+            last_index += 1;
+        }
+        assert_eq!(
+            column_title(window, last_index).as_deref(),
+            Some("inner"),
+            "最后一列该是当前目录"
+        );
+        assert_eq!(column_rows(window, last_index), vec!["deep.txt"]);
+    });
+}
+
+#[gpui_kit::test]
+fn clicking_a_folder_in_an_earlier_column_navigates_there(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("one")).unwrap();
+    std::fs::create_dir(dir.path().join("one").join("two")).unwrap();
+    std::fs::write(dir.path().join("one").join("a.txt"), "x").unwrap();
+    std::fs::write(dir.path().join("one").join("two").join("b.txt"), "x").unwrap();
+    let (_session, handle) = open_in(cx, &dir.path().join("one").join("two"));
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-3", cx);
+    });
+
+    // 最后一列是 two，上一列是 one，再上一列是临时目录（里面只有 one）。
+    let mut last = 0usize;
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        while window.try_find(("column", last + 1)).is_some() {
+            last += 1;
+        }
+        assert_eq!(column_title(window, last).as_deref(), Some("two"));
+        assert_eq!(column_rows(window, last), vec!["b.txt"]);
+        let _ = cx;
+    });
+
+    // 点"临时目录"那一列里的 one：整条链在这里截断，one 成为当前目录。
+    step(cx, handle, |window, cx| {
+        let parent = last - 2;
+        assert_eq!(column_rows(window, parent), vec!["one"], "临时目录里只有 one");
+        window
+            .within(("column", parent))
+            .click(("column-row", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let mut now = 0usize;
+        while window.try_find(("column", now + 1)).is_some() {
+            now += 1;
+        }
+        assert_eq!(now, last - 1, "少了一层：链在 one 这里截断");
+        assert_eq!(column_title(window, now).as_deref(), Some("one"));
+        // 文件夹排在前面，所以是 two 在前、a.txt 在后。
+        assert_eq!(column_rows(window, now), ["two", "a.txt"]);
+    });
+}
+
+#[gpui_kit::test]
+fn the_keyboard_still_drives_the_last_column(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("one")).unwrap();
+    std::fs::create_dir(dir.path().join("one").join("two")).unwrap();
+    std::fs::write(dir.path().join("one").join("two").join("b.txt"), "x").unwrap();
+    let (_session, handle) = open_in(cx, &dir.path().join("one"));
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-3", cx);
+    });
+
+    // 当前列是 one，里面只有 two 一个子目录。
+    let mut last = 0usize;
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        while window.try_find(("column", last + 1)).is_some() {
+            last += 1;
+        }
+        assert_eq!(column_title(window, last).as_deref(), Some("one"));
+        assert_eq!(column_rows(window, last), vec!["two"]);
+    });
+
+    // 方向键把光标放上去，Enter 进去：键盘在分列视图里照旧管用。
+    step(cx, handle, |window, cx| {
+        window.press("down", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let mut now = 0usize;
+        while window.try_find(("column", now + 1)).is_some() {
+            now += 1;
+        }
+        assert_eq!(now, last + 1, "多铺了一层");
+        assert_eq!(column_title(window, now).as_deref(), Some("two"));
+        assert_eq!(column_rows(window, now), vec!["b.txt"]);
+    });
 }
 
 #[gpui_kit::test]

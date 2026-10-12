@@ -901,6 +901,7 @@ impl WFilesApp {
             PaneCommand::QuickLook,
             PaneCommand::ViewList,
             PaneCommand::ViewGrid,
+            PaneCommand::ViewColumns,
         ] {
             if !self.pane_command_enabled(command, cx) {
                 continue;
@@ -1137,6 +1138,9 @@ impl WFilesApp {
             // 换视图不作用于文件，归到"视图"组里更好找。
             PaneCommand::ViewList => ("列表视图", "Cmd+1", "视图", "view list 列表 一行一项"),
             PaneCommand::ViewGrid => ("网格视图", "Cmd+2", "视图", "view grid 网格 缩略图"),
+            PaneCommand::ViewColumns => {
+                ("分列视图", "Cmd+3", "视图", "view miller 分列 层级 columns")
+            }
         }
     }
 
