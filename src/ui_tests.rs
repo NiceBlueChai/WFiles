@@ -2207,3 +2207,223 @@ fn dragging_across_the_terminal_selects_a_block(cx: &mut TestAppContext) {
         );
     });
 }
+
+// ---- 搜索面板 ----
+
+/// 搜索面板的开关键。与快捷键表、命令面板共用一处，所以从键位配置那边拿。
+fn search_key(cx: &mut gpui_kit::App) -> String {
+    crate::keymap::KeyMap::read(cx).key_for(crate::pane::PaneCommand::Search)
+}
+
+/// 结果区那句摘要：读屏软件与测试都靠它知道现在列出了什么。
+fn search_results(window: &mut gpui_kit::Window) -> String {
+    window
+        .try_find("search-results")
+        .and_then(|it| it.label().map(|text| text.to_string()))
+        .unwrap_or_default()
+}
+
+/// 搜索面板状态行那句话（正在搜 / 找到几个 / 出错）。
+fn search_status(window: &mut gpui_kit::Window) -> String {
+    window
+        .try_find("search-status")
+        .and_then(|it| it.label().map(|text| text.to_string()))
+        .unwrap_or_default()
+}
+
+/// 反复画帧，直到面板里某一处文字出现了要找的东西。
+///
+/// 两件事都得等：输入之后那 180 毫秒防抖是测试调度器里的虚拟时钟
+/// （光 `run_until_parked` 不走时间，得自己往前推），
+/// 而搜索本身跑在真正的 OS 线程上（见 [`crate::search::spawn`]），
+/// 只能给它一点真实时间。
+fn wait_for_text(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    read: fn(&mut gpui_kit::Window) -> String,
+    needle: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        cx.executor().advance_clock(Duration::from_millis(60));
+        cx.run_until_parked();
+        text = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                read(window)
+            })
+            .expect("窗口还在");
+        if text.contains(needle) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    text
+}
+
+fn wait_for_results(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    needle: &str,
+) -> String {
+    wait_for_text(cx, handle, search_results, needle)
+}
+
+fn wait_for_status(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    needle: &str,
+) -> String {
+    wait_for_text(cx, handle, search_status, needle)
+}
+
+/// 一个有几层文件和一点文本内容的目录。
+fn searchable_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::create_dir_all(dir.path().join("src/deep")).expect("建目录");
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").expect("写文件");
+    std::fs::write(dir.path().join("src/deep/inner.rs"), "fn inner() {}\n").expect("写文件");
+    std::fs::write(dir.path().join("notes.txt"), "hello wfiles\nsecond line\n").expect("写文件");
+    dir
+}
+
+#[gpui_kit::test]
+fn the_search_panel_opens_and_escape_closes_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+    let key = cx.update(search_key);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("search").is_none(),
+            "启动时不该自己开着搜索面板"
+        );
+    });
+
+    step(cx, handle, move |window, cx| {
+        window.press(&key, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("search").is_some(), "快捷键应该打开面板");
+    });
+
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("search").is_none(), "Esc 应该关掉面板");
+    });
+}
+
+#[gpui_kit::test]
+fn the_search_panel_finds_files_below_the_current_directory(cx: &mut TestAppContext) {
+    let dir = searchable_dir();
+    let (_session, handle) = open_in(cx, dir.path());
+    let key = cx.update(search_key);
+
+    step(cx, handle, move |window, cx| {
+        window.press(&key, cx);
+    });
+    // 输入框是面板自己创建的，焦点已经在那儿了，直接敲。
+    step(cx, handle, |window, cx| {
+        window.input("*.rs", cx);
+    });
+
+    let listed = wait_for_results(cx, handle, "main.rs");
+    assert!(
+        listed.contains("main.rs") && listed.contains("inner.rs"),
+        "两层以下的文件都该找到，实际：{listed}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_content_search_looks_inside_files(cx: &mut TestAppContext) {
+    let dir = searchable_dir();
+    let (_session, handle) = open_in(cx, dir.path());
+    let key = cx.update(search_key);
+
+    step(cx, handle, move |window, cx| {
+        window.press(&key, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("content:second", cx);
+    });
+
+    let listed = wait_for_results(cx, handle, "notes.txt");
+    assert_eq!(listed, "notes.txt", "只有这个文件里有 second：{listed}");
+}
+
+#[gpui_kit::test]
+fn a_query_typo_is_reported_instead_of_being_silently_ignored(cx: &mut TestAppContext) {
+    let dir = searchable_dir();
+    let (_session, handle) = open_in(cx, dir.path());
+    let key = cx.update(search_key);
+
+    step(cx, handle, move |window, cx| {
+        window.press(&key, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("colour:red", cx);
+    });
+
+    let status = wait_for_status(cx, handle, "colour");
+    assert!(status.contains("colour"), "认不出的字段该报出来：{status}");
+}
+
+#[gpui_kit::test]
+fn choosing_a_hit_jumps_to_its_folder_and_selects_it(cx: &mut TestAppContext) {
+    let dir = searchable_dir();
+    let (_session, handle) = open_in(cx, dir.path());
+    let key = cx.update(search_key);
+
+    step(cx, handle, move |window, cx| {
+        window.press(&key, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("inner", cx);
+    });
+    wait_for_results(cx, handle, "inner.rs");
+
+    step(cx, handle, |window, cx| {
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("search").is_none(), "跳过去之后面板该收起");
+        assert!(row_names(window).contains(&"inner.rs".to_string()), "该在它所在的目录里");
+        let name = window
+            .try_find("detail-name")
+            .and_then(|it| it.label().map(|text| text.to_string()))
+            .unwrap_or_default();
+        assert_eq!(name, "inner.rs", "跳过去的那个文件该是选中的：{name}");
+    });
+}
+
+#[gpui_kit::test]
+fn the_search_panel_is_reachable_from_the_command_palette(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("搜索", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("pane:Search").is_some(),
+            "命令面板里该能搜到搜索"
+        );
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("search").is_some(), "回车应该打开面板");
+    });
+}

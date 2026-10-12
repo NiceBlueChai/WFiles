@@ -95,6 +95,7 @@ pub fn defaults(command: PaneCommand) -> &'static [&'static str] {
         PaneCommand::CopyFileName => &["cmd-shift-c"],
         PaneCommand::OpenTerminal => &["cmd-alt-t"],
         PaneCommand::QuickLook => &["space"],
+        PaneCommand::Search => &["cmd-shift-f"],
         PaneCommand::ViewArchive => &[],
         PaneCommand::CreateArchive => &[],
         PaneCommand::ViewList => &["cmd-1"],

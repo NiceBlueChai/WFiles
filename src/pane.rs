@@ -33,6 +33,7 @@ use crate::keymap;
 use crate::model::{Listing, Selection, Sort, SortKey, ViewMode};
 use crate::ops_entity::{Ops, OpsEvent};
 use crate::preview::{self, Preview};
+use crate::search_entity::{SearchEvent, SearchPanel};
 use crate::settings::Settings;
 use crate::terminal;
 use crate::thumbnails::{self, Thumbnails, ThumbnailsEvent};
@@ -99,6 +100,7 @@ gpui_kit::actions!(
         Undo,
         OpenTerminal,
         QuickLook,
+        Search,
         ViewList,
         ViewGrid,
         ViewColumns,
@@ -164,6 +166,7 @@ fn key_binding_for(
         PaneCommand::CopyFileName => KeyBinding::new(key, CopyFileName, context),
         PaneCommand::OpenTerminal => KeyBinding::new(key, OpenTerminal, context),
         PaneCommand::QuickLook => KeyBinding::new(key, QuickLook, context),
+        PaneCommand::Search => KeyBinding::new(key, Search, context),
         PaneCommand::ViewList => KeyBinding::new(key, ViewList, context),
         PaneCommand::ViewGrid => KeyBinding::new(key, ViewGrid, context),
         PaneCommand::ViewColumns => KeyBinding::new(key, ViewColumns, context),
@@ -200,6 +203,8 @@ pub enum PaneCommand {
     CopyFileName,
     OpenTerminal,
     QuickLook,
+    /// 在当前目录下搜：连子目录、连文件内容一起找。
+    Search,
     /// 看看这个压缩包里有什么。
     ViewArchive,
     /// 把选中的东西打成一个 zip。
@@ -214,7 +219,7 @@ pub enum PaneCommand {
 
 impl PaneCommand {
     /// 全部命令。配置层与命令面板都靠它枚举，加一条命令只改这一处。
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::NewFolder,
         Self::Rename,
         Self::BulkRename,
@@ -229,6 +234,7 @@ impl PaneCommand {
         Self::CopyFileName,
         Self::OpenTerminal,
         Self::QuickLook,
+        Self::Search,
         Self::ViewArchive,
         Self::CreateArchive,
         Self::ViewList,
@@ -256,6 +262,7 @@ impl PaneCommand {
             Self::CopyFileName => "copy_file_name",
             Self::OpenTerminal => "open_terminal",
             Self::QuickLook => "quick_look",
+            Self::Search => "search",
             Self::ViewArchive => "view_archive",
             Self::CreateArchive => "create_archive",
             Self::ViewList => "view_list",
@@ -286,6 +293,7 @@ impl PaneCommand {
             Self::CopyFileName => "name 剪贴板 快捷键 按键 keybinding",
             Self::OpenTerminal => "terminal 终端 shell 快捷键 按键 keybinding",
             Self::QuickLook => "preview 预览 查看 快捷键 按键 keybinding",
+            Self::Search => "search 搜索 查找 find 内容 content 快捷键 按键 keybinding",
             Self::ViewArchive => "zip 压缩包 解压 快捷键 按键 keybinding",
             Self::CreateArchive => "zip 压缩包 打包 快捷键 按键 keybinding",
             Self::ViewList => "view list 列表 快捷键 按键 keybinding",
@@ -440,6 +448,8 @@ pub struct Pane {
     watch_task: Option<Task<()>>,
     /// Quick Look 浮层；`None` 就是没开。
     quick_look: Option<QuickLookState>,
+    /// 搜索面板；`None` 就是没开。
+    search: Option<Entity<SearchPanel>>,
     /// 压缩包面板；`None` 就是没开。
     archive_view: Option<ArchiveState>,
     /// 正在后台打包/解压时把任务握在手里（丢掉即放弃），
@@ -491,6 +501,7 @@ impl Pane {
             spring_token: 0,
             watch_task: None,
             quick_look: None,
+            search: None,
             archive_view: None,
             archive_busy: None,
             capturing: None,
@@ -1102,6 +1113,62 @@ impl Pane {
         }
     }
 
+    /// 打开或关掉搜索面板。搜索范围就是当前目录（含子目录）。
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            self.close_search(window, cx);
+            return;
+        }
+        let root = self.listing.path().to_path_buf();
+        let panel = cx.new(|cx| SearchPanel::new(root, window, cx));
+        // 面板自己不认识窗格：跳文件、关面板都靠事件回传。
+        self.subscriptions.push(cx.subscribe_in(
+            &panel,
+            window,
+            |this, _, event: &SearchEvent, window, cx| match event {
+                SearchEvent::Close => this.close_search(window, cx),
+                SearchEvent::Reveal(path) => this.reveal_from_search(path.clone(), window, cx),
+            },
+        ));
+        // 面板这一帧才挂上窗口，焦点要等它挂上去再给输入框：
+        // 新建实体时那个 focus 抢不到还没渲染的元素。
+        let focus = panel.read(cx).input_handle(cx);
+        window.focus(&focus, cx);
+        self.search = Some(panel);
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.take().is_some() {
+            // 面板一关，后台那趟搜索也该停：丢掉实体，`Cancel` 随之 drop。
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// 搜索结果里点了一个：切到它所在的目录并把它选中。
+    fn reveal_from_search(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_search(window, cx);
+        if path.is_dir() {
+            self.navigate_to(path, true, window, cx);
+            return;
+        }
+        let parent = path
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| path.clone());
+        self.navigate_to(parent, true, window, cx);
+        self.selection.select(path);
+        // 结果可能在列表很下面，把它滚回视野。
+        if let Some(position) = self.selection.focus_position(&self.listing) {
+            let row = self.row_of(position);
+            self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        self.focus.focus(window, cx);
+        self.update_status();
+        cx.notify();
+    }
+
     /// 命令面板与 Esc 用：面板开着没有、这一项能不能看。
     pub fn archive_open(&self) -> bool {
         self.archive_view.is_some()
@@ -1221,6 +1288,12 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 搜索面板开着的时候窗格被遮住了，命令不该在看不见的地方生效：
+        // 那样在输入框里按 Cmd+C 会一边复制文字、一边把选中文件塞进剪贴板。
+        // 唯一例外是搜索自己——按它等于收起面板。
+        if self.search.is_some() && !matches!(command, PaneCommand::Search) {
+            return;
+        }
         match command {
             PaneCommand::NewFolder => self.request_new_folder(cx),
             PaneCommand::Rename => self.request_rename(cx),
@@ -1236,6 +1309,7 @@ impl Pane {
             PaneCommand::CopyFileName => self.copy_file_names(cx),
             PaneCommand::OpenTerminal => self.open_terminal(cx),
             PaneCommand::QuickLook => self.toggle_quick_look(cx),
+            PaneCommand::Search => self.toggle_search(window, cx),
             PaneCommand::ViewArchive => self.toggle_archive(cx),
             PaneCommand::CreateArchive => self.create_archive(cx),
             PaneCommand::ViewList => self.set_view(ViewMode::List, cx),
@@ -2560,6 +2634,9 @@ impl Pane {
             .on_action(cx.listener(|this, _: &QuickLook, window, cx| {
                 this.run_command(PaneCommand::QuickLook, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &Search, window, cx| {
+                this.run_command(PaneCommand::Search, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ViewList, window, cx| {
                 this.run_command(PaneCommand::ViewList, window, cx)
             }))
@@ -2612,7 +2689,15 @@ impl Pane {
                             .size_12(),
                         ),
                 )
-                .child(div().font_semibold().truncate().child(entry.name.clone()))
+                .child(
+                    div()
+                        .id("detail-name")
+                        .test_support()
+                        .aria_label(entry.name.clone())
+                        .font_semibold()
+                        .truncate()
+                        .child(entry.name.clone()),
+                )
                 .child(detail_row("类型", entry.kind_label(), cx))
                 .child(detail_row(
                     "大小",
@@ -2777,6 +2862,7 @@ impl Pane {
             PaneCommand::CopyFileName => "复制文件名",
             PaneCommand::OpenTerminal => "打开终端",
             PaneCommand::QuickLook => "快速查看",
+            PaneCommand::Search => "搜索当前目录",
             PaneCommand::ViewArchive => "查看压缩包",
             PaneCommand::CreateArchive => "打包成 Zip",
             PaneCommand::ViewList => "列表视图",
@@ -3313,6 +3399,10 @@ impl Render for Pane {
         }
         if self.capturing.is_some() {
             root = root.child(self.render_key_capture(cx));
+        }
+        // 搜索面板压在最上面：它自己带遮罩，且要盖住另外几个浮层。
+        if let Some(panel) = self.search.clone() {
+            root = root.child(panel.into_any_element());
         }
         root
     }

@@ -39,6 +39,9 @@ cargo fmt --check
 | `src/bulk_rename.rs` | 批量重命名规则与预览（纯逻辑） |
 | `src/settings.rs` | 用户设置持久化（默认终端、每目录的排序与视图模式、窗口布局） |
 | `src/terminal.rs` | 系统终端探测与启动（纯逻辑） |
+| `src/query.rs` | 搜索查询的纯逻辑：一句话 → 条件树，以及"这个文件过不过"的判定 |
+| `src/search.rs` | 后台搜索的纯逻辑：走目录、读文本、分批送结果、随时可中止 |
+| `src/search_entity.rs` | 搜索面板实体：输入 → 查询、结果列表、Enter 跳到那个文件 |
 | `src/term.rs` | 内嵌终端的纯逻辑：按键 → PTY 字节、屏幕与回滚、选中与取文本 |
 | `src/term_entity.rs` | 内嵌终端实体：起 PTY、跨线程收输出、量格子画屏幕、收键盘与鼠标 |
 | `src/clipboard.rs` | 剪贴板 |

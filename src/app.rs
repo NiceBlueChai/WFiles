@@ -1003,6 +1003,7 @@ impl WFilesApp {
             PaneCommand::CopyFileName,
             PaneCommand::OpenTerminal,
             PaneCommand::QuickLook,
+            PaneCommand::Search,
             PaneCommand::ViewArchive,
             PaneCommand::CreateArchive,
             PaneCommand::ViewList,
@@ -1281,6 +1282,12 @@ impl WFilesApp {
             PaneCommand::QuickLook => {
                 ("快速查看", "空格", "文件", "preview 预览 quick look 查看")
             }
+            PaneCommand::Search => (
+                "搜索当前目录",
+                "Cmd+Shift+F",
+                "文件",
+                "search 搜索 查找 find 内容 content grep",
+            ),
             PaneCommand::ViewArchive => {
                 ("查看压缩包内容", "", "文件", "zip 压缩包 archive 解压 unzip 浏览")
             }
