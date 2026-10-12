@@ -227,10 +227,11 @@ impl WFilesApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // 设置要在建窗格之前装好：窗格渲染时要读“默认终端”。
         Settings::install(cx);
-        let ops = cx.new(|_| Ops::new());
+        let remotes = cx.new(|_| Remotes::new());
+        // 操作层要认得远程连接：拷贝/移动/撤销都可能跨本地和远程。
+        let ops = cx.new(|_| Ops::new(Some(remotes.clone())));
         let thumbs = cx.new(|_| Thumbnails::new());
         let meta = cx.new(|_| Metadata::new());
-        let remotes = cx.new(|_| Remotes::new());
 
         // 恢复上次的标签；一个都不剩就开主页。
         let session = Session::load().sanitized();

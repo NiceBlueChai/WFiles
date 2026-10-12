@@ -35,8 +35,8 @@ cargo fmt --check
 | `src/diff_entity.rs` | 内容比较面板实体：三种看法、并排列表、Esc/↑↓/Enter |
 | `src/keymap.rs` | 可配置快捷键：命令 id ↔ 按键的映射表、出厂键、配置校验（纯逻辑） |
 | `src/model.rs` | 数据模型（目录/条目/会话） |
-| `src/ops.rs` | 文件操作（复制/移动/删除/重命名）、字节计数与任务控制手柄 `Control` |
-| `src/ops_entity.rs` | 文件操作的 UI 枢纽：任务队列、进度与速度、冲突、撤销栈 |
+| `src/ops.rs` | 文件操作（复制/移动/删除/重命名）、字节计数与任务控制手柄 `Control`；本地 ↔ 远程四向搬运（下载/上传/服务器内 MOVE）与认得远程路径的撤销 |
+| `src/ops_entity.rs` | 文件操作的 UI 枢纽：任务队列、进度与速度、冲突、撤销栈；远程那一端在主线程上取客户端再交给后台，判重与撤销也一样不堵界面 |
 | `src/palette.rs` | 命令面板的匹配与排序（纯逻辑） |
 | `src/preview.rs` | Quick Look 内容层：类型判定、文本/二进制读取（纯逻辑） |
 | `src/thumbnails.rs` | 缩略图：后台解码 + 有上限的缓存 |

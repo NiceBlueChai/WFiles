@@ -5,14 +5,21 @@
 
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
 };
 
 use gpui_kit::{AsyncApp, WeakEntity, *};
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::bulk_rename::{self, BulkRename, BulkRenamePreview};
-use crate::ops::{self, ConflictPolicy, Control, ControlState, History, Outcome, Progress};
+use crate::ops::{
+    self, ConflictPolicy, Control, ControlState, History, Outcome, Progress, RemoteSides,
+};
+use crate::remote::{self, Dav};
+use crate::remotes::Remotes;
 
 /// 广播给窗格的事件：文件系统变了，该刷新的自己对照路径判断。
 #[derive(Clone, Debug)]
@@ -233,6 +240,21 @@ enum JobResult {
         renamed: Vec<(PathBuf, PathBuf)>,
         failed: Vec<(PathBuf, String)>,
     },
+    /// 粘贴前的冲突预检结果：目标在远程时，判重得问服务器，
+    /// 所以这一趟也跑在后台线程上。
+    Preflight {
+        sources: Vec<PathBuf>,
+        dest: PathBuf,
+        cut: bool,
+        collisions: usize,
+    },
+    /// 撤销的结果。撤销栈整条被搬进后台线程又搬回来：
+    /// 撤不动时要能把记录放回栈里，所以不能只搬栈顶。
+    Undone {
+        history: History,
+        involved: Vec<PathBuf>,
+        result: Result<String, String>,
+    },
 }
 
 pub struct Ops {
@@ -252,13 +274,17 @@ pub struct Ops {
     bulk: Option<BulkState>,
     /// 最近一次操作的结论，显示在底部状态栏。
     last_message: Option<String>,
+    /// 远程连接注册表：只在主线程上用——取客户端，然后把客户端搬进后台线程。
+    remotes: Option<Entity<Remotes>>,
     /// 上一条消息是不是错误（决定显示颜色）。
     last_message_is_error: bool,
 }
 
 impl Ops {
-    pub fn new() -> Self {
+    /// `remotes` 用来在搬运前取远程客户端；没有远程连接（或测试里）传 `None`。
+    pub fn new(remotes: Option<Entity<Remotes>>) -> Self {
         Self {
+            remotes,
             clipboard: Clipboard::default(),
             history: History::default(),
             running: None,
@@ -682,14 +708,50 @@ impl Ops {
     fn run_undo(&mut self, cx: &mut Context<Self>) {
         // 先取出栈顶涉及的路径（撤销前后都要刷新），再执行。
         let involved = self.history.last_paths();
-        match self.history.pop_undo() {
+        // 客户端要在主线程上取好再交给撤销：它跑在后台线程里。
+        let clients = self.clients_for(&involved, cx);
+        if clients.is_empty() {
+            self.undo_now(&clients, &involved, cx);
+            return;
+        }
+        // 撤销涉及远程：搬回去要下载或上传，那是网络，不能堵在 UI 线程上。
+        // 撤销栈整条搬进后台线程，跑完再原样搬回来——
+        // 撤不动时要能把这条记录放回栈里重试，所以不能只搬栈顶一条。
+        let history = std::mem::take(&mut self.history);
+        self.enqueue(
+            Job {
+                label: "正在撤销…".to_string(),
+                total: 1,
+                can_pause: false,
+                run: Box::new(move |_control, tx| {
+                    let mut history = history;
+                    let result = history.pop_undo(&clients);
+                    let _ = tx.try_send(WorkerMessage::Done(JobResult::Undone {
+                        history,
+                        involved,
+                        result,
+                    }));
+                }),
+            },
+            cx,
+        );
+    }
+
+    /// 当场执行撤销（只涉及本地路径时）：一次 `rename` 的事，不必惊动后台。
+    fn undo_now(
+        &mut self,
+        clients: &HashMap<String, Arc<Dav>>,
+        involved: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) {
+        match self.history.pop_undo(clients) {
             Ok(describe) => {
                 self.last_message = Some(format!("已撤销{describe}"));
                 self.last_message_is_error = false;
                 cx.notify();
                 cx.emit(OpsEvent::Changed {
                     removed: Vec::new(),
-                    changed: involved,
+                    changed: involved.to_vec(),
                     renamed_to: Vec::new(),
                 });
             }
@@ -699,6 +761,49 @@ impl Ops {
                 cx.notify();
             }
         }
+    }
+
+    // ---- 远程 ----
+
+    /// 取某个远程路径所属连接的客户端。本地路径或没有这条连接时是 `None`。
+    fn client_for(&self, path: &Path, cx: &mut App) -> Option<Arc<Dav>> {
+        let (id, _) = remote::parse_location(path)?;
+        self.remotes
+            .as_ref()?
+            .update(cx, |remotes, cx| remotes.client(&id, cx))
+    }
+
+    /// 一次搬运两端的客户端；两端都在本地时两个都是 `None`。
+    fn remote_sides(
+        &self,
+        sources: &[PathBuf],
+        dest: &Path,
+        cx: &mut App,
+    ) -> RemoteSides {
+        RemoteSides {
+            source: sources.first().and_then(|path| self.client_for(path, cx)),
+            dest: self.client_for(dest, cx),
+        }
+    }
+
+    /// 撤销要用到的客户端：把涉及的远程路径按连接 id 收一遍。
+    ///
+    /// 撤销是后来才按的，那时候才去取客户端——客户端可能被删掉重建过
+    /// （改密码会清掉旧的），早取一份存着反而会用上失效的那个。
+    fn clients_for(&self, paths: &[PathBuf], cx: &mut App) -> HashMap<String, Arc<Dav>> {
+        let mut clients = HashMap::new();
+        for path in paths {
+            let Some((id, _)) = remote::parse_location(path) else {
+                continue;
+            };
+            if clients.contains_key(&id) {
+                continue;
+            }
+            if let Some(client) = self.client_for(path, cx) {
+                clients.insert(id, client);
+            }
+        }
+        clients
     }
 
     // ---- 拷贝 / 移动 ----
@@ -711,14 +816,58 @@ impl Ops {
         cut: bool,
         cx: &mut Context<Self>,
     ) {
-        let collisions = sources
-            .iter()
-            .filter(|source| {
-                let name = source.file_name();
-                name.is_some_and(|name| dest.join(name).exists())
-            })
-            .count();
+        // 目标是远程时 `exists()` 永远是假，判重得问服务器——
+        // 而问服务器是网络，不能堵在 UI 线程上，所以那一趟也排进后台。
+        let Some(client) = self.client_for(&dest, cx) else {
+            let collisions = sources
+                .iter()
+                .filter(|source| {
+                    source
+                        .file_name()
+                        .is_some_and(|name| dest.join(name).exists())
+                })
+                .count();
+            self.after_preflight(sources, dest, cut, collisions, cx);
+            return;
+        };
 
+        let checking = sources.clone();
+        let into = dest.clone();
+        self.enqueue(
+            Job {
+                label: "正在检查目标目录…".to_string(),
+                total: sources.len(),
+                can_pause: false,
+                run: Box::new(move |_control, tx| {
+                    let collisions = checking
+                        .iter()
+                        .filter(|source| {
+                            source
+                                .file_name()
+                                .is_some_and(|name| ops::remote_exists(&client, &into.join(name)))
+                        })
+                        .count();
+                    let _ = tx.try_send(WorkerMessage::Done(JobResult::Preflight {
+                        sources: checking,
+                        dest: into,
+                        cut,
+                        collisions,
+                    }));
+                }),
+            },
+            cx,
+        );
+    }
+
+    /// 预检有了结论：有冲突先问，没有就直接开始。
+    fn after_preflight(
+        &mut self,
+        sources: Vec<PathBuf>,
+        dest: PathBuf,
+        cut: bool,
+        collisions: usize,
+        cx: &mut Context<Self>,
+    ) {
         if collisions > 0 {
             self.conflict = Some(Conflict {
                 sources,
@@ -744,7 +893,8 @@ impl Ops {
         if sources.is_empty() {
             return;
         }
-        let total = ops::count_entries(&sources);
+        let remote = self.remote_sides(&sources, &dest, cx);
+        let total = ops::count_entries(&sources, remote.source.as_deref());
         let label = if cut {
             format!("正在移动 {} 项", sources.len())
         } else {
@@ -768,9 +918,9 @@ impl Ops {
                             .is_ok()
                     };
                     let outcome = if cut {
-                        ops::move_entries(&sources, &dest, policy, &mut report)
+                        ops::move_entries(&sources, &dest, policy, &remote, &mut report)
                     } else {
-                        ops::copy_entries(&sources, &dest, policy, &mut report)
+                        ops::copy_entries(&sources, &dest, policy, &remote, &mut report)
                     };
                     let aborted = control.state() == ControlState::Aborting;
                     let _ = tx.try_send(WorkerMessage::Done(JobResult::Transferred {
@@ -1000,6 +1150,35 @@ impl Ops {
                             changed: outcome.touched,
                             renamed_to,
                         });
+                    }
+                    JobResult::Preflight {
+                        sources,
+                        dest,
+                        cut,
+                        collisions,
+                    } => self.after_preflight(sources, dest, cut, collisions, cx),
+                    JobResult::Undone {
+                        history,
+                        involved,
+                        result,
+                    } => {
+                        // 栈整条先还回来：撤不动时那条记录还在里面，可以再试一次。
+                        self.history = history;
+                        match result {
+                            Ok(describe) => {
+                                self.last_message = Some(format!("已撤销{describe}"));
+                                self.last_message_is_error = false;
+                                cx.emit(OpsEvent::Changed {
+                                    removed: Vec::new(),
+                                    changed: involved,
+                                    renamed_to: Vec::new(),
+                                });
+                            }
+                            Err(error) => {
+                                self.last_message = Some(format!("撤销失败：{error}"));
+                                self.last_message_is_error = true;
+                            }
+                        }
                     }
         }
         cx.notify();

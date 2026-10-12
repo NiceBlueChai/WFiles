@@ -138,6 +138,9 @@ pub struct Entry {
 
 /// 一个 WebDAV 连接。建好之后可以反复用（HTTP 连接由 `ureq` 复用）。
 pub struct Dav {
+    /// 属于哪条连接。判断"两个客户端是不是同一台服务器"用得上：
+    /// 同一台就走服务器自己的 MOVE/COPY，跨服务器没法直接搬。
+    id: String,
     /// 服务器根地址，结尾一定有 `/`。
     base: String,
     /// 根地址里的路径部分（如 `/dav/`），用来把服务器回的 href 变回相对路径。
@@ -170,12 +173,18 @@ impl Dav {
             .timeout_read(std::time::Duration::from_secs(30))
             .build();
         Ok(Self {
+            id: config.id.clone(),
             base,
             base_path,
             user: config.user.clone(),
             agent,
             auth: format!("Basic {}", basic(&config.user, password)),
         })
+    }
+
+    /// 属于哪条连接。
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// 登录用户名。界面上要提示"当前以谁的身份连着"。
@@ -261,23 +270,64 @@ impl Dav {
         // 一边收一边写：一个 2 GB 的文件不该先在内存里整个摊开。
         std::io::copy(&mut reader, sink).map_err(|error| format!("下载：写盘失败：{error}"))
     }
+
+    /// 问一项在不在、是文件还是目录、有多大。
+    ///
+    /// `None` = 没有这一项（服务器回了 404）。搬运前判冲突靠它，
+    /// 不能靠"列一遍父目录再看里头有没有"——父目录可能很大，
+    /// 而问这一项本身只要一趟 Depth:0 的 PROPFIND。
+    pub fn stat(&self, path: &str) -> Result<Option<Entry>, String> {
+        const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:"><d:prop>
+<d:displayname/><d:getcontentlength/><d:getlastmodified/><d:resourcetype/>
+</d:prop></d:propfind>"#;
+
+        let url = self.url_of(path);
+        let response = self
+            .agent
+            .request("PROPFIND", &url)
+            .set("Authorization", &self.auth)
+            .set("Depth", "0")
+            .set("Content-Type", "application/xml; charset=utf-8")
+            .send_string(BODY)
+            .map_err(|error| explain("查询", error))?;
+        let status = response.status();
+        if status == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("查询：服务器回 {status}"));
+        }
+        let text = response
+            .into_string()
+            .map_err(|error| format!("查询：读不回响应：{error}"))?;
+        let entries = parse_propfind(text.as_bytes()).map_err(|error| format!("查询：{error}"))?;
+        Ok(entries.into_iter().next().map(|mut entry| {
+            entry.path = self.relative(&entry.path);
+            entry
+        }))
+    }
 }
 
-/// 写操作：上传、建目录、改名、复制、删除。
-///
-/// 现在界面还没接上（P4 的"远程与本地之间的双栏传输"会用），但客户端
-/// 该有的动作先备齐：它们跑的是同一条同步链路和同一套错误翻译，
-/// 留到那时候再写等于把 `explain` 重写一遍。
-#[allow(dead_code)]
+/// 上传、建目录、改名、复制、删除。
 impl Dav {
-    /// 上传：整个内容一次性 PUT。远程目录里的文件通常不大，
-    /// 真要传大文件也走的是同一条路（调用方已经在后台线程上）。
-    pub fn upload(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+    /// 上传一个文件：`reader` 从头读到尾，内容不先进内存。
+    ///
+    /// 长度必须已知：WebDAV 的 PUT 没有"分块续传"这一说，
+    /// 而给了 `Content-Length` 服务器才知道一次要收多少（否则走 chunked，
+    /// 不少服务器根本不认）。
+    pub fn upload_stream(
+        &self,
+        path: &str,
+        reader: impl std::io::Read,
+        length: u64,
+    ) -> Result<(), String> {
         let url = self.url_of(path);
         self.agent
             .request("PUT", &url)
             .set("Authorization", &self.auth)
-            .send_bytes(bytes)
+            .set("Content-Length", &length.to_string())
+            .send(reader)
             .map(|_| ())
             .map_err(|error| explain("上传", error))
     }
@@ -628,12 +678,172 @@ fn leap(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
+/// 一个只认几个方法的假 WebDAV 服务器：真握手、真 HTTP、真 XML。
+///
+/// 用真的 TCP 而不是 mock，是因为 WebDAV 最容易错的地方恰恰在
+/// "URL 拼成什么样、href 回来是什么样"——这些只有真发一次才试得出来。
+///
+/// 放在 `remote` 里、对同 crate 的测试公开，是为了让操作层（拷贝/移动/撤销）
+/// 也能真的连一次，而不是只在协议层自测。
+/// 一份三项目的 PROPFIND 响应：目录 `folder` 里有一个文件和一个子目录。
+///
+/// 测试用（协议层的解析、假服务器的目录列表都靠它），所以标了 `#[cfg(test)]`
+/// 之外的普通私有常量——`fake` 模块在 `#[cfg(test)]` 下，能看见它。
+#[cfg(test)]
+const MULTISTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/dav/folder/</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>folder</d:displayname>
+      <d:resourcetype><d:collection/></d:resourcetype>
+    </d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/dav/folder/notes.txt</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>notes.txt</d:displayname>
+      <d:getcontentlength>1234</d:getcontentlength>
+      <d:getlastmodified>Wed, 21 Oct 2015 07:28:00 GMT</d:getlastmodified>
+      <d:resourcetype/>
+    </d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/dav/folder/sub/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/></d:resourcetype>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+/// 只描述一个文件的 PROPFIND 响应：`stat` 取的是第一项，
+/// 问"某个文件在不在"时服务器回的就是这种。
+#[cfg(test)]
+const FILESTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/dav/folder/notes.txt</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>notes.txt</d:displayname>
+      <d:getcontentlength>1234</d:getcontentlength>
+      <d:getlastmodified>Wed, 21 Oct 2015 07:28:00 GMT</d:getlastmodified>
+      <d:resourcetype/>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::{FILESTATUS, MULTISTATUS};
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    pub struct Server {
+        /// 客户端连的就是这个地址。
+        pub url: String,
+        /// 记下最后收到的请求，断言用。
+        pub seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// 起一个监听在空闲端口上的服务器；进程退出就随之消失。
+    pub fn start() -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("该能监听");
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    break;
+                };
+                let recorded = recorded.clone();
+                let _ = thread::spawn(move || handle(stream, recorded)).join();
+            }
+        });
+        Server {
+            url: format!("http://127.0.0.1:{port}/dav/"),
+            seen,
+        }
+    }
+
+    fn handle(mut stream: TcpStream, recorded: Arc<Mutex<Vec<String>>>) {
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() {
+            return;
+        }
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_string();
+        let target = parts.next().unwrap_or_default().to_string();
+        let mut length = 0usize;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; length];
+        let _ = reader.read_exact(&mut body);
+        recorded.lock().unwrap().push(format!("{method} {target}"));
+
+        let (status, content_type, payload): (&str, &str, Vec<u8>) = match method.as_str() {
+            // 只有服务器"真的有"的这几处才回内容，其余一律 404：
+            // 这样"目标存不存在"这件事在测试里也判得出来（判重、起新名字都靠它）。
+            "PROPFIND" if target == "/dav/folder/notes.txt" => (
+                "207 Multi-Status",
+                "application/xml",
+                FILESTATUS.as_bytes().to_vec(),
+            ),
+            "PROPFIND" if known(&target) => (
+                "207 Multi-Status",
+                "application/xml",
+                MULTISTATUS.as_bytes().to_vec(),
+            ),
+            "PROPFIND" => ("404 Not Found", "text/plain", Vec::new()),
+            "GET" => ("200 OK", "text/plain", b"hello dav".to_vec()),
+            _ => ("201 Created", "text/plain", Vec::new()),
+        };
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&payload);
+        let _ = stream.flush();
+    }
+
+    /// 假服务器上"存在"的路径：连接根和 `folder` 一处目录。
+    fn known(target: &str) -> bool {
+        matches!(target, "/dav/" | "/dav/folder" | "/dav/folder/")
+    }
+
+    /// 一条指向 `url` 的配置：测试里建客户端用。
+    pub fn config(url: &str) -> super::Config {
+        config_with("t1", url)
+    }
+
+    /// 指定连接 id 的配置：跨服务器那几条测试需要两个不同的 id。
+    pub fn config_with(id: &str, url: &str) -> super::Config {
+        super::Config::new(
+            id.to_string(),
+            "测试".to_string(),
+            super::Kind::WebDav,
+            url.to_string(),
+            "me".to_string(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
-    use std::net::{TcpListener, TcpStream};
-    use std::thread;
 
     // ---- 纯字符串活 ----
 
@@ -689,32 +899,6 @@ mod tests {
 
     // ---- PROPFIND 解析 ----
 
-    const MULTISTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>/dav/folder/</d:href>
-    <d:propstat><d:prop>
-      <d:displayname>folder</d:displayname>
-      <d:resourcetype><d:collection/></d:resourcetype>
-    </d:prop></d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/dav/folder/notes.txt</d:href>
-    <d:propstat><d:prop>
-      <d:displayname>notes.txt</d:displayname>
-      <d:getcontentlength>1234</d:getcontentlength>
-      <d:getlastmodified>Wed, 21 Oct 2015 07:28:00 GMT</d:getlastmodified>
-      <d:resourcetype/>
-    </d:prop></d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/dav/folder/sub/</d:href>
-    <d:propstat><d:prop>
-      <d:resourcetype><d:collection/></d:resourcetype>
-    </d:prop></d:propstat>
-  </d:response>
-</d:multistatus>"#;
-
     #[test]
     fn a_multistatus_becomes_entries() {
         let entries = parse_propfind(MULTISTATUS.as_bytes()).expect("该解析出来");
@@ -755,95 +939,10 @@ mod tests {
 
     // ---- 真连一次（本地起一个假服务器）----
 
-    /// 一个只认几个方法的假 WebDAV 服务器：真握手、真 HTTP、真 XML。
-    ///
-    /// 用真的 TCP 而不是 mock，是因为 WebDAV 最容易错的地方恰恰在
-    /// "URL 拼成什么样、href 回来是什么样"——这些只有真发一次才试得出来。
-    struct Fake {
-        /// 客户端连的就是这个地址。
-        url: String,
-        /// 记下最后收到的请求，断言用。
-        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    fn fake_server() -> Fake {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("该能监听");
-        let port = listener.local_addr().unwrap().port();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = seen.clone();
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else {
-                    break;
-                };
-                let recorded = recorded.clone();
-                let _ = thread::spawn(move || handle(stream, recorded)).join();
-            }
-        });
-        Fake {
-            url: format!("http://127.0.0.1:{port}/dav/"),
-            seen,
-        }
-    }
-
-    fn handle(mut stream: TcpStream, recorded: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use std::io::BufRead as _;
-        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() {
-            return;
-        }
-        let mut parts = line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_string();
-        let target = parts.next().unwrap_or_default().to_string();
-        let mut length = 0usize;
-        loop {
-            line.clear();
-            if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                length = value.trim().parse().unwrap_or(0);
-            }
-        }
-        let mut body = vec![0u8; length];
-        let _ = reader.read_exact(&mut body);
-        recorded.lock().unwrap().push(format!("{method} {target}"));
-
-        let (status, content_type, payload): (&str, &str, Vec<u8>) = match method.as_str() {
-            "PROPFIND" => (
-                "207 Multi-Status",
-                "application/xml",
-                MULTISTATUS.as_bytes().to_vec(),
-            ),
-            "GET" => ("200 OK", "text/plain", b"hello dav".to_vec()),
-            _ => ("201 Created", "text/plain", Vec::new()),
-        };
-        let head = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            payload.len()
-        );
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(&payload);
-        let _ = stream.flush();
-    }
-
-    fn config(url: &str) -> Config {
-        Config::new(
-            "t1".to_string(),
-            "测试".to_string(),
-            Kind::WebDav,
-            url.to_string(),
-            "me".to_string(),
-        )
-    }
-
     #[test]
     fn listing_a_real_folder_goes_over_http() {
-        let fake = fake_server();
-        let dav = Dav::new(&config(&fake.url), "secret").unwrap();
+        let fake = fake::start();
+        let dav = Dav::new(&fake::config(&fake.url), "secret").unwrap();
 
         let entries = dav.list("folder").expect("该列得出来");
         // 三项目录里去掉"folder"自己，剩 notes.txt 与 sub。
@@ -857,23 +956,23 @@ mod tests {
 
     #[test]
     fn connecting_checks_that_the_root_is_reachable() {
-        let fake = fake_server();
+        let fake = fake::start();
         // 用 "" 列根：连不上会在这一步就报错，而不是等到用户点进去才发现。
-        assert!(Dav::connect(&config(&fake.url), "secret").is_ok());
+        assert!(Dav::connect(&fake::config(&fake.url), "secret").is_ok());
     }
 
     #[test]
     fn a_dead_server_says_so_instead_of_hanging() {
         // 端口 1 上什么都没有：该立刻报"连不上"，不是卡住。
-        let dav = Dav::new(&config("http://127.0.0.1:1/dav/"), "secret").unwrap();
+        let dav = Dav::new(&fake::config("http://127.0.0.1:1/dav/"), "secret").unwrap();
         let error = dav.list("").expect_err("该报错");
         assert!(error.contains("列目录失败"), "报错要带上在干什么：{error}");
     }
 
     #[test]
     fn downloading_writes_the_bytes_out() {
-        let fake = fake_server();
-        let dav = Dav::new(&config(&fake.url), "secret").unwrap();
+        let fake = fake::start();
+        let dav = Dav::new(&fake::config(&fake.url), "secret").unwrap();
 
         let mut sink = Vec::new();
         let written = dav
@@ -885,10 +984,13 @@ mod tests {
 
     #[test]
     fn writing_methods_reach_the_server() {
-        let fake = fake_server();
-        let dav = Dav::new(&config(&fake.url), "secret").unwrap();
+        let fake = fake::start();
+        let dav = Dav::new(&fake::config(&fake.url), "secret").unwrap();
 
-        dav.upload("folder/new.txt", b"hi").unwrap();
+        // 上传走的是流式接口：传一个 Read 而不是整块字节，
+        // 这样几十 GB 的文件不必先在内存里摊开。
+        dav.upload_stream("folder/new.txt", b"hi".as_slice(), 2)
+            .unwrap();
         dav.mkdir("folder/sub2").unwrap();
         dav.remove("folder/old.txt").unwrap();
         dav.rename("folder/a.txt", "folder/b.txt").unwrap();
@@ -907,7 +1009,7 @@ mod tests {
 
     #[test]
     fn the_secret_key_follows_the_id_not_the_name() {
-        let mut config = config("https://host/dav/");
+        let mut config = fake::config("https://host/dav/");
         assert_eq!(config.secret_key(), "remote:t1");
         // 改名字不该把密码弄丢。
         config.name = "改名了".to_string();

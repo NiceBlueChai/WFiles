@@ -197,7 +197,9 @@ impl Remotes {
     }
 
     /// 取一个客户端：有现成的就用，没有就按设置里的配置建一个。
-    fn client(&mut self, id: &str, cx: &mut Context<Self>) -> Option<Arc<Dav>> {
+    ///
+    /// 公开是为了让操作层能在主线程上把客户端取好、再带进后台线程。
+    pub fn client(&mut self, id: &str, cx: &mut Context<Self>) -> Option<Arc<Dav>> {
         if let Some(client) = self.clients.get(id) {
             return Some(client.clone());
         }

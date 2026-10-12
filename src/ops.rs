@@ -4,8 +4,9 @@
 //! 所有函数都是同步的，由调用方放到后台线程执行，通过 [`Progress`] 回调汇报进度。
 
 use std::{
+    collections::HashMap,
     fs,
-    io::{self, Read as _, Write as _},
+    io::{self, Write, Read as _},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -13,6 +14,8 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
+
+use crate::remote::{self, Dav};
 
 /// 目标已存在时的处理方式。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -438,13 +441,16 @@ fn remove_entry(path: &Path) -> io::Result<()> {
 /// 冲突按 `policy` 统一处理（界面先问一次，不再逐项打断）。
 /// `on_progress` 每完成一项、以及每拷完一个数据块都调用一次；
 /// 返回 false 表示用户要求中止（暂停由调用方在它内部等，worker 不必知道）。
+///
+/// `remote` 两端都在本地时传 [`RemoteSides::default()`]。
 pub fn copy_entries(
     sources: &[PathBuf],
     dest_dir: &Path,
     policy: ConflictPolicy,
+    remote: &RemoteSides,
     on_progress: &mut dyn FnMut(&Progress) -> bool,
 ) -> Outcome {
-    transfer_entries(sources, dest_dir, policy, false, on_progress)
+    transfer_entries(sources, dest_dir, policy, false, remote, on_progress)
 }
 
 /// 把一组条目移进 `dest_dir`；跨卷时按“复制成功后删源”处理。
@@ -452,9 +458,10 @@ pub fn move_entries(
     sources: &[PathBuf],
     dest_dir: &Path,
     policy: ConflictPolicy,
+    remote: &RemoteSides,
     on_progress: &mut dyn FnMut(&Progress) -> bool,
 ) -> Outcome {
-    transfer_entries(sources, dest_dir, policy, true, on_progress)
+    transfer_entries(sources, dest_dir, policy, true, remote, on_progress)
 }
 
 fn transfer_entries(
@@ -462,11 +469,12 @@ fn transfer_entries(
     dest_dir: &Path,
     policy: ConflictPolicy,
     remove_source: bool,
+    remote: &RemoteSides,
     on_progress: &mut dyn FnMut(&Progress) -> bool,
 ) -> Outcome {
     let total = sources.len();
     // 总字节数在后台线程里数：这一趟本来就要遍历一遍，顺手就出来了。
-    let bytes_total = count_bytes(sources);
+    let bytes_total = count_bytes(sources, remote.source.as_deref());
     let mut outcome = Outcome::default();
     let mut bytes_done = 0u64;
 
@@ -494,10 +502,14 @@ fn transfer_entries(
         let target = dest_dir.join(&name);
         // 往自己的父目录移动自己是无意义的，也不该判成冲突。
         let same_dir = source.parent() == Some(dest_dir);
-        let conflict = target.exists() && !same_file(source, &target) && !same_dir;
+        let exists = match remote.dest.as_deref() {
+            Some(client) => remote_exists(client, &target),
+            None => target.exists(),
+        };
+        let conflict = exists && !same_file(source, &target) && !same_dir;
 
         let Some(target) = (if conflict {
-            resolve_conflict(&target, policy)
+            resolve_target(&target, policy, remote.dest.as_deref())
         } else {
             Some(target)
         }) else {
@@ -526,7 +538,7 @@ fn transfer_entries(
                     bytes_total,
                 })
             };
-            transfer_one(source, &target, remove_source, &mut report)
+            transfer_one(source, &target, remove_source, remote, &mut report)
         };
 
         match result {
@@ -557,6 +569,72 @@ fn transfer_entries(
     outcome
 }
 
+/// 一次搬运两端的远程客户端；两端都在本地时两个都是 `None`。
+///
+/// 客户端必须**在主线程上取好再搬进后台线程**：`Remotes` 是 GPUI 实体，
+/// 后台线程里读不到它。取好的 `Dav` 是同步的，跨线程带着走没问题。
+#[derive(Clone, Default)]
+pub struct RemoteSides {
+    /// 源在远程时的客户端（查、下载、移动成功后删源）。
+    pub source: Option<Arc<Dav>>,
+    /// 目标在远程时的客户端（判重、建目录、上传）。
+    pub dest: Option<Arc<Dav>>,
+}
+
+/// `dav://<连接 id>/<子路径>` → 子路径。
+fn sub_of(path: &Path) -> Result<String, TransferError> {
+    remote::parse_location(path)
+        .map(|(_, sub)| sub)
+        .ok_or_else(|| TransferError::Failed(format!("不是远程路径：{}", path.display())))
+}
+
+/// 远程目标上有没有这一项。`Path::exists()` 对 `dav://…` 永远是假，
+/// 判冲突必须问服务器。
+pub fn remote_exists(client: &Dav, target: &Path) -> bool {
+    let Some((_, sub)) = remote::parse_location(target) else {
+        return false;
+    };
+    client.stat(&sub).unwrap_or(None).is_some()
+}
+
+/// 目标已存在时，按策略挑最终落点；`None` = 跳过这一项。
+///
+/// 本地那一支走 [`resolve_conflict`]（靠文件系统判"有没有"），
+/// 远程这一支改成问服务器，并且"保留两者"的候选名也得由服务器确认没人用。
+fn resolve_target(target: &Path, policy: ConflictPolicy, client: Option<&Dav>) -> Option<PathBuf> {
+    let Some(client) = client else {
+        return resolve_conflict(target, policy);
+    };
+    let Some((id, sub)) = remote::parse_location(target) else {
+        return resolve_conflict(target, policy);
+    };
+    match policy {
+        ConflictPolicy::Skip => None,
+        ConflictPolicy::Replace => Some(target.to_path_buf()),
+        ConflictPolicy::KeepBoth => Some(remote::location(&id, &unique_remote(client, &sub))),
+    }
+}
+
+/// 在远程那一端给 `sub` 找一个没人用的兄弟：`a.txt` → `a 2.txt`。
+fn unique_remote(client: &Dav, sub: &str) -> String {
+    let (prefix, name) = match sub.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name.to_string()),
+        None => (String::new(), sub.to_string()),
+    };
+    let (stem, extension) = match name.rfind('.') {
+        Some(at) if at > 0 => (name[..at].to_string(), name[at..].to_string()),
+        _ => (name, String::new()),
+    };
+    let mut round = 2;
+    loop {
+        let candidate = format!("{prefix}{stem} {round}{extension}");
+        if client.stat(&candidate).unwrap_or(None).is_none() {
+            return candidate;
+        }
+        round += 1;
+    }
+}
+
 /// 搬运单项的两种结局。
 ///
 /// 分开是为了让"用户中止"不会变成一条失败记录——
@@ -567,6 +645,52 @@ pub enum TransferError {
 }
 
 fn transfer_one(
+    source: &Path,
+    target: &Path,
+    remove_source: bool,
+    remote: &RemoteSides,
+    report: &mut dyn FnMut(u64) -> bool,
+) -> Result<(), TransferError> {
+    match (remote.source.as_deref(), remote.dest.as_deref()) {
+        (None, None) => local_to_local(source, target, remove_source, report),
+        // 远程 -> 本地：下载。移动时下载成功后删掉服务器上的那一份。
+        (Some(client), None) => {
+            let sub = sub_of(source)?;
+            download_entry(client, &sub, target, report)?;
+            if remove_source {
+                client
+                    .remove(&sub)
+                    .map_err(|error| TransferError::Failed(format!("已下载但删除远程源失败：{error}")))?;
+            }
+            Ok(())
+        }
+        // 本地 -> 远程：上传。
+        (None, Some(client)) => {
+            let sub = sub_of(target)?;
+            upload_entry(client, source, &sub, remove_source, report)
+        }
+        // 远程 -> 远程：同一台服务器就让服务器自己拷，一趟 MOVE/COPY 就完事；
+        // 跨服务器要先下载再上传，而"下载到哪儿"说不清（也没有可见的落点），
+        // 所以明确不支持，好过偷偷在临时目录里绕一圈。
+        (Some(from), Some(to)) => {
+            if from.id() != to.id() {
+                return Err(TransferError::Failed(
+                    "不支持在两个不同的服务器之间直接搬运".to_string(),
+                ));
+            }
+            let from_sub = sub_of(source)?;
+            let to_sub = sub_of(target)?;
+            if remove_source {
+                from.rename(&from_sub, &to_sub)
+            } else {
+                from.copy(&from_sub, &to_sub)
+            }
+            .map_err(TransferError::Failed)
+        }
+    }
+}
+
+fn local_to_local(
     source: &Path,
     target: &Path,
     remove_source: bool,
@@ -597,19 +721,182 @@ fn transfer_one(
     Ok(())
 }
 
+/// 从远程下载一项（文件或整棵子树）到本地 `target`。
+fn download_entry(
+    client: &Dav,
+    sub: &str,
+    target: &Path,
+    report: &mut dyn FnMut(u64) -> bool,
+) -> Result<(), TransferError> {
+    let info = client
+        .stat(sub)
+        .map_err(TransferError::Failed)?
+        .ok_or_else(|| TransferError::Failed("远程那一项已经不在了".to_string()))?;
+
+    if info.is_dir {
+        fs::create_dir_all(target)
+            .map_err(|error| TransferError::Failed(format!("建不了本地目录：{error}")))?;
+        let children = client
+            .list(sub)
+            .map_err(TransferError::Failed)?;
+        for child in children {
+            download_entry(client, &child.path, &target.join(&child.name), report)?;
+        }
+        return Ok(());
+    }
+
+    let mut file = fs::File::create(target)
+        .map_err(|error| TransferError::Failed(format!("写不了本地文件：{error}")))?;
+    let result = {
+        let mut sink = Reporting {
+            inner: &mut file,
+            report,
+        };
+        client.download(sub, &mut sink)
+    };
+    // 中止时那半个文件交给这一层删：拷目录时兄弟们已经下好了，
+    // 在外面删会把整棵子树连坐删掉。先关掉句柄——Windows 上开着的文件删不掉。
+    if let Err(error) = result {
+        drop(file);
+        remove_entry(target).ok();
+        if error.contains("已中止") {
+            return Err(TransferError::Aborted);
+        }
+        return Err(TransferError::Failed(error));
+    }
+    Ok(())
+}
+
+/// 把本地一项（文件或整棵子树）上传到远程 `sub`。
+///
+/// `remove_source` 为真时，上传成功后删掉本地那份——这是"剪切"，
+/// 也用于把一次远程 -> 本地的移动撤销回去。
+fn upload_entry(
+    client: &Dav,
+    source: &Path,
+    sub: &str,
+    remove_source: bool,
+    report: &mut dyn FnMut(u64) -> bool,
+) -> Result<(), TransferError> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| TransferError::Failed(format!("读不了源文件：{error}")))?;
+    if metadata.is_dir() {
+        client
+            .mkdir(sub)
+            .map_err(TransferError::Failed)?;
+        let children = fs::read_dir(source)
+            .map_err(|error| TransferError::Failed(format!("列不了本地目录：{error}")))?;
+        for child in children {
+            let child = child.map_err(|error| TransferError::Failed(error.to_string()))?;
+            let name = child.file_name().to_string_lossy().into_owned();
+            let child_sub = if sub.is_empty() {
+                name
+            } else {
+                format!("{sub}/{name}")
+            };
+            upload_entry(client, &child.path(), &child_sub, remove_source, report)?;
+        }
+        // 孩子已经各传各的、也各删各的了，到这里目录是空的，可以收尾。
+        if remove_source {
+            remove_entry(source).map_err(|error| {
+                TransferError::Failed(format!("已上传但删除本地源失败：{error}"))
+            })?;
+        }
+        return Ok(());
+    }
+
+    let length = metadata.len();
+    let file = fs::File::open(source)
+        .map_err(|error| TransferError::Failed(format!("读不了源文件：{error}")))?;
+    let reader = Reporting { inner: file, report };
+    let result = client.upload_stream(sub, reader, length);
+    if let Err(error) = result {
+        // 上传失败时服务器上多半留着半个文件：它由这一层负责清掉，
+        // 免得"失败"之后目标目录里多一个看起来传好了的残骸。
+        client.remove(sub).ok();
+        if error.contains("已中止") {
+            return Err(TransferError::Aborted);
+        }
+        return Err(TransferError::Failed(error));
+    }
+    if remove_source {
+        remove_entry(source).map_err(|error| {
+            TransferError::Failed(format!("已上传但删除本地源失败：{error}"))
+        })?;
+    }
+    Ok(())
+}
+
+/// 边读边报字节数（上传用）/ 边写边报（下载用）的那一层包装。
+///
+/// 返回 false 就是用户按了中止：这里把它变成一个 `Interrupted` 的 IO 错误，
+/// 顺着 `io::copy` / `ureq` 的读冒泡出去，调用方据此收尾。
+struct Reporting<'a, R> {
+    inner: R,
+    report: &'a mut dyn FnMut(u64) -> bool,
+}
+
+impl<R: std::io::Read> std::io::Read for Reporting<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0 && !(self.report)(read as u64) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "已中止"));
+        }
+        Ok(read)
+    }
+}
+
+impl<R: Write> Write for Reporting<'_, R> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        if written > 0 && !(self.report)(written as u64) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "已中止"));
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// 拷贝/移动前先数一遍总条目数，让进度条从一开始就有正确的分母。
-pub fn count_entries(paths: &[PathBuf]) -> usize {
-    paths.iter().map(|path| count_one(path)).sum()
+///
+/// `client` 是源那一端在远程时的客户端：远程得靠列目录数，
+/// 而列目录是要走一趟网络的。
+pub fn count_entries(paths: &[PathBuf], client: Option<&Dav>) -> usize {
+    paths.iter().map(|path| count_one(path, client)).sum()
 }
 
 /// 拷/移之前先数一遍总字节数：进度条、"还剩多久"都要这个分母。
 ///
 /// 数不出来的（没权限、失效链接）按 0 算，界面退化成只看条目数。
-pub fn count_bytes(paths: &[PathBuf]) -> u64 {
-    paths.iter().map(|path| bytes_of(path)).sum()
+pub fn count_bytes(paths: &[PathBuf], client: Option<&Dav>) -> u64 {
+    paths.iter().map(|path| bytes_of(path, client)).sum()
 }
 
-fn bytes_of(path: &Path) -> u64 {
+fn bytes_of(path: &Path, client: Option<&Dav>) -> u64 {
+    if let (Some(client), Some((_, sub))) = (client, remote::parse_location(path)) {
+        return bytes_remote(client, &sub);
+    }
+    bytes_local(path)
+}
+
+/// 远程一棵子树的总字节数：一趟递归的 PROPFIND。
+fn bytes_remote(client: &Dav, sub: &str) -> u64 {
+    let Some(info) = client.stat(sub).ok().flatten() else {
+        return 0;
+    };
+    if !info.is_dir {
+        return info.size;
+    }
+    let Ok(children) = client.list(sub) else {
+        return 0;
+    };
+    children.iter().map(|child| bytes_remote(client, &child.path)).sum()
+}
+
+fn bytes_local(path: &Path) -> u64 {
     let Ok(link) = fs::symlink_metadata(path) else {
         return 0;
     };
@@ -620,7 +907,7 @@ fn bytes_of(path: &Path) -> u64 {
         };
         return read_dir
             .flatten()
-            .map(|entry| bytes_of(&entry.path()))
+            .map(|entry| bytes_of(&entry.path(), None))
             .sum();
     }
     // 文件跟着链接走：真要拷的是链接指向的内容，
@@ -629,7 +916,30 @@ fn bytes_of(path: &Path) -> u64 {
     fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0)
 }
 
-fn count_one(path: &Path) -> usize {
+fn count_one(path: &Path, client: Option<&Dav>) -> usize {
+    if let (Some(client), Some((_, sub))) = (client, remote::parse_location(path)) {
+        return count_remote(client, &sub);
+    }
+    count_local(path)
+}
+
+fn count_remote(client: &Dav, sub: &str) -> usize {
+    let Some(info) = client.stat(sub).ok().flatten() else {
+        return 1;
+    };
+    if !info.is_dir {
+        return 1;
+    }
+    let Ok(children) = client.list(sub) else {
+        return 1;
+    };
+    1 + children
+        .iter()
+        .map(|child| count_remote(client, &child.path))
+        .sum::<usize>()
+}
+
+fn count_local(path: &Path) -> usize {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return 1;
     };
@@ -642,7 +952,7 @@ fn count_one(path: &Path) -> usize {
     };
     1 + read_dir
         .flatten()
-        .map(|entry| count_one(&entry.path()))
+        .map(|entry| count_local(&entry.path()))
         .sum::<usize>()
 }
 
@@ -713,41 +1023,32 @@ impl HistoryEntry {
     }
 
     /// 执行撤销。失败时返回原因，且这一条记录仍然留在栈里（情况没变，重试也许还有意义）。
-    pub fn undo(&self) -> Result<(), String> {
+    ///
+    /// `clients` 是这一条记录涉及的远程连接（按连接 id 索引）；
+    /// 只涉及本地路径时它是空的，行为跟以前一样。
+    pub fn undo(&self, clients: &HashMap<String, Arc<Dav>>) -> Result<(), String> {
         match self {
             Self::Created { path } => {
-                let metadata = fs::symlink_metadata(path)
-                    .map_err(|_| "这一项已经不存在了".to_string())?;
-                if metadata.is_dir() {
-                    let empty = fs::read_dir(path)
-                        .map(|mut entries| entries.next().is_none())
-                        .unwrap_or(false);
-                    if !empty {
-                        return Err("文件夹里已经有了新内容，先清空再撤销".to_string());
-                    }
-                }
-                remove_entry(path).map_err(|error| error.to_string())
+                remove_any(path, clients)
             }
             Self::Renamed { from, to } => {
-                if !to.exists() {
+                if exists_any(to, clients) != Some(true) {
                     return Err("原文件已经不在改名后的位置了".to_string());
                 }
-                fs::rename(to, from).map_err(|error| error.to_string())
+                move_back(from, to, clients)
             }
             Self::Copied { created } => {
                 for path in created {
-                    if path.exists() {
-                        remove_entry(path).map_err(|error| error.to_string())?;
+                    if exists_any(path, clients) == Some(true) {
+                        remove_any(path, clients)?;
                     }
                 }
                 Ok(())
             }
             Self::Moved { moves } => {
+                // 逆序搬回去，避免序号类的落点互相踩。
                 for (from, to) in moves.iter().rev() {
-                    if let Some(parent) = from.parent() {
-                        fs::create_dir_all(parent).ok();
-                    }
-                    fs::rename(to, from).map_err(|error| error.to_string())?;
+                    move_back(from, to, clients)?;
                 }
                 Ok(())
             }
@@ -772,6 +1073,73 @@ impl HistoryEntry {
                     restore_from_trash(original, *trashed_at)?;
                 }
                 Ok(())
+            }
+        }
+    }
+}
+
+/// 本地或远程，这一项在不在。`None` = 问不出来（连接没了）。
+fn exists_any(path: &Path, clients: &HashMap<String, Arc<Dav>>) -> Option<bool> {
+    let Some((id, sub)) = remote::parse_location(path) else {
+        return Some(path.exists());
+    };
+    let client = clients.get(&id)?;
+    Some(client.stat(&sub).unwrap_or(None).is_some())
+}
+
+/// 本地或远程，删掉这一项。
+fn remove_any(path: &Path, clients: &HashMap<String, Arc<Dav>>) -> Result<(), String> {
+    let Some((id, sub)) = remote::parse_location(path) else {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| "这一项已经不存在了".to_string())?;
+        if metadata.is_dir() {
+            let empty = fs::read_dir(path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if !empty {
+                return Err("文件夹里已经有了新内容，先清空再撤销".to_string());
+            }
+        }
+        return remove_entry(path).map_err(|error| error.to_string());
+    };
+    let client = clients
+        .get(&id)
+        .ok_or_else(|| "这条远程连接已经不在了".to_string())?;
+    client.remove(&sub)
+}
+
+/// 撤销一次移动：把 `to` 搬回 `from`。两端各可能是本地或远程。
+fn move_back(from: &Path, to: &Path, clients: &HashMap<String, Arc<Dav>>) -> Result<(), String> {
+    let from_remote = remote::parse_location(from);
+    let to_remote = remote::parse_location(to);
+    // 先按“两边各是什么位置”取好客户端，后面哪个分支用得上就用。
+    let sides = RemoteSides {
+        source: to_remote.as_ref().and_then(|(id, _)| clients.get(id).cloned()),
+        dest: from_remote.as_ref().and_then(|(id, _)| clients.get(id).cloned()),
+    };
+    match (from_remote, to_remote) {
+        (None, None) => {
+            if let Some(parent) = from.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            fs::rename(to, from).map_err(|error| error.to_string())
+        }
+        // 同一台服务器：让服务器自己搬回去，一趟 MOVE 就完事。
+        (Some((from_id, from_sub)), Some((to_id, to_sub))) if from_id == to_id => {
+            let client = clients
+                .get(&from_id)
+                .ok_or_else(|| "这条远程连接已经不在了".to_string())?;
+            client.rename(&to_sub, &from_sub)
+        }
+        // 一边本地一边远程（或跨服务器）：走一趟真的下载/上传。
+        // 搬回去之后 `to` 那一端不该还留着一份，所以是"移动"不是"复制"。
+        // 撤销跑在后台线程上，不用报进度，给个一律放行的上报器。
+        _ => {
+            let mut report = |_bytes: u64| true;
+            match transfer_one(to, from, true, &sides, &mut report) {
+                Ok(()) => Ok(()),
+                Err(TransferError::Aborted) => Err("已中止".to_string()),
+                Err(TransferError::Failed(message)) => Err(message),
             }
         }
     }
@@ -812,12 +1180,12 @@ impl History {
     }
 
     /// 弹出并执行撤销，返回被撤销操作的描述。
-    pub fn pop_undo(&mut self) -> Result<String, String> {
+    pub fn pop_undo(&mut self, clients: &HashMap<String, Arc<Dav>>) -> Result<String, String> {
         let entry = self
             .entries
             .pop()
             .ok_or_else(|| "没有可撤销的操作".to_string())?;
-        match entry.undo() {
+        match entry.undo(clients) {
             Ok(()) => Ok(entry.describe()),
             Err(error) => {
                 // 撤不动就放回栈里，下一次重试。
@@ -1015,6 +1383,7 @@ mod tests {
             &[src.join("a.txt"), src.join("nested")],
             &dest,
             ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
             &mut |progress| {
                 labels.push(progress.label.clone());
                 true
@@ -1044,6 +1413,7 @@ mod tests {
             &[src.join("a.txt")],
             &dest,
             ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
             &mut |_| true,
         );
         assert_eq!(outcome.done, 1);
@@ -1067,6 +1437,7 @@ mod tests {
             &[src.join("a.txt")],
             &dest,
             ConflictPolicy::Replace,
+            &RemoteSides::default(),
             &mut |_| true,
         );
         assert_eq!(outcome.done, 1);
@@ -1089,6 +1460,7 @@ mod tests {
             &[src.join("a.txt")],
             &dest,
             ConflictPolicy::Skip,
+            &RemoteSides::default(),
             &mut |_| true,
         );
         assert_eq!(outcome.done, 0);
@@ -1110,6 +1482,7 @@ mod tests {
             &[src.join("a.txt")],
             &dest,
             ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
             &mut |_| true,
         );
         assert_eq!(outcome.done, 1);
@@ -1128,6 +1501,7 @@ mod tests {
             std::slice::from_ref(&src),
             &src.join("inner"),
             ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
             &mut |_| true,
         );
         assert_eq!(outcome.done, 0);
@@ -1156,12 +1530,250 @@ mod tests {
                 .collect::<Vec<_>>(),
             &dest,
             ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
             &mut |progress| progress.done < 2,
         );
 
         assert_eq!(outcome.done, 2, "第 3 项开始前被叫停");
         assert_eq!(outcome.skipped, 4, "剩下的全部记为跳过");
         assert_eq!(fs::read_dir(&dest).unwrap().count(), 2);
+    }
+
+    // ---- 跨本地与远程（真连一次假服务器）----
+
+    /// 起一个假服务器并连上它，返回客户端和"它都收到了什么"。
+    fn remote_client() -> (std::sync::Arc<Dav>, remote::fake::Server) {
+        let server = remote::fake::start();
+        let client = Dav::new(&remote::fake::config(&server.url), "secret").unwrap();
+        (std::sync::Arc::new(client), server)
+    }
+
+    fn seen_requests(server: &remote::fake::Server) -> Vec<String> {
+        server.seen.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn copying_local_files_up_to_a_remote_folder() {
+        let (client, server) = remote_client();
+        let root = temp();
+        let local = root.path().join("a.txt");
+        fs::write(&local, "hello").unwrap();
+
+        // 目标写成 `dav://t1/folder`：窗格里就是这么一个路径，
+        // 拼上文件名后上传的地址应该是 folder/a.txt。
+        let dest = remote::location("t1", "folder");
+        let sides = RemoteSides {
+            source: None,
+            dest: Some(client),
+        };
+        let outcome = copy_entries(
+            std::slice::from_ref(&local),
+            &dest,
+            ConflictPolicy::Replace,
+            &sides,
+            &mut |_| true,
+        );
+
+        assert_eq!(outcome.failed, vec![]);
+        assert_eq!(outcome.done, 1);
+        assert_eq!(
+            seen_requests(&server),
+            vec![
+                // 判重：服务器说没有，才轮到真的上传。
+                "PROPFIND /dav/folder/a.txt".to_string(),
+                "PUT /dav/folder/a.txt".to_string(),
+            ]
+        );
+        assert!(local.exists(), "上传不删本地那份");
+    }
+
+    #[test]
+    fn moving_local_files_up_to_a_remote_folder_deletes_the_local_copy() {
+        let (client, server) = remote_client();
+        let root = temp();
+        let local = root.path().join("a.txt");
+        fs::write(&local, "hello").unwrap();
+
+        let dest = remote::location("t1", "folder");
+        let sides = RemoteSides {
+            source: None,
+            dest: Some(client),
+        };
+        let outcome = move_entries(
+            std::slice::from_ref(&local),
+            &dest,
+            ConflictPolicy::Replace,
+            &sides,
+            &mut |_| true,
+        );
+
+        assert_eq!(outcome.failed, vec![]);
+        assert_eq!(outcome.done, 1);
+        // 剪切就是剪切：传上去以后本地这份要没了。
+        assert!(!local.exists());
+        assert!(seen_requests(&server).ends_with(&["PUT /dav/folder/a.txt".to_string()]));
+    }
+
+    #[test]
+    fn moving_a_remote_file_down_deletes_it_up_there() {
+        let (client, server) = remote_client();
+        let root = temp();
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let source = remote::location("t1", "folder/notes.txt");
+        let sides = RemoteSides {
+            source: Some(client),
+            dest: None,
+        };
+        let outcome = move_entries(
+            std::slice::from_ref(&source),
+            &dest,
+            ConflictPolicy::Replace,
+            &sides,
+            &mut |_| true,
+        );
+
+        assert_eq!(outcome.failed, vec![]);
+        assert_eq!(outcome.done, 1);
+        assert_eq!(
+            fs::read_to_string(dest.join("notes.txt")).unwrap(),
+            "hello dav"
+        );
+        // 移动 = 下载 + 删掉服务器上那份，顺序不能反。
+        assert_eq!(
+            seen_requests(&server),
+            vec![
+                "PROPFIND /dav/folder/notes.txt".to_string(),
+                "PROPFIND /dav/folder/notes.txt".to_string(),
+                "GET /dav/folder/notes.txt".to_string(),
+                "DELETE /dav/folder/notes.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn moving_within_one_server_is_a_single_request() {
+        let (client, server) = remote_client();
+        let source = remote::location("t1", "folder/a.txt");
+        let dest = remote::location("t1", "folder/sub");
+        let sides = RemoteSides {
+            source: Some(client.clone()),
+            dest: Some(client),
+        };
+        let outcome = move_entries(
+            std::slice::from_ref(&source),
+            &dest,
+            ConflictPolicy::Replace,
+            &sides,
+            &mut |_| true,
+        );
+
+        assert_eq!(outcome.failed, vec![]);
+        assert_eq!(outcome.done, 1);
+        // 同一台服务器之间没有"下载再上传"这回事：一趟 MOVE 就完事。
+        // 先数总字节（问了源），再判目标重不重，最后才动手。
+        assert_eq!(
+            seen_requests(&server),
+            vec![
+                "PROPFIND /dav/folder/a.txt".to_string(),
+                "PROPFIND /dav/folder/sub/a.txt".to_string(),
+                "MOVE /dav/folder/a.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn carrying_between_two_servers_is_refused() {
+        let first = remote::fake::start();
+        let second = remote::fake::start();
+        let from = std::sync::Arc::new(
+            Dav::new(&remote::fake::config_with("t1", &first.url), "secret").unwrap(),
+        );
+        let to = std::sync::Arc::new(
+            Dav::new(&remote::fake::config_with("t2", &second.url), "secret").unwrap(),
+        );
+
+        let source = remote::location("t1", "folder/a.txt");
+        let dest = remote::location("t2", "folder");
+        let sides = RemoteSides {
+            source: Some(from),
+            dest: Some(to),
+        };
+        let outcome = move_entries(
+            std::slice::from_ref(&source),
+            &dest,
+            ConflictPolicy::Replace,
+            &sides,
+            &mut |_| true,
+        );
+
+        assert_eq!(outcome.done, 0);
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(
+            outcome.failed[0].1.contains("两个不同的服务器"),
+            "要说清为什么不行：{}",
+            outcome.failed[0].1
+        );
+        // 拒绝就是拒绝：第二台服务器上连一个写请求都不该有
+        // （判重那次 PROPFIND 是只读的，不算动手）。
+        let writes: Vec<_> = seen_requests(&second)
+            .into_iter()
+            .filter(|it| !it.starts_with("PROPFIND"))
+            .collect();
+        assert!(writes.is_empty(), "不该在目标服务器上留下东西：{writes:?}");
+    }
+
+    #[test]
+    fn undo_moves_a_remote_file_back_to_local() {
+        let (client, server) = remote_client();
+        let root = temp();
+        let local = root.path().join("notes.txt");
+        let remote_at = remote::location("t1", "folder/notes.txt");
+
+        let mut history = History::default();
+        history.push(HistoryEntry::Moved {
+            moves: vec![(local.clone(), remote_at.clone())],
+        });
+        let mut clients = HashMap::new();
+        clients.insert("t1".to_string(), client);
+        history.pop_undo(&clients).unwrap();
+
+        assert_eq!(fs::read_to_string(&local).unwrap(), "hello dav");
+        // 撤销移动 = 下载回来 + 删掉远程那份。
+        assert_eq!(
+            seen_requests(&server),
+            vec![
+                "PROPFIND /dav/folder/notes.txt".to_string(),
+                "GET /dav/folder/notes.txt".to_string(),
+                "DELETE /dav/folder/notes.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn undo_moves_a_local_file_back_up_to_the_server() {
+        let (client, server) = remote_client();
+        let root = temp();
+        // 模拟一次"远程 -> 本地"的移动已经发生：文件此刻在本地。
+        let local = root.path().join("notes.txt");
+        fs::write(&local, "hello dav").unwrap();
+        let remote_at = remote::location("t1", "folder/notes.txt");
+
+        let mut history = History::default();
+        history.push(HistoryEntry::Moved {
+            moves: vec![(remote_at.clone(), local.clone())],
+        });
+        let mut clients = HashMap::new();
+        clients.insert("t1".to_string(), client);
+        history.pop_undo(&clients).unwrap();
+
+        // 撤销 = 传回服务器 + 删掉本地那份。
+        assert!(!local.exists(), "本地那份不该留着");
+        assert_eq!(
+            seen_requests(&server),
+            vec!["PUT /dav/folder/notes.txt".to_string()]
+        );
     }
 
     // ---- 后台任务的控制手柄 ----
@@ -1232,8 +1844,8 @@ mod tests {
         fs::write(src.join("a.txt"), "12345").unwrap();
         fs::write(src.join("nested/b.txt"), "1234567890").unwrap();
 
-        assert_eq!(count_bytes(std::slice::from_ref(&src)), 15);
-        assert_eq!(count_bytes(&[src.join("a.txt"), src]), 20);
+        assert_eq!(count_bytes(std::slice::from_ref(&src), None), 15);
+        assert_eq!(count_bytes(&[src.join("a.txt"), src], None), 20);
     }
 
     #[cfg(unix)]
@@ -1248,7 +1860,7 @@ mod tests {
 
         let paths = vec![root.path().join("link.txt"), root.path().join("gone.txt")];
         // 链接算它指向的内容（5 字节），失效链接算 0。
-        assert_eq!(count_bytes(&paths), 5);
+        assert_eq!(count_bytes(&paths, None), 5);
     }
 
     #[test]
@@ -1266,6 +1878,7 @@ mod tests {
             &[src.join("a.txt"), src.join("b.txt")],
             &dest,
             ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
             &mut |progress| {
                 last = Some(progress.clone());
                 true
@@ -1292,6 +1905,7 @@ mod tests {
             std::slice::from_ref(&src.join("big.bin")),
             &dest,
             ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
             &mut |progress| progress.bytes_done < 2 * 1024 * 1024,
         );
 
@@ -1320,6 +1934,7 @@ mod tests {
             std::slice::from_ref(&src),
             &dest,
             ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
             &mut |progress| progress.bytes_done < 4 * 1024 * 1024,
         );
 
@@ -1345,8 +1960,8 @@ mod tests {
         fs::write(src.join("nested/b.txt"), "x").unwrap();
         fs::write(src.join("nested/deep/c.txt"), "x").unwrap();
 
-        assert_eq!(count_entries(std::slice::from_ref(&src)), 6);
-        assert_eq!(count_entries(&[src.join("a.txt"), src]), 7);
+        assert_eq!(count_entries(std::slice::from_ref(&src), None), 6);
+        assert_eq!(count_entries(&[src.join("a.txt"), src], None), 7);
     }
 
     // ---- 撤销 ----
@@ -1363,7 +1978,7 @@ mod tests {
             Some("新建“未命名文件夹”".to_string())
         );
 
-        assert_eq!(history.pop_undo().unwrap(), "新建“未命名文件夹”");
+        assert_eq!(history.pop_undo(&HashMap::new()).unwrap(), "新建“未命名文件夹”");
         assert!(!folder.exists());
         assert!(history.is_empty());
     }
@@ -1377,7 +1992,7 @@ mod tests {
         let mut history = History::default();
         history.push(HistoryEntry::Created { path: folder.clone() });
 
-        assert!(history.pop_undo().is_err());
+        assert!(history.pop_undo(&HashMap::new()).is_err());
         assert!(
             history.last_describe().is_some(),
             "撤不动要留在栈里"
@@ -1398,7 +2013,7 @@ mod tests {
             to: renamed,
         });
 
-        history.pop_undo().unwrap();
+        history.pop_undo(&HashMap::new()).unwrap();
         assert!(file.exists());
         assert!(!root.path().join("b.txt").exists());
     }
@@ -1417,6 +2032,7 @@ mod tests {
             &[src.join("a.txt"), src.join("d")],
             &dest,
             ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
             &mut |_| true,
         );
 
@@ -1424,7 +2040,7 @@ mod tests {
         history.push(HistoryEntry::Copied {
             created: outcome.touched.clone(),
         });
-        history.pop_undo().unwrap();
+        history.pop_undo(&HashMap::new()).unwrap();
 
         assert!(!dest.join("a.txt").exists());
         assert!(!dest.join("d").exists());
@@ -1442,7 +2058,7 @@ mod tests {
         let dest = root.path().join("dest");
         fs::create_dir(&dest).unwrap();
         let sources = vec![src.join("a.txt"), src.join("b.txt")];
-        let outcome = move_entries(&sources, &dest, ConflictPolicy::KeepBoth, &mut |_| true);
+        let outcome = move_entries(&sources, &dest, ConflictPolicy::KeepBoth, &RemoteSides::default(), &mut |_| true);
         assert_eq!(outcome.done, 2);
 
         // 撤销记录按“源 -> 目标”成对记住，放回时反着来。
@@ -1456,7 +2072,7 @@ mod tests {
         let mut history = History::default();
         history.push(HistoryEntry::Moved { moves });
 
-        history.pop_undo().unwrap();
+        history.pop_undo(&HashMap::new()).unwrap();
         assert_eq!(fs::read_to_string(src.join("a.txt")).unwrap(), "aaa");
         assert_eq!(fs::read_to_string(src.join("b.txt")).unwrap(), "bbb");
         assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
@@ -1484,7 +2100,7 @@ mod tests {
             fs::rename(from, to).unwrap();
         }
 
-        history.pop_undo().unwrap();
+        history.pop_undo(&HashMap::new()).unwrap();
         for path in &paths {
             assert!(path.exists(), "{} 应该被改回原名", path.display());
         }
@@ -1531,7 +2147,7 @@ mod tests {
             history.entries[0],
             HistoryEntry::Created { path: renamed.clone() }
         );
-        history.pop_undo().unwrap();
+        history.pop_undo(&HashMap::new()).unwrap();
         assert!(!renamed.exists());
     }
 

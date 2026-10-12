@@ -634,7 +634,7 @@ fn new_ops(cx: &mut TestAppContext) -> gpui_kit::Entity<Ops> {
     cx.background_executor.allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
-        cx.new(|_| Ops::new())
+        cx.new(|_| Ops::new(None))
     })
 }
 
@@ -3143,6 +3143,86 @@ fn the_connect_dialog_refuses_an_empty_address(cx: &mut TestAppContext) {
             .unwrap_or_default()
     });
     assert_eq!(error, "服务器地址不能为空", "该说出缺什么：{error}");
+}
+
+#[gpui_kit::test]
+fn pasting_into_a_remote_folder_uploads_over_http(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let root = tempfile::tempdir().expect("临时目录");
+    let local = root.path().join("a.txt");
+    std::fs::write(&local, "hello").unwrap();
+
+    // 真的起一个服务器、真的发一次 PUT：
+    // 远程粘贴最容易错的正是"地址拼成什么样"，只有真发一次才试得出来。
+    let server = crate::remote::fake::start();
+    let ops = cx.update(|cx| {
+        gpui_kit::init(cx);
+        Settings::update(cx, |settings| {
+            settings
+                .remotes
+                .push(crate::remote::fake::config(&server.url));
+        });
+        let remotes = cx.new(|_| crate::remotes::Remotes::new());
+        cx.new(|_| crate::ops_entity::Ops::new(Some(remotes)))
+    });
+    cx.background_executor.allow_parking();
+
+    cx.update(|cx| {
+        ops.update(cx, |ops, cx| {
+            ops.cut(vec![local.clone()], cx);
+            ops.request_paste(crate::remote::location("t1", "folder"), cx);
+        });
+    });
+    wait_until_idle(cx, &ops);
+    let message = message_of(cx, &ops);
+    assert_eq!(message, "移动完成 1 项", "实际是 {message}");
+    assert!(!local.exists(), "剪切之后本地那份该没了");
+
+    let seen = server.seen.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|it| it.starts_with("PUT /dav/folder/a.txt")),
+        "该真的上传了一次：{seen:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_remote_target_that_already_exists_asks_before_writing(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let root = tempfile::tempdir().expect("临时目录");
+    // 名字故意和假服务器上已有的那个一样：这一粘必然撞名。
+    let local = root.path().join("notes.txt");
+    std::fs::write(&local, "hello").unwrap();
+
+    let server = crate::remote::fake::start();
+    let ops = cx.update(|cx| {
+        gpui_kit::init(cx);
+        Settings::update(cx, |settings| {
+            settings
+                .remotes
+                .push(crate::remote::fake::config(&server.url));
+        });
+        let remotes = cx.new(|_| crate::remotes::Remotes::new());
+        cx.new(|_| crate::ops_entity::Ops::new(Some(remotes)))
+    });
+    cx.background_executor.allow_parking();
+
+    cx.update(|cx| {
+        ops.update(cx, |ops, cx| {
+            ops.copy(vec![local.clone()], cx);
+            ops.request_paste(crate::remote::location("t1", "folder"), cx);
+        });
+    });
+    wait_until_idle(cx, &ops);
+
+    // 判重是问服务器的，所以结论要等那一趟回来：回来之后该弹冲突对话框。
+    let conflict = cx.update(|cx| ops.read(cx).conflict().map(|it| it.collisions));
+    assert_eq!(conflict, Some(1), "撞名了就该先问：{conflict:?}");
+    // 没问清楚之前不该动服务器上的东西。
+    let seen = server.seen.lock().unwrap().clone();
+    assert!(
+        seen.iter().all(|it| it.starts_with("PROPFIND")),
+        "只该问，不该写：{seen:?}"
+    );
 }
 
 #[gpui_kit::test]
