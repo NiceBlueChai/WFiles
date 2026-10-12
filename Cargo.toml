@@ -33,6 +33,7 @@ hmac = "0.12"
 # PROPFIND / MKCOL 这两个 WebDAV 必需的动作直接被拒。
 ureq = { version = "2", default-features = false, features = ["tls"] }
 quick-xml = { version = "0.38", default-features = false }
+suppaftp = "12"
 
 # 密码存系统钥匙串。**按平台分开声明，不是图省事写一份**：
 # `keyring` 的 Linux 后端（secret-service）会拖进 zbus / dbus 一整条依赖链，

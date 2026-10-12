@@ -20,6 +20,7 @@ mod palette;
 mod pane;
 mod preview;
 mod query;
+mod ftp;
 mod remote;
 mod remotes;
 mod s3;

@@ -1,7 +1,7 @@
 //! 远程位置（P4）：连接配置、凭据存放，以及各协议的客户端。
 //!
-//! 现在实现了 WebDAV——它同时也是坚果云、Nextcloud、ownCloud 等一众服务
-//! 的接入方式，所以排在最前面。SFTP / FTP / S3 / SMB 按路线图排在其后。
+//! 已经实现三种：WebDAV（同时也是坚果云、Nextcloud、ownCloud 等一众网盘与
+//! 自建 NAS 的接入方式）、S3 兼容对象存储、明文 FTP。SFTP 按路线图排在其后。
 //!
 //! 三条纪律：
 //! 1. **密码不进配置文件**。配置是明文 JSON，会被同步、会被贴到工单里；
@@ -25,15 +25,18 @@ pub enum Kind {
     /// S3 兼容对象存储：AWS S3、MinIO、Cloudflare R2、Backblaze B2，
     /// 以及各家云厂商的 S3 兼容端点。
     S3,
+    /// 明文 FTP。FTPS 在路线图里明确不做。
+    Ftp,
 }
 
 impl Kind {
-    pub const ALL: [Self; 2] = [Self::WebDav, Self::S3];
+    pub const ALL: [Self; 3] = [Self::WebDav, Self::S3, Self::Ftp];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::WebDav => "WebDAV",
             Self::S3 => "S3 对象存储",
+            Self::Ftp => "FTP",
         }
     }
 
@@ -42,6 +45,7 @@ impl Kind {
         match self {
             Self::WebDav => "https://dav.jianguoyun.com/dav/",
             Self::S3 => "https://s3.cn-north-1.amazonaws.com.cn/bucket/",
+            Self::Ftp => "ftp://127.0.0.1:21/",
         }
     }
 
@@ -50,6 +54,7 @@ impl Kind {
         match self {
             Self::WebDav => "用户名",
             Self::S3 => "Access Key ID",
+            Self::Ftp => "用户名",
         }
     }
 
@@ -58,6 +63,7 @@ impl Kind {
         match self {
             Self::WebDav => "密码",
             Self::S3 => "Secret Access Key",
+            Self::Ftp => "密码",
         }
     }
 }
@@ -215,6 +221,7 @@ pub fn open(config: &Config, password: &str) -> Result<Client, String> {
     let client: Client = match config.kind {
         Kind::WebDav => std::sync::Arc::new(Dav::new(config, password)?),
         Kind::S3 => std::sync::Arc::new(crate::s3::S3::new(config, password)?),
+        Kind::Ftp => std::sync::Arc::new(crate::ftp::Ftp::new(config, password)?),
     };
     Ok(client)
 }

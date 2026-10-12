@@ -157,6 +157,7 @@ fn kind_id(kind: RemoteKind) -> String {
     match kind {
         RemoteKind::WebDav => "connect-kind-webdav".to_string(),
         RemoteKind::S3 => "connect-kind-s3".to_string(),
+        RemoteKind::Ftp => "connect-kind-ftp".to_string(),
     }
 }
 
