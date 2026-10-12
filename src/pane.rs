@@ -1159,7 +1159,7 @@ impl Pane {
             window,
             |this, _, event: &SearchEvent, window, cx| match event {
                 SearchEvent::Close => this.close_search(window, cx),
-                SearchEvent::Reveal(path) => this.reveal_from_search(path.clone(), window, cx),
+                SearchEvent::Reveal(path) => this.reveal_path(path.clone(), window, cx),
             },
         ));
         // 面板这一帧才挂上窗口，焦点要等它挂上去再给输入框：
@@ -1199,7 +1199,7 @@ impl Pane {
             window,
             |this, _, event: &AnalyzeEvent, window, cx| match event {
                 AnalyzeEvent::Close => this.close_analyze(window, cx),
-                AnalyzeEvent::Reveal(path) => this.reveal_from_search(path.clone(), window, cx),
+                AnalyzeEvent::Reveal(path) => this.reveal_path(path.clone(), window, cx),
             },
         ));
         // 面板这一帧才挂上窗口，焦点等挂好再给（见搜索面板那边的说明）。
@@ -1466,7 +1466,8 @@ impl Pane {
     }
 
     /// 搜索结果里点了一个：切到它所在的目录并把它选中。
-    fn reveal_from_search(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// 跳到某个文件：切到它所在的目录并选中它。搜索面板与分析、比较面板共用。
+    pub fn reveal_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.close_search(window, cx);
         if path.is_dir() {
             self.navigate_to(path, true, window, cx);

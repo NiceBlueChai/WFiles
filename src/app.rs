@@ -17,6 +17,8 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::bulk_rename::BulkRename;
+use crate::compare::Options as CompareOptions;
+use crate::compare_entity::{CompareEvent, ComparePanel};
 use crate::drag::{self, DraggedPaths};
 use crate::format;
 use crate::ops::{ConflictPolicy, ControlState};
@@ -42,6 +44,7 @@ gpui_kit::actions!(
         CopyToOther,
         MoveToOther,
         ToggleTerminal,
+        Compare,
     ]
 );
 
@@ -70,6 +73,8 @@ enum AppCommand {
     ToggleSync,
     CopyToOther,
     MoveToOther,
+    /// 比较两栏（或选中的两个目录）差在哪，并可选同步。
+    Compare,
 }
 
 /// 面板能触发的动作。窗格内的操作转交给当前窗格，
@@ -122,6 +127,8 @@ pub fn init(cx: &mut App) {
         // 内嵌终端面板。Ctrl+Alt+T 是 Linux 桌面上"打开终端"的老键位，
         // 换成 Ctrl 也和"打开系统终端"的 Cmd+Alt+T 区分得开。
         KeyBinding::new(TOGGLE_KEY, ToggleTerminal, None),
+        // 比较：双栏时比两栏，单栏时比选中的两个目录。
+        KeyBinding::new("cmd-alt-b", Compare, None),
     ]);
 }
 
@@ -156,6 +163,8 @@ pub struct WFilesApp {
     /// 底部的内嵌终端。`None` = 收起来；收起来时实体也一起丢掉，
     /// 于是里面的 shell 一定会被杀掉（见 `Terminal` 的 `Drop`）。
     term: Option<Entity<Terminal>>,
+    /// 比较面板。`None` = 收起来；收起来时实体一起丢掉，后台那一趟随之停下。
+    compare: Option<Entity<ComparePanel>>,
 }
 
 impl WFilesApp {
@@ -200,6 +209,7 @@ impl WFilesApp {
             quit_subscription: None,
             subscriptions: Vec::new(),
             term: None,
+            compare: None,
         };
 
         app.subscriptions.push(cx.subscribe_in(
@@ -640,6 +650,77 @@ impl WFilesApp {
         self.ops.update(cx, |ops, cx| ops.request_paste(dest, cx));
     }
 
+    /// 比较比哪两个目录。
+    ///
+    /// 双栏时就是屏幕上左右两栏（按位置，不是按"谁有焦点"）；
+    /// 单栏时看选中了几个目录：两个就比这两个，一个就和当前目录比。
+    /// 一个都挑不出来时返回 `None`，命令面板里也就不列这一条——
+    /// 只有当前目录一个人，没得比。
+    fn compare_targets(&self, cx: &App) -> Option<(PathBuf, PathBuf)> {
+        if let Some(partner) = self.split {
+            let (left_index, right_index) = if self.focus_on_left {
+                (self.active, partner)
+            } else {
+                (partner, self.active)
+            };
+            let left = self.tabs[left_index].read(cx).path().to_path_buf();
+            let right = self.tabs[right_index].read(cx).path().to_path_buf();
+            if left != right {
+                return Some((left, right));
+            }
+        }
+        let pane = self.tabs[self.active].read(cx);
+        let dirs: Vec<PathBuf> = pane
+            .selected_paths()
+            .into_iter()
+            .filter(|path| path.is_dir())
+            .collect();
+        match dirs.len() {
+            2 => Some((dirs[0].clone(), dirs[1].clone())),
+            1 => Some((pane.path().to_path_buf(), dirs[0].clone())),
+            _ => None,
+        }
+    }
+
+    /// 打开比较面板，或者在开着的时候收起它。
+    fn toggle_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.compare.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let Some((left, right)) = self.compare_targets(cx) else {
+            return;
+        };
+        let ops = self.ops.clone();
+        let panel = cx.new(|cx| {
+            ComparePanel::new(ops, CompareOptions::new(left, right), window, cx)
+        });
+        self.subscriptions.push(cx.subscribe_in(
+            &panel,
+            window,
+            |this, _, event: &CompareEvent, window, cx| match event {
+                CompareEvent::Close => {
+                    this.compare = None;
+                    cx.notify();
+                }
+                CompareEvent::Reveal(path) => this.reveal_in_active(path.clone(), window, cx),
+            },
+        ));
+        // 面板这一帧才挂上窗口，焦点等挂好再给。
+        let focus = panel.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.compare = Some(panel);
+        cx.notify();
+    }
+
+    /// 跳到某个文件并收起比较面板：由面板的 Enter 触发。
+    fn reveal_in_active(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.compare = None;
+        self.tabs[self.active]
+            .update(cx, |pane, cx| pane.reveal_path(path, window, cx));
+        cx.notify();
+    }
+
     /// 同步浏览：焦点那一栏换了目录，另一栏跟着走。
     ///
     /// 只从焦点栏往外传，另一栏的变化不会再传回来，所以不会两边互相推。
@@ -990,6 +1071,7 @@ impl WFilesApp {
                 AppCommand::ToggleSync => self.toggle_sync(window, cx),
                 AppCommand::CopyToOther => self.transfer_to_other(false, cx),
                 AppCommand::MoveToOther => self.transfer_to_other(true, cx),
+                AppCommand::Compare => self.toggle_compare(window, cx),
             },
         }
     }
@@ -1088,6 +1170,20 @@ impl WFilesApp {
                     "tab 切换 窗口",
                 ),
                 action: PaletteAction::SwitchTab(index),
+            });
+        }
+
+        // 比较：比不出两个目录就不列，免得面板里躺着一条按了没反应的。
+        if self.compare_targets(cx).is_some() {
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    "app:compare",
+                    "比较这两个文件夹",
+                    "Cmd+Alt+B",
+                    "文件",
+                    "compare diff 比较 差异 同步 sync 两栏",
+                ),
+                action: PaletteAction::App(AppCommand::Compare),
             });
         }
 
@@ -2279,7 +2375,16 @@ impl Render for WFilesApp {
             }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 this.toggle_terminal(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Compare, window, cx| {
+                this.toggle_compare(window, cx)
             }));
+
+        // 比较面板自带遮罩，压在窗格上；确认框与冲突框还要在它之上，
+        // 所以放在 has_overlay 那一段之前挂。
+        if let Some(panel) = self.compare.clone() {
+            root = root.child(panel.into_any_element());
+        }
 
         if has_overlay {
             // 一次只显示一层：命令面板 > 冲突 > 批量 > 输入 > 确认。

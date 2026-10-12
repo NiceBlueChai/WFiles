@@ -2737,3 +2737,116 @@ fn escape_closes_the_analyze_panel(cx: &mut TestAppContext) {
         assert!(window.try_find("analyze").is_none(), "Esc 该关掉面板");
     });
 }
+
+// ---- 目录比较与同步 ----
+
+/// 造一对待比较的目录，放在 `root` 下面（单栏时选中这两个就能比）。
+fn compare_pair(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let left = root.join("l");
+    let right = root.join("r");
+    std::fs::create_dir_all(&left).unwrap();
+    std::fs::create_dir_all(&right).unwrap();
+    std::fs::write(left.join("same.txt"), "一样的内容").unwrap();
+    std::fs::write(right.join("same.txt"), "一样的内容").unwrap();
+    std::fs::write(left.join("only-left.txt"), "只有左").unwrap();
+    (left, right)
+}
+
+fn wait_for_compare_row(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    index: usize,
+) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        cx.run_until_parked();
+        let found = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                window
+                    .try_find(("compare-row", index))
+                    .map(|row| row.label().unwrap_or_default().to_string())
+            })
+            .expect("窗口还在");
+        if found.is_some() || Instant::now() > deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[gpui_kit::test]
+fn comparing_two_folders_lists_what_differs(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    compare_pair(root.path());
+    let (_session, handle) = open_in(cx, root.path());
+
+    // 选中 l 与 r 两个目录：单栏时"比较"比的就是它们。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-b", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("compare").is_some(), "该打开比较面板");
+    });
+
+    let label = wait_for_compare_row(cx, handle, 0).expect("该列出差异");
+    assert!(label.contains("only-left.txt"), "该列出左边独有的：{label}");
+    assert!(label.contains("只有左"), "该写明只有哪一边有：{label}");
+}
+
+#[gpui_kit::test]
+fn syncing_copies_the_difference_into_the_other_folder(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let (_left, right) = compare_pair(root.path());
+    let (_session, handle) = open_in(cx, root.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-b", cx);
+    });
+    let label = wait_for_compare_row(cx, handle, 0);
+    assert!(label.is_some(), "先得比出差异");
+
+    // 第一个同步按钮是"→ 拷到右"。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("compare-sync", 0usize), cx);
+    });
+
+    assert!(
+        wait_for_file(cx, &right.join("only-left.txt")),
+        "该把左边独有的拷到右边"
+    );
+}
+
+#[gpui_kit::test]
+fn escape_closes_the_compare_panel(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    compare_pair(root.path());
+    let (_session, handle) = open_in(cx, root.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-b", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("compare").is_some(), "该打开面板");
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("compare").is_none(), "Esc 该关掉面板");
+    });
+}

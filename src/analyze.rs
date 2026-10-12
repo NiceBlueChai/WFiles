@@ -392,6 +392,11 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// 文件的 SHA-256（整个文件，流式读）。读不出来返回 `None`。
+pub fn sha256(path: &Path) -> Option<String> {
+    digest_prefix(path, 0)
+}
+
 /// 文件的 SHA-256；`limit` 大于 0 时只算开头那么多字节（`0` = 整个文件）。
 ///
 /// 读不出来返回 `None`：查重复时"算不出来"必须和"算出来不一样"区分开，

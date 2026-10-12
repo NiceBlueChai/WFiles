@@ -4,6 +4,8 @@ mod app;
 mod archive;
 mod bulk_rename;
 mod clipboard;
+mod compare;
+mod compare_entity;
 mod drag;
 mod format;
 mod keymap;
