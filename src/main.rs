@@ -6,6 +6,8 @@ mod bulk_rename;
 mod clipboard;
 mod compare;
 mod compare_entity;
+mod diff;
+mod diff_entity;
 mod drag;
 mod format;
 mod keymap;

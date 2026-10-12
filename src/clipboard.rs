@@ -28,7 +28,9 @@ pub fn clipboard_text(paths: &[PathBuf], mode: ClipboardText) -> String {
 }
 
 /// 取文件名；根目录这类没有文件名的路径退回完整路径，不留空白行。
-fn name_of(path: &Path) -> String {
+///
+/// 不只剪贴板用，比较/分析面板的标题也要显示"某个文件"而不是一长串路径。
+pub fn name_of(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())

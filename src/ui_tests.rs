@@ -72,6 +72,16 @@ fn step(
         .expect("窗口还在");
 }
 
+/// 与 [`step`] 一样推一帧，但把回调的结果带回来（断言里要读界面上的字时用）。
+fn step_value<T>(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    f: impl FnOnce(&mut gpui_kit::Window, &mut gpui_kit::App) -> T,
+) -> T {
+    cx.update_window(handle.into(), |_, window, cx| f(window, cx))
+        .expect("窗口还在")
+}
+
 /// 会话与设置隔到临时目录，免得测试动到用户真实的标签恢复状态。
 ///
 /// `WFILES_SESSION_DIR` 是**进程级**的环境变量，而 `cargo test` 默认多线程跑：
@@ -2848,5 +2858,120 @@ fn escape_closes_the_compare_panel(cx: &mut TestAppContext) {
     step(cx, handle, |window, cx| {
         settle(window, cx);
         assert!(window.try_find("compare").is_none(), "Esc 该关掉面板");
+    });
+}
+
+// ---- 文件内容比较：按行 / 细到字符 / 十六进制 ----
+
+/// 面板在两个文件读完之后才出结果，那个读取在真线程上：
+/// 给它一点真实时间，每一轮都画帧——不画帧事件就不会被消费。
+fn wait_for_diff_row(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    index: usize,
+) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        cx.run_until_parked();
+        let found = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                window
+                    .try_find(("diff-row", index))
+                    .map(|row| row.label().unwrap_or_default().to_string())
+            })
+            .expect("窗口还在");
+        if found.is_some() || Instant::now() > deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[gpui_kit::test]
+fn comparing_two_files_shows_which_line_changed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "第一行\n第二行\n第三行\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "第一行\n改过的第二行\n第三行\n").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    // 单栏选中两个文件，"比较文件内容"比的就是它们。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-shift-b", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("diff").is_some(), "该打开内容比较面板");
+    });
+
+    // 三行都在（上下文留着才好对照），中间那行标"改"。
+    let changed = wait_for_diff_row(cx, handle, 1).expect("该比出差异行");
+    assert!(changed.starts_with("改"), "中间那行该标成改过：{changed}");
+    assert!(changed.contains("改过的第二行"), "该显示右边的新内容：{changed}");
+
+    let status = step_value(cx, handle, |window, _| {
+        window
+            .try_find("diff-status")
+            .and_then(|node| node.label().map(|label| label.to_string()))
+    });
+    let status = status.expect("该有状态行");
+    assert!(status.contains("改了 1 行"), "该报改了一行：{status}");
+}
+
+#[gpui_kit::test]
+fn the_diff_panel_switches_to_bytes_for_binary_files(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    // 开头带 0 字节 → 判成二进制，只能按字节看。
+    std::fs::write(dir.path().join("a.bin"), [0u8, 1, 2, 3, 4]).unwrap();
+    std::fs::write(dir.path().join("b.bin"), [0u8, 1, 2, 9, 4]).unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-shift-b", cx);
+    });
+
+    let _ = wait_for_diff_row(cx, handle, 0).expect("该列出字节行");
+    let status = step_value(cx, handle, |window, _| {
+        window
+            .try_find("diff-status")
+            .and_then(|node| node.label().map(|label| label.to_string()))
+    });
+    let status = status.expect("该有状态行");
+    assert!(
+        status.contains("个字节不一样") && status.contains("偏移 3"),
+        "二进制该按字节报差异：{status}"
+    );
+}
+
+#[gpui_kit::test]
+fn escape_closes_the_diff_panel(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "一样\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "一样\n").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-shift-b", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("diff").is_some(), "该打开面板");
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("diff").is_none(), "Esc 该关掉面板");
     });
 }

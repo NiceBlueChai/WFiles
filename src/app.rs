@@ -17,8 +17,10 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::bulk_rename::BulkRename;
+use crate::clipboard::name_of;
 use crate::compare::Options as CompareOptions;
 use crate::compare_entity::{CompareEvent, ComparePanel};
+use crate::diff_entity::{DiffEvent, DiffPanel};
 use crate::drag::{self, DraggedPaths};
 use crate::format;
 use crate::ops::{ConflictPolicy, ControlState};
@@ -45,6 +47,7 @@ gpui_kit::actions!(
         MoveToOther,
         ToggleTerminal,
         Compare,
+        Diff,
     ]
 );
 
@@ -75,6 +78,8 @@ enum AppCommand {
     MoveToOther,
     /// 比较两栏（或选中的两个目录）差在哪，并可选同步。
     Compare,
+    /// 并排看两个文件的内容差在哪。
+    Diff,
 }
 
 /// 面板能触发的动作。窗格内的操作转交给当前窗格，
@@ -129,6 +134,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(TOGGLE_KEY, ToggleTerminal, None),
         // 比较：双栏时比两栏，单栏时比选中的两个目录。
         KeyBinding::new("cmd-alt-b", Compare, None),
+        // 文件内容比较：同上，只是对象换成两个文件。带 Shift 是顺着
+        // "同一个比较动作、更细一层"的意思，和上面的目录比较挨着记。
+        KeyBinding::new("cmd-alt-shift-b", Diff, None),
     ]);
 }
 
@@ -165,6 +173,8 @@ pub struct WFilesApp {
     term: Option<Entity<Terminal>>,
     /// 比较面板。`None` = 收起来；收起来时实体一起丢掉，后台那一趟随之停下。
     compare: Option<Entity<ComparePanel>>,
+    /// 文件内容比较面板。
+    diff: Option<Entity<DiffPanel>>,
 }
 
 impl WFilesApp {
@@ -210,6 +220,7 @@ impl WFilesApp {
             subscriptions: Vec::new(),
             term: None,
             compare: None,
+            diff: None,
         };
 
         app.subscriptions.push(cx.subscribe_in(
@@ -682,6 +693,65 @@ impl WFilesApp {
         }
     }
 
+    /// 并排比哪两个文件。
+    ///
+    /// 双栏时取左右两栏各一个（选中优先，没有选中就用光标下那个）；
+    /// 单栏时取选中的前两个文件。挑不出来就不列这条命令。
+    fn diff_targets(&self, cx: &App) -> Option<(PathBuf, PathBuf)> {
+        if let Some(partner) = self.split {
+            let (left_index, right_index) = if self.focus_on_left {
+                (self.active, partner)
+            } else {
+                (partner, self.active)
+            };
+            let left = self.file_in_tab(left_index, cx);
+            let right = self.file_in_tab(right_index, cx);
+            match (left, right) {
+                (Some(left), Some(right)) if left != right => return Some((left, right)),
+                _ => {}
+            }
+        }
+        let files: Vec<PathBuf> = self.tabs[self.active]
+            .read(cx)
+            .selected_paths()
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect();
+        if files.len() >= 2 {
+            return Some((files[0].clone(), files[1].clone()));
+        }
+        None
+    }
+
+    /// 这一栏里"当前那一个文件"：选中优先，没有选中就用光标下的。
+    fn file_in_tab(&self, index: usize, cx: &App) -> Option<PathBuf> {
+        let pane = self.tabs[index].read(cx);
+        pane.selected_paths().into_iter().find(|path| path.is_file())
+    }
+
+    /// 打开文件内容比较面板；已经开着就换掉（对象可能变了）。
+    fn open_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((left, right)) = self.diff_targets(cx) else {
+            return;
+        };
+        let panel = cx.new(|cx| DiffPanel::new(left, right, cx));
+        self.subscriptions.push(cx.subscribe_in(
+            &panel,
+            window,
+            |this, _, event: &DiffEvent, window, cx| match event {
+                DiffEvent::Close => {
+                    this.diff = None;
+                    cx.notify();
+                }
+                DiffEvent::Reveal(path) => this.reveal_in_active(path.clone(), window, cx),
+            },
+        ));
+        let focus = panel.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.diff = Some(panel);
+        cx.notify();
+    }
+
     /// 打开比较面板，或者在开着的时候收起它。
     fn toggle_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.compare.take().is_some() {
@@ -1072,6 +1142,7 @@ impl WFilesApp {
                 AppCommand::CopyToOther => self.transfer_to_other(false, cx),
                 AppCommand::MoveToOther => self.transfer_to_other(true, cx),
                 AppCommand::Compare => self.toggle_compare(window, cx),
+                AppCommand::Diff => self.open_diff(window, cx),
             },
         }
     }
@@ -1184,6 +1255,24 @@ impl WFilesApp {
                     "compare diff 比较 差异 同步 sync 两栏",
                 ),
                 action: PaletteAction::App(AppCommand::Compare),
+            });
+        }
+
+        if self.diff_targets(cx).is_some() {
+            let (left, right) = self.diff_targets(cx).expect("刚查过");
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    "app:diff",
+                    format!(
+                        "比较文件内容：{} ↔ {}",
+                        name_of(&left),
+                        name_of(&right)
+                    ),
+                    "",
+                    "文件",
+                    "diff 比较 内容 差异 行 十六进制 hex 字节",
+                ),
+                action: PaletteAction::App(AppCommand::Diff),
             });
         }
 
@@ -2378,11 +2467,17 @@ impl Render for WFilesApp {
             }))
             .on_action(cx.listener(|this, _: &Compare, window, cx| {
                 this.toggle_compare(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Diff, window, cx| {
+                this.open_diff(window, cx)
             }));
 
         // 比较面板自带遮罩，压在窗格上；确认框与冲突框还要在它之上，
         // 所以放在 has_overlay 那一段之前挂。
         if let Some(panel) = self.compare.clone() {
+            root = root.child(panel.into_any_element());
+        }
+        if let Some(panel) = self.diff.clone() {
             root = root.child(panel.into_any_element());
         }
 
