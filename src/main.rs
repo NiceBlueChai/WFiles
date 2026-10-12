@@ -1,4 +1,5 @@
 mod app;
+mod archive;
 mod bulk_rename;
 mod clipboard;
 mod drag;

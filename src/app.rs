@@ -956,6 +956,8 @@ impl WFilesApp {
             PaneCommand::CopyFileName,
             PaneCommand::OpenTerminal,
             PaneCommand::QuickLook,
+            PaneCommand::ViewArchive,
+            PaneCommand::CreateArchive,
             PaneCommand::ViewList,
             PaneCommand::ViewGrid,
             PaneCommand::ViewColumns,
@@ -1160,6 +1162,9 @@ impl WFilesApp {
             PaneCommand::GoUp => pane.has_parent(),
             // 没有选中任何东西时可没什么可"快速查看"的。
             PaneCommand::QuickLook => pane.quick_look_enabled(),
+            // 光标得正指着一个 zip 才谈得上"看里面"；打包则要求有选中项。
+            PaneCommand::ViewArchive => pane.archive_enabled(),
+            PaneCommand::CreateArchive => selected >= 1,
             _ => true,
         }
     }
@@ -1191,6 +1196,12 @@ impl WFilesApp {
             ),
             PaneCommand::QuickLook => {
                 ("快速查看", "空格", "文件", "preview 预览 quick look 查看")
+            }
+            PaneCommand::ViewArchive => {
+                ("查看压缩包内容", "", "文件", "zip 压缩包 archive 解压 unzip 浏览")
+            }
+            PaneCommand::CreateArchive => {
+                ("打包成 Zip", "", "文件", "zip 压缩包 archive 压缩 打包 compress")
             }
             // 换视图不作用于文件，归到"视图"组里更好找。
             PaneCommand::ViewList => ("列表视图", "Cmd+1", "视图", "view list 列表 一行一项"),

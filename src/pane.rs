@@ -25,6 +25,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{AsyncApp, Size, Task, WeakEntity, *};
 
+use crate::archive;
 use crate::clipboard;
 use crate::drag::{self, DraggedPaths};
 use crate::format;
@@ -171,6 +172,10 @@ pub enum PaneCommand {
     CopyFileName,
     OpenTerminal,
     QuickLook,
+    /// 看看这个压缩包里有什么。
+    ViewArchive,
+    /// 把选中的东西打成一个 zip。
+    CreateArchive,
     /// 换成列表视图。
     ViewList,
     /// 换成网格视图。
@@ -220,6 +225,20 @@ impl Render for DragPreview {
             .text_color(cx.theme().foreground)
             .child(self.label.clone())
     }
+}
+
+/// 压缩包面板：在看哪个包、里面有什么、读没读出来。
+///
+/// 之所以不把压缩包当目录进：包里的条目没法复制、重命名、删，
+/// 那些操作全得先解出来才有意义。老老实实给一个"看得见 + 解得出来"
+/// 的面板，比给一堆点了会报错的按钮诚实。
+#[derive(Clone)]
+struct ArchiveState {
+    path: PathBuf,
+    name: String,
+    entries: Vec<archive::Entry>,
+    /// 读不出来时把原因摆在面板里，而不是弹一个对话框打断操作。
+    error: Option<String>,
 }
 
 /// 一次"弹簧文件夹"预约：鼠标停在哪个文件夹上、这一票是第几号。
@@ -310,6 +329,11 @@ pub struct Pane {
     watch_task: Option<Task<()>>,
     /// Quick Look 浮层；`None` 就是没开。
     quick_look: Option<QuickLookState>,
+    /// 压缩包面板；`None` 就是没开。
+    archive_view: Option<ArchiveState>,
+    /// 正在后台打包/解压时把任务握在手里（丢掉即放弃），
+    /// 顺带让按钮知道自己该灰着。
+    archive_busy: Option<Task<()>>,
     subscriptions: Vec<Subscription>,
 }
 
@@ -352,6 +376,8 @@ impl Pane {
             spring_token: 0,
             watch_task: None,
             quick_look: None,
+            archive_view: None,
+            archive_busy: None,
             subscriptions: Vec::new(),
         };
 
@@ -646,6 +672,9 @@ impl Pane {
         let is_dir = self.listing.entry(&path).is_some_and(|entry| entry.is_dir);
         if is_dir {
             self.navigate_to(path, true, window, cx);
+        } else if archive::is_archive(&path) {
+            // 压缩包不交给系统：自己就能看得见里面，还能解得出来。
+            self.open_archive(path, cx);
         } else if let Err(error) = open::that(&path) {
             self.error = Some(error.to_string());
             self.update_status();
@@ -907,6 +936,157 @@ impl Pane {
         }
     }
 
+    // ---- 压缩包 ----
+
+    /// 光标（或唯一选中项）指着的是不是一个压缩包。
+    fn archive_target(&self) -> Option<PathBuf> {
+        let path = self.selection.cursor().or_else(|| self.selection.single())?;
+        archive::is_archive(path).then(|| path.to_path_buf())
+    }
+
+    /// 打开或关掉压缩包面板；已经在看同一个就关掉。
+    fn toggle_archive(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.archive_target() else {
+            self.close_archive(cx);
+            return;
+        };
+        if self.archive_view.as_ref().is_some_and(|it| it.path == path) {
+            self.close_archive(cx);
+            return;
+        }
+        self.open_archive(path, cx);
+    }
+
+    /// 读一个压缩包的内容并把它摆在面板里。
+    ///
+    /// 读不出来也要开面板：把原因写进去，
+    /// 比"按了没反应"或者"弹个框"都好交代。
+    fn open_archive(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let (entries, error) = match archive::entries(&path) {
+            Ok(entries) => (entries, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        self.archive_view = Some(ArchiveState {
+            path,
+            name,
+            entries,
+            error,
+        });
+        cx.notify();
+    }
+
+    fn close_archive(&mut self, cx: &mut Context<Self>) {
+        if self.archive_view.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 命令面板与 Esc 用：面板开着没有、这一项能不能看。
+    pub fn archive_open(&self) -> bool {
+        self.archive_view.is_some()
+    }
+
+    pub fn archive_enabled(&self) -> bool {
+        self.archive_target().is_some()
+    }
+
+    /// 把面板里这个包解到当前目录下、以包命名的新文件夹里。
+    ///
+    /// 不直接摊在当前目录：一个装了两百个文件的包倒出来会把目录淹了。
+    fn extract_here(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.archive_view.as_ref() else {
+            return;
+        };
+        let zip = state.path.clone();
+        // `报告.zip` → 解到 `报告/`；撞车就 `报告 2/`。
+        let stem = zip
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| state.name.clone());
+        let dest = archive::unused_dir(self.listing.path(), &stem);
+        self.status = format!("正在解压 {}…", state.name);
+
+        let (tx, rx) = async_channel::bounded(1);
+        let wanted = Vec::new();
+        // 解压是纯 IO + CPU 活，扔到普通线程；界面全程不碰它。
+        std::thread::spawn(move || {
+            let result = archive::extract(&zip, &dest, &wanted).map(|files| (dest, files));
+            tx.try_send(result).ok();
+        });
+        self.run_archive_job(rx, cx);
+    }
+
+    /// 把选中的东西打成一个 zip，落在当前目录。
+    fn create_archive(&mut self, cx: &mut Context<Self>) {
+        let sources = self.selected_paths();
+        if sources.is_empty() || self.archive_busy.is_some() {
+            return;
+        }
+        let base = self.listing.path().to_path_buf();
+        // 只选中一个就用它的名字；多个就用当前目录的名字。
+        let stem = if sources.len() == 1 {
+            sources[0]
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "归档".to_string())
+        } else {
+            base.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "归档".to_string())
+        };
+        let zip = archive::unused_name(&base, &stem, "zip");
+        self.status = format!("正在打包 {}…", zip.display());
+
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = archive::create(&zip, &base, &sources).map(|files| (zip, files));
+            tx.try_send(result).ok();
+        });
+        self.run_archive_job(rx, cx);
+    }
+
+    /// 等一个后台的打包/解压活干完。
+    ///
+    /// 干活的线程只负责干，结论通过通道送回来再改界面状态。
+    fn run_archive_job(
+        &mut self,
+        rx: async_channel::Receiver<Result<(PathBuf, usize), String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn(async move |this: WeakEntity<Pane>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            if let Ok(result) = rx.recv().await {
+                this.update(&mut cx, |pane, cx| pane.finish_archive_job(result, cx))
+                    .ok();
+            }
+        });
+        self.archive_busy = Some(task);
+        cx.notify();
+    }
+
+    fn finish_archive_job(
+        &mut self,
+        result: Result<(PathBuf, usize), String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.archive_busy = None;
+        match result {
+            Ok((target, files)) => {
+                self.status = format!("{}：{} 个文件", target.display(), files);
+                self.refresh(cx);
+            }
+            Err(error) => {
+                self.error = Some(error);
+                self.update_status();
+            }
+        }
+        cx.notify();
+    }
+
     /// Quick Look 开着没有。Esc 要先关它，再谈取消选中。
     pub fn quick_look_open(&self) -> bool {
         self.quick_look.is_some()
@@ -939,6 +1119,8 @@ impl Pane {
             PaneCommand::CopyFileName => self.copy_file_names(cx),
             PaneCommand::OpenTerminal => self.open_terminal(cx),
             PaneCommand::QuickLook => self.toggle_quick_look(cx),
+            PaneCommand::ViewArchive => self.toggle_archive(cx),
+            PaneCommand::CreateArchive => self.create_archive(cx),
             PaneCommand::ViewList => self.set_view(ViewMode::List, cx),
             PaneCommand::ViewGrid => self.set_view(ViewMode::Grid, cx),
             PaneCommand::ViewColumns => self.set_view(ViewMode::Columns, cx),
@@ -1185,6 +1367,23 @@ impl Pane {
                 .tooltip("快速查看（空格）")
                 .disabled(self.quick_look_target().is_none())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_quick_look(cx))),
+            Button::new("op-archive")
+                .icon(IconName::FileArchive)
+                .ghost()
+                .small()
+                .tooltip(if self.archive_target().is_some() {
+                    "查看压缩包内容"
+                } else {
+                    "打包成 Zip"
+                })
+                .disabled(selected == 0)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.archive_target().is_some() {
+                        this.toggle_archive(cx);
+                    } else {
+                        this.create_archive(cx);
+                    }
+                })),
         ]
     }
 
@@ -2199,8 +2398,11 @@ impl Pane {
             }))
             // Esc 有优先顺序：先看有没有浮层要关，没有才轮到清空选中。
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                // Esc 有优先顺序：先看有没有浮层要关，没有才轮到清空选中。
                 if this.quick_look_open() {
                     this.close_quick_look(cx);
+                } else if this.archive_open() {
+                    this.close_archive(cx);
                 } else {
                     this.clear_selection(cx);
                 }
@@ -2397,6 +2599,181 @@ impl Pane {
     ///
     /// **没做"点背景关掉"**：GPUI 的点击会冒泡到父元素，卡片里选中一段文字
     /// 也会被当成点了背景，一选就关太难受。关闭走 Esc、再按一次空格，
+    /// 压缩包面板：列出包里的条目，配一个"解压到这儿"。
+    fn render_archive(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(state) = self.archive_view.clone() else {
+            return div().into_any_element();
+        };
+        let muted = cx.theme().muted_foreground;
+        let radius = cx.theme().radius;
+        let busy = self.archive_busy.is_some();
+
+        let files = state.entries.iter().filter(|entry| !entry.is_dir).count();
+        let total: u64 = state.entries.iter().map(|entry| entry.size).sum();
+        let subtitle = format!("{} 个文件 · 共 {}", files, format::file_size(total));
+
+        let body = match &state.error {
+            Some(error) => div()
+                .id("archive-error")
+                .test_support()
+                .aria_label(error.clone())
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(muted)
+                .child(error.clone())
+                .into_any_element(),
+            None if state.entries.is_empty() => div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(muted)
+                .child("这个包是空的")
+                .into_any_element(),
+            None => div()
+                .id("archive-entries")
+                .test_support()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_sm()
+                .child(v_flex().children(
+                    state
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| self.render_archive_entry(index, entry, cx)),
+                ))
+                .into_any_element(),
+        };
+
+        let stem = state
+            .path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| state.name.clone());
+
+        div()
+            .id("archive")
+            .test_support()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(cx.theme().overlay)
+            .child(
+                v_flex()
+                    .id("archive-card")
+                    .w(px(560.))
+                    .max_h(px(560.))
+                    .gap_3()
+                    .p_5()
+                    .rounded(radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .min_w_0()
+                            .child(div().font_semibold().truncate().child(state.name.clone()))
+                            .child(
+                                div()
+                                    .id("archive-subtitle")
+                                    .test_support()
+                                    .aria_label(subtitle.clone())
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(subtitle),
+                            ),
+                    )
+                    .child(body)
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("archive-extract")
+                                    .label(format!("解压到「{stem}」"))
+                                    .small()
+                                    .disabled(state.error.is_some() || busy)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.extract_here(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("archive-close")
+                                    .label("关闭（Esc）")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_archive(cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 面板里的一行：包名里的路径 + 大小。
+    fn render_archive_entry(
+        &self,
+        index: usize,
+        entry: &archive::Entry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = if entry.is_dir {
+            format!("{}/", entry.name.trim_end_matches('/'))
+        } else {
+            entry.name.clone()
+        };
+        div()
+            .id(("archive-entry", index))
+            .test_support()
+            .aria_label(label.clone())
+            .h(px(ROW_HEIGHT))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(cx.theme().radius)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(if entry.is_dir {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(Icon::new(if entry.is_dir {
+                        IconName::Folder
+                    } else {
+                        IconName::File
+                    })
+                    .size_4()),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if entry.is_dir {
+                        String::new()
+                    } else {
+                        format::file_size(entry.size)
+                    }),
+            )
+            .into_any_element()
+    }
+
     /// 或者卡片底部的按钮。
     fn render_quick_look(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(look) = self.quick_look.clone() else {
@@ -2674,6 +3051,9 @@ impl Render for Pane {
 
         if self.quick_look.is_some() {
             root = root.child(self.render_quick_look(cx));
+        }
+        if self.archive_view.is_some() {
+            root = root.child(self.render_archive(cx));
         }
         root
     }

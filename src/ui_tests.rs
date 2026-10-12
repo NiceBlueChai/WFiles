@@ -1786,3 +1786,121 @@ fn dragging_a_file_onto_a_folder_moves_it(cx: &mut TestAppContext) {
         "自己拖自己是移动，原处不该还留一份"
     );
 }
+
+/// 造一个装了两个文本文件的 `bundle.zip`，放在 `dir` 里。
+fn make_bundle(dir: &Path) -> std::path::PathBuf {
+    for name in ["a.txt", "b.txt"] {
+        std::fs::write(dir.join(name), "hello").unwrap();
+    }
+    let zip = dir.join("bundle.zip");
+    crate::archive::create(
+        &zip,
+        dir,
+        &[dir.join("a.txt"), dir.join("b.txt")],
+    )
+    .expect("造测试用的压缩包");
+    zip
+}
+
+/// 面板里列出的条目名。
+fn archive_entry_names(window: &mut gpui_kit::Window) -> Vec<String> {
+    (0usize..64)
+        .map(|index| window.try_find(("archive-entry", index)))
+        .take_while(Option::is_some)
+        .map(|entry| entry.unwrap().label().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[gpui_kit::test]
+fn opening_a_zip_shows_what_is_inside(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    make_bundle(dir.path());
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let zip = row_position(window, "bundle.zip");
+        window.click(("row-name", zip), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("archive").is_some(),
+            "回车该打开压缩包面板，而不是交给系统"
+        );
+        assert_eq!(archive_entry_names(window), ["a.txt", "b.txt"]);
+    });
+
+    // Esc 关掉它（浮层优先于清空选中）。
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("archive").is_none(), "Esc 该关掉面板");
+    });
+}
+
+#[gpui_kit::test]
+fn extracting_a_zip_puts_the_files_in_a_folder_of_its_own(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    make_bundle(dir.path());
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let zip = row_position(window, "bundle.zip");
+        window.click(("row-name", zip), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("archive-extract", cx);
+    });
+
+    // 解到"以包命名"的子目录里：直接摊在当前目录会把目录淹了。
+    assert!(
+        wait_for_file(cx, &dir.path().join("bundle").join("a.txt")),
+        "该解到 bundle/ 里，而不是摊在当前目录"
+    );
+    assert!(dir.path().join("bundle.zip").exists(), "源压缩包不动");
+}
+
+#[gpui_kit::test]
+fn packing_the_selection_makes_a_zip_next_to_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "1").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "2").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.click("op-archive", cx);
+    });
+
+    let stem = dir
+        .path()
+        .file_name()
+        .expect("临时目录有名字")
+        .to_string_lossy()
+        .into_owned();
+    let zip = dir.path().join(format!("{stem}.zip"));
+    assert!(wait_for_file(cx, &zip), "该在当前目录生成一个 zip");
+
+    let listed = crate::archive::entries(&zip).expect("打出来的包读得出来");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.txt", "b.txt"]
+    );
+}

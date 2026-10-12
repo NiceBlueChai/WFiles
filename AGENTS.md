@@ -28,6 +28,7 @@ cargo fmt --check
 | `src/app.rs` | `WFilesApp` 应用外壳与全局状态 |
 | `src/pane.rs` | 面板系统（导航/列表与网格 UI、视图模式、行级拖放） |
 | `src/drag.rs` | 拖放的纯判定逻辑（拖什么、能不能落、移动还是拷贝、悬停多久展开） |
+| `src/archive.rs` | zip 的纯读写逻辑（列条目、解压、打包、防 Zip-Slip、撞车改名） |
 | `src/model.rs` | 数据模型（目录/条目/会话） |
 | `src/ops.rs` | 文件操作（复制/移动/删除/重命名）、字节计数与任务控制手柄 `Control` |
 | `src/ops_entity.rs` | 文件操作的 UI 枢纽：任务队列、进度与速度、冲突、撤销栈 |
