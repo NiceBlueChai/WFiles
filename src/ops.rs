@@ -921,7 +921,7 @@ mod tests {
         fs::create_dir_all(src.join("inner")).unwrap();
 
         let outcome = move_entries(
-            &[src.clone()],
+            std::slice::from_ref(&src),
             &src.join("inner"),
             ConflictPolicy::KeepBoth,
             &mut |_| true,
@@ -970,7 +970,7 @@ mod tests {
         fs::write(src.join("nested/b.txt"), "x").unwrap();
         fs::write(src.join("nested/deep/c.txt"), "x").unwrap();
 
-        assert_eq!(count_entries(&[src.clone()]), 6);
+        assert_eq!(count_entries(std::slice::from_ref(&src)), 6);
         assert_eq!(count_entries(&[src.join("a.txt"), src]), 7);
     }
 

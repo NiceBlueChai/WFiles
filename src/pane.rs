@@ -26,6 +26,8 @@ use crate::clipboard;
 use crate::format;
 use crate::model::{Listing, Selection, Sort, SortKey};
 use crate::ops_entity::{Ops, OpsEvent};
+use crate::settings::Settings;
+use crate::terminal;
 use crate::watch;
 
 const ROW_HEIGHT: f32 = 40.;
@@ -70,6 +72,7 @@ gpui_kit::actions!(
         CopyFileName,
         Paste,
         Undo,
+        OpenTerminal,
     ]
 );
 
@@ -103,6 +106,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-c", CopyFileName, context),
         KeyBinding::new("cmd-v", Paste, context),
         KeyBinding::new("cmd-z", Undo, context),
+        KeyBinding::new("cmd-alt-t", OpenTerminal, context),
     ]);
 }
 
@@ -130,6 +134,7 @@ pub enum PaneCommand {
     GoUp,
     CopyPath,
     CopyFileName,
+    OpenTerminal,
 }
 
 pub struct Pane {
@@ -538,6 +543,36 @@ impl Pane {
         self.ops.update(cx, |ops, cx| ops.request_undo(cx));
     }
 
+    /// 终端该开在哪个目录：只选中一个目录时就开在那儿，否则开在当前目录。
+    ///
+    /// “我正看着这个文件夹，想在这底下敲命令”是最常见的意图，
+    /// 而选中一个子目录时显然是想去那里面。
+    fn terminal_target(&self) -> PathBuf {
+        if self.selection.len() == 1
+            && let Some(path) = self.selected_paths().into_iter().next()
+            && path.is_dir()
+        {
+            return path;
+        }
+        self.listing.path().to_path_buf()
+    }
+
+    /// 在目标目录开一个终端窗口。失败时把原因写进状态栏，
+    /// 不弹对话框——这类失败用户重试一次就知道，挡住界面不值得。
+    fn open_terminal(&mut self, cx: &mut Context<Self>) {
+        let dir = self.terminal_target();
+        let settings = Settings::read(cx);
+        match terminal::open(&settings.terminal, &dir) {
+            Ok(name) => {
+                self.status = format!("已在{name}中打开 {}", dir.display());
+            }
+            Err(error) => {
+                self.status = error;
+            }
+        }
+        cx.notify();
+    }
+
     /// 执行一条命令。窗口参数是因为部分命令要弹对话框/移动焦点。
     pub fn run_command(
         &mut self,
@@ -558,6 +593,7 @@ impl Pane {
             PaneCommand::GoUp => self.go_up(window, cx),
             PaneCommand::CopyPath => self.copy_paths(cx),
             PaneCommand::CopyFileName => self.copy_file_names(cx),
+            PaneCommand::OpenTerminal => self.open_terminal(cx),
         }
     }
 
@@ -754,6 +790,13 @@ impl Pane {
                 .tooltip("粘贴（Cmd+V）")
                 .disabled(!can_paste)
                 .on_click(cx.listener(|this, _, _, cx| this.request_paste(cx))),
+            Button::new("op-terminal")
+                .icon(IconName::Terminal)
+                .ghost()
+                .small()
+                .tooltip("在这里打开终端（Cmd+Alt+T）")
+                // 换终端在命令面板里做：工具栏保持“按下去就打开”的单一职责。
+                .on_click(cx.listener(|this, _, _, cx| this.open_terminal(cx))),
         ]
     }
 
@@ -1123,6 +1166,9 @@ impl Pane {
             }))
             .on_action(cx.listener(|this, _: &Undo, window, cx| {
                 this.run_command(PaneCommand::Undo, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenTerminal, window, cx| {
+                this.run_command(PaneCommand::OpenTerminal, window, cx)
             }))
             .child(self.render_header(cx))
             .child(self.render_list(cx))

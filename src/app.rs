@@ -22,6 +22,8 @@ use crate::ops_entity::{Ops, OpsEvent, PendingAction};
 use crate::palette::{self, Command as PaletteCommand};
 use crate::pane::{Pane, PaneCommand, PaneEvent};
 use crate::session::Session;
+use crate::settings::Settings;
+use crate::terminal;
 
 gpui_kit::actions!(wfiles, [NewTab, CloseTab, NextTab, TogglePalette]);
 
@@ -49,6 +51,8 @@ enum PaletteAction {
     GoTo(PathBuf),
     SwitchTab(usize),
     Pane(PaneCommand),
+    /// 把某个终端设为默认；只改设置，不打开窗口。
+    SetTerminal(String),
     NewTab,
     CloseTab,
     NextTab,
@@ -94,6 +98,8 @@ pub struct WFilesApp {
 
 impl WFilesApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // 设置要在建窗格之前装好：窗格渲染时要读“默认终端”。
+        Settings::install(cx);
         let ops = cx.new(|_| Ops::new());
 
         // 恢复上次的标签；一个都不剩就开主页。
@@ -592,6 +598,9 @@ impl WFilesApp {
                 self.tabs[self.active]
                     .update(cx, |pane, cx| pane.run_command(command, window, cx));
             }
+            PaletteAction::SetTerminal(id) => {
+                Settings::update(cx, |settings| settings.terminal = id.clone());
+            }
             PaletteAction::NewTab => self.new_tab(window, cx),
             PaletteAction::CloseTab => self.close_tab(self.active, window, cx),
             PaletteAction::NextTab => self.next_tab(cx),
@@ -616,6 +625,7 @@ impl WFilesApp {
             PaneCommand::GoUp,
             PaneCommand::CopyPath,
             PaneCommand::CopyFileName,
+            PaneCommand::OpenTerminal,
         ] {
             if !self.pane_command_enabled(command, cx) {
                 continue;
@@ -697,6 +707,34 @@ impl WFilesApp {
             action: PaletteAction::NextTab,
         });
 
+        // 换默认终端：只列装了的，免得选一个按下去报错的。
+        let current = Settings::read(cx).terminal;
+        items.push(PaletteItem {
+            command: PaletteCommand::new(
+                format!("terminal:{}", terminal::AUTO),
+                "默认终端：跟随系统",
+                if current == terminal::AUTO { "当前" } else { "" },
+                "终端",
+                "terminal 默认 自动 shell",
+            ),
+            action: PaletteAction::SetTerminal(terminal::AUTO.to_string()),
+        });
+        for option in terminal::candidates() {
+            if !terminal::installed(&option) {
+                continue;
+            }
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("terminal:{}", option.id),
+                    format!("默认终端：{}", option.name),
+                    if current == option.id { "当前" } else { "" },
+                    "终端",
+                    "terminal shell 命令行",
+                ),
+                action: PaletteAction::SetTerminal(option.id.to_string()),
+            });
+        }
+
         items
     }
 
@@ -733,6 +771,9 @@ impl WFilesApp {
             PaneCommand::GoUp => ("前往上一级", "Backspace", "up parent 上级"),
             PaneCommand::CopyPath => ("复制路径", "Cmd+Alt+C", "path 剪贴板"),
             PaneCommand::CopyFileName => ("复制文件名", "Cmd+Shift+C", "name 剪贴板"),
+            PaneCommand::OpenTerminal => {
+                ("在这里打开终端", "Cmd+Alt+T", "terminal 终端 shell 命令行")
+            }
         }
     }
 

@@ -7,8 +7,12 @@
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Bounds, Point, TestAppContext, WindowBounds, WindowOptions};
 use gpui_kit::{base::Root, px, size};
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::app::WFilesApp;
+use crate::settings::Settings;
+use crate::terminal;
 
 /// 开一个装着 WFilesApp 的测试窗口。
 fn open_app(cx: &mut TestAppContext) -> gpui_kit::WindowHandle<Root> {
@@ -50,12 +54,31 @@ fn step(
         .expect("窗口还在");
 }
 
-/// 会话文件隔到临时目录，免得测试动到用户真实的标签恢复状态。
-fn isolate_session() -> tempfile::TempDir {
+/// 会话与设置隔到临时目录，免得测试动到用户真实的标签恢复状态。
+///
+/// `WFILES_SESSION_DIR` 是**进程级**的环境变量，而 `cargo test` 默认多线程跑：
+/// 两个测试同时改它，后写的那个会把前一个的目录顶掉，于是断言去读一个
+/// 从没写过的路径。所以这里配一把锁，谁拿着锁谁才独占这个变量，
+/// 拿到 `SessionIsolation` 的那一刻起一直到测试结束都是它的。
+fn isolate_session() -> SessionIsolation {
+    static LOCK: Mutex<()> = Mutex::new(());
+    // 上一个持锁的线程 panic 过就把锁抢回来，别把整轮测试卡死。
+    let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let dir = tempfile::tempdir().expect("临时目录");
-    // 只有一个集成测试读这个变量，进程内不存在竞争。
     unsafe { std::env::set_var("WFILES_SESSION_DIR", dir.path()) };
-    dir
+    SessionIsolation { _guard: guard, dir }
+}
+
+/// 见 [`isolate_session`]：持锁期间独占 `WFILES_SESSION_DIR`。
+struct SessionIsolation {
+    _guard: MutexGuard<'static, ()>,
+    dir: tempfile::TempDir,
+}
+
+impl SessionIsolation {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
 }
 
 /// 画两帧：滚动容器里的内容要第二帧才完成布局并注册进观察表，
@@ -149,6 +172,54 @@ fn command_palette_opens_filters_and_runs(cx: &mut TestAppContext) {
             "Esc 应该关闭命令面板"
         );
     });
+}
+
+#[gpui_kit::test]
+fn command_palette_sets_and_persists_the_default_terminal(cx: &mut TestAppContext) {
+    let session = isolate_session();
+    let handle = open_app(cx);
+
+    // 装了的终端里挑第一个；一个都没装时退到“跟随系统”，照样能验落盘。
+    let expected = terminal::candidates()
+        .into_iter()
+        .find(terminal::installed)
+        .map(|option| option.id.to_string())
+        .unwrap_or_else(|| terminal::AUTO.to_string());
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("终端", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let row = window
+            .try_find(format!("terminal:{expected}"))
+            .expect("面板里应该列出这个终端");
+        let label = row.label().unwrap_or_default();
+        assert!(
+            label.starts_with("默认终端："),
+            "终端条目应该长成“默认终端：X”，实际是 {label}"
+        );
+    });
+
+    // 点一下就改设置：面板关上，并且真的写进了 settings.json。
+    let row_id = format!("terminal:{expected}");
+    step(cx, handle, move |window, cx| {
+        window.click(row_id, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("palette-overlay").is_none(),
+            "改完设置后面板应该关上"
+        );
+    });
+
+    let saved = Settings::load_from(&session.path().join("settings.json"))
+        .expect("设置应该已经落盘");
+    assert_eq!(saved.terminal, expected);
 }
 
 #[gpui_kit::test]

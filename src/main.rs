@@ -8,6 +8,8 @@ mod ops_entity;
 mod palette;
 mod pane;
 mod session;
+mod settings;
+mod terminal;
 mod watch;
 
 #[cfg(test)]
