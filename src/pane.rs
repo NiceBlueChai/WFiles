@@ -25,6 +25,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{AsyncApp, Size, Task, WeakEntity, *};
 
+use crate::analyze_entity::{
+    AnalyzeEvent, AnalyzeMode, AnalyzePanel,
+};
 use crate::archive;
 use crate::clipboard;
 use crate::drag::{self, DraggedPaths};
@@ -109,6 +112,7 @@ gpui_kit::actions!(
         // 压缩包这两条出厂不绑键（命令面板里用），但用户配了就得有对应动作。
         ViewArchive,
         CreateArchive,
+        Analyze,
     ]
 );
 
@@ -175,6 +179,7 @@ fn key_binding_for(
         PaneCommand::ViewColumns => KeyBinding::new(key, ViewColumns, context),
         PaneCommand::ViewArchive => KeyBinding::new(key, ViewArchive, context),
         PaneCommand::CreateArchive => KeyBinding::new(key, CreateArchive, context),
+        PaneCommand::Analyze => KeyBinding::new(key, Analyze, context),
     })
 }
 
@@ -214,6 +219,8 @@ pub enum PaneCommand {
     ViewArchive,
     /// 把选中的东西打成一个 zip。
     CreateArchive,
+    /// 算一算：文件夹多大、哪些文件重复、文件的校验和。
+    Analyze,
     /// 换成列表视图。
     ViewList,
     /// 换成网格视图。
@@ -224,7 +231,7 @@ pub enum PaneCommand {
 
 impl PaneCommand {
     /// 全部命令。配置层与命令面板都靠它枚举，加一条命令只改这一处。
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::NewFolder,
         Self::Rename,
         Self::BulkRename,
@@ -246,6 +253,7 @@ impl PaneCommand {
         Self::ViewList,
         Self::ViewGrid,
         Self::ViewColumns,
+        Self::Analyze,
     ];
 
     /// 配置文件里用的名字。
@@ -275,6 +283,7 @@ impl PaneCommand {
             Self::ViewList => "view_list",
             Self::ViewGrid => "view_grid",
             Self::ViewColumns => "view_columns",
+            Self::Analyze => "analyze",
         }
     }
 
@@ -307,6 +316,7 @@ impl PaneCommand {
             Self::ViewList => "view list 列表 快捷键 按键 keybinding",
             Self::ViewGrid => "view grid 网格 缩略图 快捷键 按键 keybinding",
             Self::ViewColumns => "view miller 分列 层级 快捷键 按键 keybinding",
+            Self::Analyze => "analyze 分析 大小 重复 校验和 md5 sha 快捷键 按键 keybinding",
         }
     }
 }
@@ -466,6 +476,8 @@ pub struct Pane {
     quick_look: Option<QuickLookState>,
     /// 搜索面板；`None` 就是没开。
     search: Option<Entity<SearchPanel>>,
+    /// 分析面板（大小 / 重复 / 校验和）；`None` 就是没开。
+    analyze: Option<Entity<AnalyzePanel>>,
     /// 压缩包面板；`None` 就是没开。
     archive_view: Option<ArchiveState>,
     /// 正在后台打包/解压时把任务握在手里（丢掉即放弃），
@@ -520,6 +532,7 @@ impl Pane {
             watch_task: None,
             quick_look: None,
             search: None,
+            analyze: None,
             marking: None,
             archive_view: None,
             archive_busy: None,
@@ -1160,7 +1173,63 @@ impl Pane {
     /// 有没有浮层压在窗格上。有浮层时窗格的命令一律不执行
     /// （见 [`Self::run_command`]），键盘也归浮层。
     fn overlay_open(&self) -> bool {
-        self.search.is_some() || self.marking.is_some()
+        self.search.is_some() || self.marking.is_some() || self.analyze.is_some()
+    }
+
+    /// 分析面板开没开。键盘与 Esc 的优先级要用它排顺序。
+    fn analyze_open(&self) -> bool {
+        self.analyze.is_some()
+    }
+
+    /// 打开分析面板，或者在开着的时候收起它。
+    ///
+    /// 面板里还能自己切页签（大小 / 重复 / 校验和），
+    /// 所以这里只需要一条命令：按一下开，再按一下关。
+    fn toggle_analyze(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.analyze.is_some() {
+            self.close_analyze(window, cx);
+            return;
+        }
+        let dir = self.listing.path().to_path_buf();
+        let selected = self.analyze_targets();
+        let mode = AnalyzeMode::default_for(&selected);
+        let panel = cx.new(|cx| AnalyzePanel::new(dir, selected, mode, cx));
+        self.subscriptions.push(cx.subscribe_in(
+            &panel,
+            window,
+            |this, _, event: &AnalyzeEvent, window, cx| match event {
+                AnalyzeEvent::Close => this.close_analyze(window, cx),
+                AnalyzeEvent::Reveal(path) => this.reveal_from_search(path.clone(), window, cx),
+            },
+        ));
+        // 面板这一帧才挂上窗口，焦点等挂好再给（见搜索面板那边的说明）。
+        let focus = panel.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.analyze = Some(panel);
+        cx.notify();
+    }
+
+    /// 关掉分析面板。实体一丢，`Drop` 会把后台那一趟中止掉。
+    fn close_analyze(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.analyze.take().is_some() {
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// 分析算谁：选中项优先，一个都没选就用光标下那一项。
+    ///
+    /// 面板的三页各有各的口径（大小看目录、校验和看文件、重复看目录树），
+    /// 但对"算谁"的回答必须一致，切页签不该换对象。
+    fn analyze_targets(&self) -> Vec<PathBuf> {
+        let selected = self.selected_paths();
+        if !selected.is_empty() {
+            return selected;
+        }
+        self.selection
+            .cursor()
+            .map(|path| vec![path.to_path_buf()])
+            .unwrap_or_default()
     }
 
     /// 打开标记浮层：给选中的那一项标色、打标签。再按一次就收起。
@@ -1231,7 +1300,7 @@ impl Pane {
             return;
         };
         let path = state.path.clone();
-        let tags = marks::parse_tags(&state.input.read(cx).value().to_string());
+        let tags = marks::parse_tags(state.input.read(cx).value().as_ref());
         Settings::update(cx, |settings| settings.marks.set_tags(&path, tags));
         self.close_marks(window, cx);
     }
@@ -1542,7 +1611,12 @@ impl Pane {
         // 命令不该在看不见的地方生效：那样在输入框里按 Cmd+C
         // 会一边复制文字、一边把选中文件塞进剪贴板。
         // 唯一例外是开关自己的那条——按它等于收起浮层。
-        if self.overlay_open() && !matches!(command, PaneCommand::Search | PaneCommand::Mark) {
+        if self.overlay_open()
+            && !matches!(
+                command,
+                PaneCommand::Search | PaneCommand::Mark | PaneCommand::Analyze
+            )
+        {
             return;
         }
         match command {
@@ -1567,6 +1641,7 @@ impl Pane {
             PaneCommand::ViewList => self.set_view(ViewMode::List, cx),
             PaneCommand::ViewGrid => self.set_view(ViewMode::Grid, cx),
             PaneCommand::ViewColumns => self.set_view(ViewMode::Columns, cx),
+            PaneCommand::Analyze => self.toggle_analyze(window, cx),
         }
     }
 
@@ -2793,6 +2868,22 @@ impl Pane {
         cx.notify();
     }
 
+    /// 分析面板开着时 ↑↓ 归它：窗格自己的光标不该跟着动。
+    fn analyze_cursor(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(panel) = self.analyze.clone() else {
+            return;
+        };
+        panel.update(cx, |panel, cx| panel.move_cursor(delta, cx));
+    }
+
+    /// 分析面板开着时 Enter 归它：跳到它指的那一行的文件。
+    fn analyze_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.analyze.clone() else {
+            return;
+        };
+        panel.update(cx, |panel, cx| panel.reveal_cursor(cx));
+    }
+
     /// 量出"这一栏有多宽"。
     ///
     /// 网格要知道宽度才能算一行放几格，而 GPUI 既没有元素级的 `on_resize`，
@@ -2832,8 +2923,20 @@ impl Pane {
                     }
                 }),
             )
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_cursor(-1, false, cx)))
-            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_cursor(1, false, cx)))
+            .on_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                if this.analyze_open() {
+                    this.analyze_cursor(-1, cx);
+                    return;
+                }
+                this.move_cursor(-1, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                if this.analyze_open() {
+                    this.analyze_cursor(1, cx);
+                    return;
+                }
+                this.move_cursor(1, false, cx)
+            }))
             .on_action(cx.listener(|this, _: &SelectUp, _, cx| this.move_cursor(-1, true, cx)))
             .on_action(cx.listener(|this, _: &SelectDown, _, cx| this.move_cursor(1, true, cx)))
             .on_action(cx.listener(|this, _: &MoveFirst, _, cx| this.focus_position(0, false, cx)))
@@ -2844,7 +2947,15 @@ impl Pane {
             .on_action(cx.listener(|this, _: &PageUp, _, cx| this.move_page(-1, cx)))
             .on_action(cx.listener(|this, _: &PageDown, _, cx| this.move_page(1, cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
-            .on_action(cx.listener(|this, _: &Open, window, cx| this.open_cursor(window, cx)))
+            .on_action(cx.listener(|this, _: &Open, window, cx| {
+                // 分析面板开着的时候 Enter 是"跳到它指的那个文件"，
+                // 不是打开窗格光标下的东西。
+                if this.analyze_open() {
+                    this.analyze_reveal(cx);
+                    return;
+                }
+                this.open_cursor(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenParent, window, cx| {
                 this.run_command(PaneCommand::GoUp, window, cx)
             }))
@@ -2854,12 +2965,14 @@ impl Pane {
                 this.run_command(PaneCommand::Refresh, window, cx)
             }))
             // Esc 有优先顺序：先看有没有浮层要关，没有才轮到清空选中。
-            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
                 // Esc 有优先顺序：先看有没有浮层要关，没有才轮到清空选中。
                 if this.quick_look_open() {
                     this.close_quick_look(cx);
                 } else if this.archive_open() {
                     this.close_archive(cx);
+                } else if this.analyze_open() {
+                    this.close_analyze(window, cx);
                 } else {
                     this.clear_selection(cx);
                 }
@@ -2918,6 +3031,9 @@ impl Pane {
             .on_action(cx.listener(|this, _: &ViewArchive, _, cx| this.toggle_archive(cx)))
             .on_action(cx.listener(|this, _: &CreateArchive, _, cx| {
                 this.create_archive(cx)
+            }))
+            .on_action(cx.listener(|this, _: &Analyze, window, cx| {
+                this.run_command(PaneCommand::Analyze, window, cx)
             }))
             .child(self.render_width_probe())
             .when(self.view == ViewMode::List, |body| {
@@ -3142,6 +3258,7 @@ impl Pane {
             PaneCommand::ViewList => "列表视图",
             PaneCommand::ViewGrid => "网格视图",
             PaneCommand::ViewColumns => "分列视图",
+            PaneCommand::Analyze => "分析：大小 / 重复 / 校验和",
         }
     }
 
@@ -3676,6 +3793,10 @@ impl Render for Pane {
         }
         if self.marking.is_some() {
             root = root.child(self.render_marks(cx));
+        }
+        // 分析面板也自带遮罩，压在标记浮层上面。
+        if let Some(panel) = self.analyze.clone() {
+            root = root.child(panel.into_any_element());
         }
         // 搜索面板压在最上面：它自己带遮罩，且要盖住另外几个浮层。
         if let Some(panel) = self.search.clone() {

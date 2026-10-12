@@ -2617,3 +2617,123 @@ fn the_search_panel_is_reachable_from_the_command_palette(cx: &mut TestAppContex
         assert!(window.try_find("search").is_some(), "回车应该打开面板");
     });
 }
+
+// ---- 分析：文件夹大小 / 重复文件 / 校验和 ----
+
+/// 分析面板是在真线程上算的，结果靠事件送回来：给它一点真实时间，
+/// 每一轮都得画帧——不画帧事件就不会被消费。
+fn wait_for_analyze_row(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    index: usize,
+) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        cx.run_until_parked();
+        let found = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                window
+                    .try_find(("analyze-row", index))
+                    .map(|row| row.label().unwrap_or_default().to_string())
+            })
+            .expect("窗口还在");
+        if found.is_some() || Instant::now() > deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[gpui_kit::test]
+fn the_analyze_panel_adds_up_a_folder(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "12345").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "123").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-alt-i", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("analyze").is_some(), "该打开分析面板");
+    });
+
+    // 头一行是那个目录自己：8 B（5 + 3），两个文件。
+    let head = wait_for_analyze_row(cx, handle, 0).expect("该算出这一行");
+    assert!(head.contains("8 B"), "大小该是两个文件之和：{head}");
+    assert!(head.contains("2 个文件"), "该报文件个数：{head}");
+
+    // 底下跟着最大的几个文件：a.txt 比 b.txt 大，排在前面。
+    let biggest = wait_for_analyze_row(cx, handle, 1).expect("该列出最大的文件");
+    assert!(biggest.contains("a.txt"), "最大的该是 a.txt：{biggest}");
+}
+
+#[gpui_kit::test]
+fn the_analyze_panel_hashes_the_selected_file(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("abc.txt"), "abc").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let row = row_position(window, "abc.txt");
+        window.click(("row-name", row), cx);
+    });
+    // 选中了文件，面板该直接落在"校验和"这一页。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-i", cx);
+    });
+
+    let label = wait_for_analyze_row(cx, handle, 0).expect("该算出校验和");
+    assert!(
+        label.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        "SHA-256 该是 abc 的那一个：{label}"
+    );
+}
+
+#[gpui_kit::test]
+fn the_analyze_panel_finds_duplicate_files(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("one")).unwrap();
+    std::fs::create_dir_all(dir.path().join("two")).unwrap();
+    std::fs::write(dir.path().join("one/a.txt"), "一样的内容").unwrap();
+    std::fs::write(dir.path().join("two/b.txt"), "一样的内容").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-alt-i", cx);
+    });
+    // 切到"重复文件"那一页。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("analyze-tab", 1usize), cx);
+    });
+
+    let label = wait_for_analyze_row(cx, handle, 0).expect("该找到一组重复");
+    assert!(label.contains("2 个副本"), "两个一样的文件是一组：{label}");
+}
+
+#[gpui_kit::test]
+fn escape_closes_the_analyze_panel(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "12345").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-alt-i", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("analyze").is_some(), "该打开面板");
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("analyze").is_none(), "Esc 该关掉面板");
+    });
+}

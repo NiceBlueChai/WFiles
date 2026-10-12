@@ -1,3 +1,5 @@
+mod analyze;
+mod analyze_entity;
 mod app;
 mod archive;
 mod bulk_rename;

@@ -20,6 +20,11 @@ zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
 regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
+md5 = "0.8"
+sha1 = "0.10"
+sha2 = "0.10"
+# 上面三个哈希库共用的 trait；直接声明是为了 `Digest` 的方法能用在它们三家身上。
+digest = "0.10"
 
 [profile.dev]
 codegen-units = 16

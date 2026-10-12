@@ -1021,6 +1021,7 @@ impl WFilesApp {
             PaneCommand::ViewList,
             PaneCommand::ViewGrid,
             PaneCommand::ViewColumns,
+            PaneCommand::Analyze,
         ] {
             if !self.pane_command_enabled(command, cx) {
                 continue;
@@ -1333,6 +1334,12 @@ impl WFilesApp {
             PaneCommand::ViewColumns => {
                 ("分列视图", "Cmd+3", "视图", "view miller 分列 层级 columns")
             }
+            PaneCommand::Analyze => (
+                "分析：大小 / 重复 / 校验和",
+                "Cmd+Alt+I",
+                "文件",
+                "analyze 分析 大小 重复 校验和 md5 sha1 sha256 size duplicate checksum",
+            ),
         }
     }
 
