@@ -62,6 +62,34 @@ impl FileEntry {
             .or_else(|| dir_entry.metadata().ok())
     }
 
+    /// 远程目录里的一项。字段由调用方给——只有它知道怎么从协议里读出来。
+    ///
+    /// 放在这里而不是 `remote` 里，是为了让"排序、过滤、显示"这一套
+    /// 不用管东西是本地的还是远端的。
+    pub fn remote(
+        path: PathBuf,
+        name: &str,
+        is_dir: bool,
+        size: u64,
+        modified: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            sort_name: name.to_lowercase(),
+            sort_kind: if is_dir {
+                String::new()
+            } else {
+                path.extension()
+                    .map(|extension| extension.to_string_lossy().to_lowercase())
+                    .unwrap_or_default()
+            },
+            path,
+            name: name.to_string(),
+            is_dir,
+            size,
+            modified,
+        }
+    }
+
     pub fn kind_label(&self) -> String {
         if self.is_dir {
             return "文件夹".to_string();
@@ -198,14 +226,21 @@ impl Listing {
                 entries.push(entry);
             }
         }
+        Ok(Self::from_entries(path.to_path_buf(), entries))
+    }
 
+    /// 把一批条目装成目录内容。
+    ///
+    /// 远程目录走的就是这条路：那一批条目是后台线程从服务器上取回来的，
+    /// 之后排序、过滤、选中与本地目录一模一样。
+    pub fn from_entries(path: PathBuf, entries: Vec<FileEntry>) -> Self {
         let index = entries
             .iter()
             .enumerate()
             .map(|(ix, entry)| (entry.path.clone(), ix))
             .collect();
         let mut listing = Self {
-            path: path.to_path_buf(),
+            path,
             entries,
             index,
             order: Vec::new(),
@@ -214,7 +249,7 @@ impl Listing {
             sort: Sort::default(),
         };
         listing.rebuild();
-        Ok(listing)
+        listing
     }
 
     /// 读盘失败时的占位内容，让界面仍然有一个明确的“当前目录”。

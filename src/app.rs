@@ -4,6 +4,7 @@
 //! 打开的目录列表在变化时写盘，下次启动原样恢复。
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -24,10 +25,12 @@ use crate::diff_entity::{DiffEvent, DiffPanel};
 use crate::drag::{self, DraggedPaths};
 use crate::meta::{Field as MetaField, Metadata};
 use crate::format;
+use crate::remote::{self, Kind as RemoteKind};
 use crate::ops::{ConflictPolicy, ControlState};
 use crate::ops_entity::{Ops, OpsEvent, PendingAction};
 use crate::palette::{self, Command as PaletteCommand};
 use crate::pane::{Pane, PaneCommand, PaneEvent};
+use crate::remotes::{Remotes, RemotesEvent};
 use crate::session::Session;
 use crate::thumbnails::Thumbnails;
 use crate::settings::{Layout, Settings};
@@ -105,6 +108,23 @@ enum PaletteAction {
     NextTab,
     /// 跑一条存下来的搜索：打开搜索面板并把那句查询填进去。
     SavedSearch(String),
+    /// 打开“连接远程服务器”对话框。
+    Connect,
+    /// 打开一条存下来的连接（存的是连接 id）。
+    OpenRemote(String),
+}
+
+/// 连接对话框的当前状态。输入框随开随建、随关随毁，密码不留在别处。
+#[derive(Clone)]
+struct ConnectState {
+    name: Entity<InputState>,
+    url: Entity<InputState>,
+    user: Entity<InputState>,
+    password: Entity<InputState>,
+    /// 正在后台试连：按钮变灰，也不再重复发起。
+    busy: bool,
+    /// 上一次试连失败的原因。
+    error: Option<String>,
 }
 
 /// 命令面板的当前状态。候选项在打开时快照，
@@ -114,6 +134,18 @@ struct PaletteState {
     /// 过滤后的下标，按相关度排序。
     filtered: Vec<usize>,
     selected: usize,
+}
+
+/// 从服务器地址里取个主机名出来当默认显示名：
+/// `https://dav.jianguoyun.com/dav/` → `dav.jianguoyun.com`。
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = rest.split(['/', '?', ':']).next().unwrap_or_default();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 
@@ -180,6 +212,15 @@ pub struct WFilesApp {
     diff: Option<Entity<DiffPanel>>,
     /// 元数据列的缓存与后台探测：所有标签共用一份，同一个文件只探一次。
     meta: Entity<Metadata>,
+    /// 远程连接的注册表：握着 WebDAV 客户端、目录缓存与下载任务。
+    remotes: Entity<Remotes>,
+    /// 连接对话框。`None` = 关着；关掉时输入框实体一起丢掉。
+    connect: Option<ConnectState>,
+    /// 侧栏里哪条连接的“删除”被按下了一次（两步确认的第一步）。
+    forget_armed: Option<String>,
+    /// 最近一次连上后，密码到底落在哪——必须让用户看得见，
+    /// 否则“密码明文躺在设置里”这种事没人会知道。
+    secret_note: Option<String>,
 }
 
 impl WFilesApp {
@@ -189,6 +230,7 @@ impl WFilesApp {
         let ops = cx.new(|_| Ops::new());
         let thumbs = cx.new(|_| Thumbnails::new());
         let meta = cx.new(|_| Metadata::new());
+        let remotes = cx.new(|_| Remotes::new());
 
         // 恢复上次的标签；一个都不剩就开主页。
         let session = Session::load().sanitized();
@@ -200,6 +242,7 @@ impl WFilesApp {
                     ops.clone(),
                     thumbs.clone(),
                     meta.clone(),
+                    remotes.clone(),
                     window,
                     cx,
                 )
@@ -213,6 +256,7 @@ impl WFilesApp {
                     ops.clone(),
                     thumbs.clone(),
                     meta.clone(),
+                    remotes.clone(),
                     window,
                     cx,
                 )
@@ -242,6 +286,10 @@ impl WFilesApp {
             compare: None,
             diff: None,
             meta,
+            remotes,
+            connect: None,
+            forget_armed: None,
+            secret_note: None,
         };
 
         app.subscriptions.push(cx.subscribe_in(
@@ -262,6 +310,16 @@ impl WFilesApp {
                 },
             ));
         }
+        // 远程：连上就跳过去，列完目录由窗格自己处理（`Remotes::entries`），
+        // 这里只管"连上了 / 没连上 / 打开失败"这三件需要告诉用户的事。
+        let remotes = app.remotes.clone();
+        app.subscriptions.push(cx.subscribe_in(
+            &remotes,
+            window,
+            |this, _, event: &RemotesEvent, window, cx| {
+                this.on_remotes_event(event, window, cx)
+            },
+        ));
         app.saved_session = app.snapshot(cx);
 
         // 退出前再存一次，覆盖“最后一次导航还没来得及落盘”的窗口。
@@ -460,6 +518,7 @@ impl WFilesApp {
                     )
                     .children(items),
             )
+            .child(self.render_remote_section(cx))
             .child(div().flex_1())
             .child(
                 h_flex()
@@ -472,6 +531,101 @@ impl WFilesApp {
                     .child(Icon::new(IconName::HardDrive).size_4())
                     .child("本地文件系统"),
             )
+    }
+
+    /// 侧栏的"远程"区：存下来的连接一条一行，末尾一行是"连接服务器"。
+    ///
+    /// 删连接没有放进命令面板，只在侧栏做：它要点两下（第一下只是举手），
+    /// 而面板里一条 Enter 就删掉一个记不住的密码太容易误伤。
+    fn render_remote_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.tabs[self.active].read(cx).path().to_path_buf();
+        let saved = Settings::peek(cx, |settings| settings.remotes.clone());
+        let armed = self.forget_armed.clone();
+        let note = self.secret_note.clone();
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, config) in saved.iter().enumerate() {
+            let id = config.id.clone();
+            let name = config.name.clone();
+            let target = remote::location(&config.id, &config.root);
+            let is_current = current == target;
+            let is_armed = armed.as_deref() == Some(id.as_str());
+            let open_id = id.clone();
+            let forget_id = id.clone();
+
+            let row = ListItem::new(("remote", index))
+                .rounded(cx.theme().radius)
+                .selected(is_current)
+                .accessibility_label(name.clone())
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .child(Icon::new(IconName::Cloud).size_4())
+                        .child(div().flex_1().min_w_0().truncate().child(name.clone())),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_remote(open_id.clone(), window, cx)
+                }));
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().child(row))
+                    // 举起手之后才给"确认删除"，手放下去就只是个叉。
+                    .child(
+                        Button::new(("remote-forget", index))
+                            .label(if is_armed { "确认删除" } else { "×" })
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.forget_armed.as_deref() == Some(forget_id.as_str()) {
+                                    this.forget_remote(&forget_id, window, cx);
+                                } else {
+                                    this.forget_armed = Some(forget_id.clone());
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows.push(
+            ListItem::new("remote-new")
+                .rounded(cx.theme().radius)
+                .accessibility_label("连接服务器")
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .child(Icon::new(IconName::Plus).size_4())
+                        .child("连接服务器…"),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.open_connect(window, cx)))
+                .into_any_element(),
+        );
+
+        v_flex()
+            .p_2()
+            .gap_1()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("远程"),
+            )
+            .children(rows)
+            .when_some(note, |this, note| {
+                this.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(note),
+                )
+            })
     }
 
     // ---- 标签管理 ----
@@ -489,6 +643,7 @@ impl WFilesApp {
                 self.ops.clone(),
                 self.thumbs.clone(),
                 self.meta.clone(),
+                self.remotes.clone(),
                 window,
                 cx,
             )
@@ -771,6 +926,149 @@ impl WFilesApp {
         let focus = panel.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         self.diff = Some(panel);
+        cx.notify();
+    }
+
+    // ---- 远程连接 ----
+
+    /// 后台回来的三件事：连上了、没连上、打开远程文件失败。
+    fn on_remotes_event(
+        &mut self,
+        event: &RemotesEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            RemotesEvent::Connected { id, name } => {
+                // 密码只进系统钥匙串，不写进配置文件——这句话要说出来，
+                // 否则用户只能靠猜才知道密码去了哪。
+                self.secret_note = Some(format!("「{name}」的密码已存入系统钥匙串"));
+                self.connect = None;
+                self.open_remote(id.clone(), window, cx);
+            }
+            RemotesEvent::Failed(reason) => {
+                // 对话框可能已经关了（比如用户等不及按了 Esc）：
+                // 那就只在状态栏说一句，别把对话框又弹回来。
+                if let Some(state) = self.connect.as_mut() {
+                    state.busy = false;
+                    state.error = Some(reason.clone());
+                }
+            }
+            RemotesEvent::Listed { .. } => {}
+        }
+        cx.notify();
+    }
+
+    /// 打开连接对话框。
+    fn open_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connect.is_some() {
+            return;
+        }
+        let field = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+        };
+        let name = field("坚果云", window, cx);
+        let url = field(RemoteKind::WebDav.url_hint(), window, cx);
+        let user = field("用户名（可留空）", window, cx);
+        let password = field("密码或应用专用密码", window, cx);
+        name.update(cx, |input, cx| input.focus(window, cx));
+        self.connect = Some(ConnectState {
+            name,
+            url,
+            user,
+            password,
+            busy: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn close_connect(&mut self, cx: &mut Context<Self>) {
+        self.connect = None;
+        cx.notify();
+    }
+
+    /// 点"连接"：收齐四个框，交给 `Remotes` 去后台试连。
+    ///
+    /// 试连而不是直接存：地址打错一个字，存下来的是一个永远打不开的连接，
+    /// 用户还得自己去找怎么删。
+    fn submit_connect(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.connect.as_mut() else {
+            return;
+        };
+        if state.busy {
+            return;
+        }
+        let value = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        let url = value(&state.url);
+        let user = value(&state.user);
+        let password = state.password.read(cx).value().to_string();
+        let name = value(&state.name);
+
+        if url.is_empty() {
+            state.error = Some("服务器地址不能为空".to_string());
+            cx.notify();
+            return;
+        }
+        // 没填名字就从地址里取主机名，别让用户为了必填而编一个。
+        let name = if name.is_empty() {
+            host_of(&url).unwrap_or_else(|| "远程服务器".to_string())
+        } else {
+            name
+        };
+        let id = self
+            .remotes
+            .update(cx, |remotes, cx| remotes.fresh_id(&name, cx));
+        let config = remote::Config::new(id, name, RemoteKind::WebDav, url, user);
+
+        state.busy = true;
+        state.error = None;
+        let secret = password;
+        self.remotes
+            .update(cx, |remotes, cx| remotes.connect(config, &secret, cx));
+        cx.notify();
+    }
+
+    /// 打开一条存下来的连接：跳到它的根（`config.root` 可能是个子目录）。
+    fn open_remote(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = Settings::peek(cx, |settings| {
+            settings.remotes.iter().find(|it| it.id == id).cloned()
+        }) else {
+            return;
+        };
+        let path = remote::location(&config.id, &config.root);
+        self.navigate_active_tab(path, window, cx);
+    }
+
+    /// 删掉一条连接：配置、钥匙串里的密码、目录缓存一起清掉。
+    ///
+    /// 侧栏上按第一次只是"举起手"，按第二次才真删——
+    /// 这一步删不掉用户任何文件，但会删掉一个记不住的密码。
+    fn forget_remote(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.forget_armed = None;
+        if self.secret_note.as_deref().is_some_and(|note| note.contains(id)) {
+            self.secret_note = None;
+        }
+        self.remotes.update(cx, |remotes, cx| remotes.forget(id, cx));
+        // 正停在那个远程目录里的标签要退回本地主页：
+        // 留着会显示一个永远刷不出来的空列表。
+        let home = Self::initial_dir();
+        let stale: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                tab.read(cx)
+                    .path()
+                    .to_string_lossy()
+                    .contains(&format!("{}://{}/", remote::SCHEME, id))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in stale {
+            let tab = self.tabs[index].clone();
+            tab.update(cx, |pane, cx| pane.reset_to(home.clone(), window, cx));
+        }
         cx.notify();
     }
 
@@ -1162,6 +1460,8 @@ impl WFilesApp {
                 Settings::update(cx, |settings| settings.terminal = id.clone());
             }
             PaletteAction::MetaColumn(field) => self.set_meta_column(field, cx),
+            PaletteAction::Connect => self.open_connect(window, cx),
+            PaletteAction::OpenRemote(id) => self.open_remote(id, window, cx),
             PaletteAction::ToggleTerminal => self.toggle_terminal(window, cx),
             PaletteAction::SavedSearch(name) => {
                 let Some(saved) = Settings::read(cx).saved_search(&name).cloned() else {
@@ -1345,6 +1645,32 @@ impl WFilesApp {
                     "关掉 关闭 隐藏 不要 元数据列",
                 ),
                 action: PaletteAction::MetaColumn(None),
+            });
+        }
+
+        // ---- 远程 ----
+        // 存下来的连接一条一项，能直接跳过去；"连接服务器"放在最后，
+        // 因为新建远没有打开常用。
+        items.push(PaletteItem {
+            command: PaletteCommand::new(
+                "app:connect",
+                "连接远程服务器…",
+                "",
+                "远程",
+                "remote 远程 连接 webdav 服务器 坚果云 nextcloud 网盘 nas 挂载",
+            ),
+            action: PaletteAction::Connect,
+        });
+        for config in Settings::peek(cx, |settings| settings.remotes.clone()) {
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("remote:{}", config.id),
+                    format!("打开远程：{}", config.name),
+                    config.kind.label(),
+                    "远程",
+                    format!("remote 远程 打开 {} {}", config.name, config.url),
+                ),
+                action: PaletteAction::OpenRemote(config.id),
             });
         }
 
@@ -2158,6 +2484,9 @@ impl WFilesApp {
         footer: AnyElement,
         on_overlay_click: impl Fn(&mut WFilesApp, &mut Window, &mut Context<WFilesApp>) + 'static,
     ) -> AnyElement {
+        // 点遮罩和按 Esc 是同一件事（"算了"），所以两个回调共用一支。
+        let close = Rc::new(on_overlay_click);
+        let for_escape = close.clone();
         div()
             .id("overlay")
             .absolute()
@@ -2165,12 +2494,22 @@ impl WFilesApp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(cx.theme().overlay)
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                on_overlay_click(this, window, cx)
-            }))
+            // 遮罩是卡片的**兄弟**，不是它的父级：点事件会顺着元素树往上冒，
+            // 挂在父级上就等于"点卡片里任何一个按钮都会顺手把对话框关掉"——
+            // 比如连接失败那句话刚写进去，对话框就没了。
+            .child(
+                div()
+                    .id("overlay-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .bg(cx.theme().overlay)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        close(this, window, cx)
+                    })),
+            )
             .child(
                 v_flex()
+                    .id("overlay-card")
                     .w(width)
                     .gap_4()
                     .p_5()
@@ -2178,10 +2517,22 @@ impl WFilesApp {
                     .border_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
+                    // 点击往下传是按 z 序来的：遮罩虽然不是卡片的父级，
+                    // 但它在卡片下面、又铺满整屏，所以卡片里任何一个按钮按下
+                    // 都会"漏"到遮罩上把对话框关掉（连接失败那句话刚写进去就没了）。
+                    // 这里在卡片上收住：按钮先执行，卡片把事件掐断，遮罩收不到。
+                    .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
                     .child(div().font_semibold().child(title))
                     .child(body)
                     .child(h_flex().justify_end().gap_2().child(footer)),
             )
+            // 焦点在对话框里的输入框上时，按键事件会冒到这里——
+            // 于是每个对话框都认 Esc，不用各自再挂一次。
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    for_escape(this, window, cx);
+                }
+            }))
             .into_any_element()
     }
 
@@ -2479,6 +2830,89 @@ impl WFilesApp {
             |this, _, cx| this.dismiss_bulk(cx),
         )
     }
+
+    /// 连接远程服务器：四个框 + 试连。
+    ///
+    /// 不做"先存下来再说"：地址打错一个字就是一个永远打不开的连接，
+    /// 而用户还得自己去找怎么删。所以这里一定先连一次，通了才存。
+    fn render_connect(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(state) = self.connect.clone() else {
+            return div().into_any_element();
+        };
+
+        let muted = cx.theme().muted_foreground;
+        let labeled = |label: &'static str, input: &Entity<InputState>| {
+            v_flex()
+                .gap_1()
+                .min_w_0()
+                .child(div().text_xs().text_color(muted).child(label))
+                .child(Input::new(input).w_full())
+        };
+
+        let mut body = v_flex()
+            .gap_3()
+            .child(labeled("名称（可留空，默认取主机名）", &state.name))
+            .child(labeled("服务器地址", &state.url))
+            .child(labeled("用户名", &state.user))
+            .child(labeled("密码", &state.password))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!(
+                        "支持：{}；地址形如 {}。密码只进系统钥匙串，不写进配置文件。",
+                        RemoteKind::ALL
+                            .iter()
+                            .map(|kind| kind.label())
+                            .collect::<Vec<_>>()
+                            .join("、"),
+                        RemoteKind::WebDav.url_hint()
+                    )),
+            );
+
+        if let Some(error) = &state.error {
+            body = body.child(
+                div()
+                    .id("connect-error")
+                    .test_support()
+                    .aria_label(error.clone())
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(error.clone()),
+            );
+        }
+        if state.busy {
+            body = body.child(
+                div()
+                    .id("connect-busy")
+                    .test_support()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("正在连接…"),
+            );
+        }
+
+        let cancel = Button::new("connect-cancel")
+            .label("取消")
+            .ghost()
+            .on_click(cx.listener(|this, _, _, cx| this.close_connect(cx)))
+            .into_any_element();
+        let ok = Button::new("connect-ok")
+            .label("连接")
+            .primary()
+            .disabled(state.busy)
+            .on_click(cx.listener(|this, _, _, cx| this.submit_connect(cx)))
+            .into_any_element();
+
+        Self::overlay_card(
+            "连接远程服务器".to_string(),
+            px(460.),
+            cx,
+            body.into_any_element(),
+            h_flex().gap_2().child(cancel).child(ok).into_any_element(),
+            |this, _, cx| this.close_connect(cx),
+        )
+    }
 }
 
 impl Render for WFilesApp {
@@ -2488,7 +2922,8 @@ impl Render for WFilesApp {
             || self.ops.read(cx).conflict().is_some()
             || self.ops.read(cx).prompt().is_some()
             || self.ops.read(cx).bulk().is_some()
-            || self.palette.is_some();
+            || self.palette.is_some()
+            || self.connect.is_some();
 
         let mut root = v_flex()
             .size_full()
@@ -2554,9 +2989,11 @@ impl Render for WFilesApp {
         }
 
         if has_overlay {
-            // 一次只显示一层：命令面板 > 冲突 > 批量 > 输入 > 确认。
+            // 一次只显示一层：命令面板 > 连接 > 冲突 > 批量 > 输入 > 确认。
             let overlay = if self.palette.is_some() {
                 self.render_palette(cx)
+            } else if self.connect.is_some() {
+                self.render_connect(cx)
             } else if self.ops.read(cx).conflict().is_some() {
                 self.render_conflict(cx)
             } else if self.ops.read(cx).bulk().is_some() {
@@ -2570,5 +3007,21 @@ impl Render for WFilesApp {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_of;
+
+    #[test]
+    fn the_default_name_comes_from_the_host() {
+        assert_eq!(host_of("https://dav.jianguoyun.com/dav/").as_deref(), Some("dav.jianguoyun.com"));
+        // 没有协议头、带端口、带查询串都得认出来。
+        assert_eq!(host_of("host.local:8080/dav").as_deref(), Some("host.local"));
+        assert_eq!(host_of("http://host/dav?a=b").as_deref(), Some("host"));
+        // 认不出就交给调用方用兜底名字，别拿一个空串当名字。
+        assert_eq!(host_of(""), None);
+        assert_eq!(host_of("/dav/"), None);
     }
 }

@@ -43,6 +43,9 @@ pub struct Settings {
     /// 存下来的搜索：起了名字的查询，点一下就能再跑一遍。
     #[serde(default)]
     pub saved_searches: Vec<SavedSearch>,
+    /// 保存下来的远程连接。**密码不在这里**——它在系统钥匙串里（见 `remote`）。
+    #[serde(default)]
+    pub remotes: Vec<crate::remote::Config>,
     /// 列表右侧那列元数据显示什么（存的是 `meta::Field` 的 id）；空就是不显示。
     ///
     /// 六种（Git 状态 / 图片尺寸 / 媒体时长 / EXIF / ID3 / PDF 页数）共用一列：
@@ -133,6 +136,7 @@ impl Default for Settings {
             keys: crate::keymap::KeyMap::default(),
             marks: crate::marks::Marks::default(),
             saved_searches: Vec::new(),
+            remotes: Vec::new(),
             meta_column: String::new(),
         }
     }

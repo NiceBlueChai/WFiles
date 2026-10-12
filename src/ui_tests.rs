@@ -3090,3 +3090,101 @@ fn the_metadata_column_can_be_turned_off_again(cx: &mut TestAppContext) {
     });
     assert!(gone, "关掉之后这一格该消失");
 }
+
+// ---------------------------------------------------------------------------
+// P4 远程连接
+// ---------------------------------------------------------------------------
+
+/// 从命令面板打开连接对话框：面板里挑那条命令点一下。
+fn open_connect_dialog(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>) {
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("连接远程服务器", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("app:connect", cx);
+    });
+}
+
+/// 状态栏上那一句（远程位置、正在取…、几个项目都写在那里）。
+fn status_text(window: &mut gpui_kit::Window) -> String {
+    window
+        .try_find("pane-status")
+        .and_then(|it| it.label().map(|label| label.to_string()))
+        .unwrap_or_default()
+}
+
+#[gpui_kit::test]
+fn the_connect_dialog_refuses_an_empty_address(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    open_connect_dialog(cx, handle);
+
+    // 空地址按"连接"：对话框留着，并且说清楚缺什么，
+    // 而不是弹一个"连接失败"让人去猜。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("connect-ok").is_some(),
+            "该弹出连接对话框"
+        );
+        window.click("connect-ok", cx);
+    });
+    let error = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window
+            .try_find("connect-error")
+            .and_then(|it| it.label().map(|label| label.to_string()))
+            .unwrap_or_default()
+    });
+    assert_eq!(error, "服务器地址不能为空", "该说出缺什么：{error}");
+}
+
+#[gpui_kit::test]
+fn a_saved_connection_navigates_to_its_remote_location(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| {
+            settings.remotes.push(crate::remote::Config::new(
+                "jg".to_string(),
+                "坚果云".to_string(),
+                crate::remote::Kind::WebDav,
+                // 端口 9 是 discard 端口：连不上，且是本机立刻拒绝，
+                // 不会真的把请求发到网络上去。
+                "http://127.0.0.1:9/dav/".to_string(),
+                "me".to_string(),
+            ));
+        });
+    });
+
+    let label = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window
+            .try_find(("remote", 0usize))
+            .and_then(|row| row.label().map(|label| label.to_string()))
+            .unwrap_or_default()
+    });
+    assert_eq!(label, "坚果云", "侧栏该列出存下来的连接：{label}");
+
+    step(cx, handle, |window, cx| {
+        window.click(("remote", 0usize), cx);
+    });
+
+    // 切过去之后状态栏必须写明这是远程位置（或正在取），
+    // 列表长得跟本地一样，不说的话用户会以为自己在本地目录里。
+    let status = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        status_text(window)
+    });
+    assert!(
+        status.contains("正在取这个目录") || status.contains("远程位置"),
+        "该写明这是远程位置：{status}"
+    );
+}

@@ -80,8 +80,10 @@ impl Session {
     ///
     /// 标签全部失效时留下一个空列表，由调用方决定补一个默认位置。
     pub fn sanitized(mut self) -> Self {
+        // 远程路径（`dav://…`）在磁盘上不存在，但它是合法的目录位置，
+        // 不能因为 `is_dir()` 为假就把标签丢掉——否则重启后远程标签全没了。
         self.tabs
-            .retain(|path| path.is_dir() && path.parent().is_some());
+            .retain(|path| (path.is_dir() || crate::remote::parse_location(path).is_some()) && path.parent().is_some());
         if self.tabs.is_empty() {
             self.active = 0;
             self.split = None;

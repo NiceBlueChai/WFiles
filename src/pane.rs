@@ -35,7 +35,9 @@ use crate::format;
 use crate::keymap;
 use crate::marks;
 use crate::meta::{Metadata, MetadataEvent};
-use crate::model::{Listing, Selection, Sort, SortKey, ViewMode};
+use crate::remote;
+use crate::remotes::{Remotes, RemotesEvent};
+use crate::model::{FileEntry, Listing, Selection, Sort, SortKey, ViewMode};
 use crate::ops_entity::{Ops, OpsEvent};
 use crate::preview::{self, Preview};
 use crate::search_entity::{SearchEvent, SearchPanel};
@@ -433,6 +435,8 @@ pub struct Pane {
     thumbs: Entity<Thumbnails>,
     /// 元数据列的缓存与后台探测。
     meta: Entity<Metadata>,
+    /// 远程连接的客户端与目录缓存。
+    remotes: Entity<Remotes>,
     listing: Listing,
     selection: Selection,
     back: Vec<PathBuf>,
@@ -503,6 +507,7 @@ impl Pane {
         ops: Entity<Ops>,
         thumbs: Entity<Thumbnails>,
         meta: Entity<Metadata>,
+        remotes: Entity<Remotes>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -516,6 +521,7 @@ impl Pane {
             ops,
             thumbs,
             meta,
+            remotes,
             listing,
             selection: Selection::default(),
             back: Vec::new(),
@@ -596,6 +602,28 @@ impl Pane {
                         cx.notify();
                     }
                 }
+            },
+        ));
+
+        // 远程目录是后台列出来的：回来了一批就填进当前目录。
+        pane.subscriptions.push(cx.subscribe_in(
+            &pane.remotes,
+            window,
+            |this, _, event: &RemotesEvent, _, cx| match event {
+                RemotesEvent::Listed { path, error } => {
+                    // 只填"现在正看着"的那一栏：用户可能早就切走了。
+                    if *path != this.listing.path() {
+                        return;
+                    }
+                    if let Some(error) = error {
+                        this.error = Some(error.clone());
+                    } else {
+                        this.fill_remote(path, cx);
+                    }
+                    this.update_status();
+                    cx.notify();
+                }
+                RemotesEvent::Connected { .. } | RemotesEvent::Failed(_) => {}
             },
         ));
 
@@ -739,6 +767,15 @@ impl Pane {
         } else {
             format!("{visible} / {total} 个项目")
         };
+        // 远程位置要写明：列表长得跟本地一样，不说的话用户会以为
+        // 自己在本地目录里，删改起来心里没底。
+        if let Some((_, sub)) = remote::parse_location(self.listing.path()) {
+            text = if sub.is_empty() {
+                format!("远程位置 · {text}")
+            } else {
+                format!("远程位置 · {sub} · {text}")
+            };
+        }
         if !self.selection.is_empty() {
             text.push_str(&format!("，已选中 {} 项", self.selection.len()));
         }
@@ -769,6 +806,11 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 远程位置（dav://…）：本地那一套读不了，走后台那一支。
+        if remote::parse_location(&path).is_some() {
+            self.go_remote(path, remember, take_focus, window, cx);
+            return;
+        }
         match Listing::read(&path) {
             Ok(listing) => {
                 if remember && path != self.listing.path() {
@@ -797,6 +839,84 @@ impl Pane {
         }
         self.update_status();
         cx.notify();
+    }
+
+    /// 进一个远程目录：先把界面切过去（空列表），后台列出来再填。
+    ///
+    /// 之所以不"等列完再切"：那会让窗口在慢服务器上僵住几十秒，
+    /// 而用户连卡在哪儿都不知道。先切过去、写明在取，才是能用的样子。
+    fn go_remote(
+        &mut self,
+        path: PathBuf,
+        remember: bool,
+        take_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((id, sub)) = remote::parse_location(&path) else {
+            return;
+        };
+        if remember && path != self.listing.path() {
+            self.back.push(self.listing.path().to_path_buf());
+            self.forward.clear();
+        }
+        self.listing = Listing::empty(path.clone());
+        self.selection.clear();
+        self.error = None;
+        self.clear_filter(window, cx);
+        self.sync_row_sizes();
+        self.scroll_to_top();
+        // 远程目录没有"文件变了"的通知可听，监听本地文件系统只会白跑。
+        self.watch_task = None;
+        if take_focus {
+            self.focus.focus(window, cx);
+        }
+
+        let entries = self.remotes.update(cx, |remotes, cx| remotes.list(&id, &sub, cx));
+        match entries {
+            // 已经列过了（缓存还在）：当场填进去。
+            Some(_) => {
+                self.fill_remote(&path, cx);
+                self.update_status();
+            }
+            // 后台正在取：先说清楚在等什么，别让人以为这是个空目录。
+            None => self.status = "正在取这个目录…".to_string(),
+        }
+        cx.emit(PaneEvent::Navigated);
+        cx.notify();
+    }
+
+    /// 把后台取回来的那批条目装进当前目录。
+    fn fill_remote(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some((id, _)) = remote::parse_location(path) else {
+            return;
+        };
+        let entries = self
+            .remotes
+            .update(cx, |remotes, _| remotes.entries(path).cloned())
+            .unwrap_or_default();
+        let query = self.listing.query().to_string();
+        let sort = self.listing.sort();
+        let items = entries
+            .into_iter()
+            .map(|entry| {
+                let child = remote::location(&id, &entry.path);
+                // 服务器给的是 Unix 秒；没有时间就当没有（那一列空着）。
+                let modified = entry
+                    .modified
+                    .map(|seconds| {
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+                    });
+                FileEntry::remote(child, &entry.name, entry.is_dir, entry.size, modified)
+            })
+            .collect();
+        let mut listing = Listing::from_entries(path.to_path_buf(), items);
+        listing.set_sort(sort);
+        listing.set_query(&query);
+        self.listing = listing;
+        self.selection.retain_existing(&self.listing);
+        self.error = None;
+        self.sync_row_sizes();
     }
 
     fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -831,6 +951,14 @@ impl Pane {
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let path = self.listing.path().to_path_buf();
+        // 远程目录刷新 = 重新问一次服务器（缓存丢掉，别拿旧的糊弄）。
+        if let Some((id, sub)) = remote::parse_location(&path) {
+            self.remotes
+                .update(cx, |remotes, cx| remotes.reload(&id, &sub, cx));
+            self.status = "正在取这个目录…".to_string();
+            cx.notify();
+            return;
+        }
         let query = self.listing.query().to_string();
         let sort = self.listing.sort();
 
@@ -860,6 +988,13 @@ impl Pane {
         let is_dir = self.listing.entry(&path).is_some_and(|entry| entry.is_dir);
         if is_dir {
             self.navigate_to(path, true, window, cx);
+        } else if remote::parse_location(&path).is_some() {
+            // 远程文件：先下载到临时目录，再交给系统打开。
+            let Some((id, sub)) = remote::parse_location(&path) else {
+                return;
+            };
+            self.remotes
+                .update(cx, |remotes, cx| remotes.open_file(&id, &sub, cx));
         } else if archive::is_archive(&path) {
             // 压缩包不交给系统：自己就能看得见里面，还能解得出来。
             self.open_archive(path, cx);
@@ -1678,6 +1813,15 @@ impl Pane {
 
     /// 开始监听当前目录；切换目录时旧任务被丢弃，监听随之停止。
     fn start_watching(&mut self, cx: &mut Context<Self>) {
+        // 远程目录没有本地文件事件可听：notify 只能看着本机的文件系统。
+        if remote::parse_location(self.listing.path()).is_some() {
+            self.watch_task = None;
+            return;
+        }
+        self.watch_local(cx);
+    }
+
+    fn watch_local(&mut self, cx: &mut Context<Self>) {
         let path = self.listing.path().to_path_buf();
         let Ok((watcher, rx)) = watch::watch_directory(&path) else {
             return;

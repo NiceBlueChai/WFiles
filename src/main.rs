@@ -20,6 +20,8 @@ mod palette;
 mod pane;
 mod preview;
 mod query;
+mod remote;
+mod remotes;
 mod search;
 mod search_entity;
 mod session;
