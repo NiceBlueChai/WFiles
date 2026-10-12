@@ -119,6 +119,8 @@ pub fn init(cx: &mut App) {
 #[derive(Clone, Debug)]
 pub enum PaneEvent {
     Navigated,
+    /// 这一栏被点了：双栏模式下应用据此把焦点挪过来。
+    Focused,
 }
 
 impl EventEmitter<PaneEvent> for Pane {}
@@ -259,6 +261,11 @@ impl Pane {
         self.selection.len()
     }
 
+    /// 把键盘焦点拿到这一栏来。应用切换双栏焦点时用它。
+    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+    }
+
     /// 还有没有上一级可去（根目录就没有）。
     pub fn has_parent(&self) -> bool {
         self.listing.path().parent().is_some()
@@ -318,6 +325,23 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.go_to(path, remember, true, window, cx)
+    }
+
+    /// 换目录但不抢键盘焦点：双栏同步浏览时另一栏是被"带着走"的，
+    /// 焦点该留在用户正在操作的那一栏——否则按一下 Enter 焦点就跳到对面去了。
+    pub fn follow_to(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_to(path, true, false, window, cx)
+    }
+
+    fn go_to(
+        &mut self,
+        path: PathBuf,
+        remember: bool,
+        take_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match Listing::read(&path) {
             Ok(listing) => {
                 if remember && path != self.listing.path() {
@@ -333,7 +357,9 @@ impl Pane {
                 self.sync_row_sizes();
                 self.scroll_to_top();
                 self.start_watching(cx);
-                self.focus.focus(window, cx);
+                if take_focus {
+                    self.focus.focus(window, cx);
+                }
                 cx.emit(PaneEvent::Navigated);
             }
             Err(error) => {
@@ -521,7 +547,7 @@ impl Pane {
     // ---- 文件操作请求 ----
 
     /// 按列表顺序返回选中项，批量操作要用同一个顺序。
-    fn selected_paths(&self) -> Vec<PathBuf> {
+    pub fn selected_paths(&self) -> Vec<PathBuf> {
         self.selection.ordered(&self.listing)
     }
 
@@ -1238,7 +1264,9 @@ impl Pane {
     /// 表头 + 列表 + 状态栏，也就是键盘绑定生效的那一块。
     fn render_body(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .id("pane-body")
+            // id 带上实体号：双栏时两个窗格同屏，元素 id 必须各不相同，
+            // 否则两个列表的状态（滚动位置、选中行）会互相打架。
+            .id(("pane-body", cx.entity_id().as_u64() as usize))
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -1250,6 +1278,7 @@ impl Pane {
                 cx.listener(|this, _, window, cx| {
                     if !this.focus.is_focused(window) {
                         this.focus.focus(window, cx);
+                        cx.emit(PaneEvent::Focused);
                     }
                 }),
             )
@@ -1437,6 +1466,9 @@ impl Pane {
             .text_color(cx.theme().muted_foreground)
             .child(
                 div()
+                    .id("pane-status")
+                    .test_support()
+                    .aria_label(self.status.clone())
                     .flex_1()
                     .min_w_0()
                     .truncate()

@@ -27,7 +27,20 @@ use crate::thumbnails::Thumbnails;
 use crate::settings::{Layout, Settings};
 use crate::terminal;
 
-gpui_kit::actions!(wfiles, [NewTab, CloseTab, NextTab, TogglePalette]);
+gpui_kit::actions!(
+    wfiles,
+    [
+        NewTab,
+        CloseTab,
+        NextTab,
+        TogglePalette,
+        ToggleSplit,
+        SwapPane,
+        ToggleSync,
+        CopyToOther,
+        MoveToOther,
+    ]
+);
 
 /// 批量重命名对话框里的五个输入框，随开随建、随关随毁。
 #[derive(Clone)]
@@ -46,10 +59,22 @@ struct PaletteItem {
     action: PaletteAction,
 }
 
+/// 应用级命令：不属于任何一个窗格（分栏、同步这类）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppCommand {
+    ToggleSplit,
+    SwapPane,
+    ToggleSync,
+    CopyToOther,
+    MoveToOther,
+}
+
 /// 面板能触发的动作。窗格内的操作转交给当前窗格，
 /// 应用级的（标签页）由应用自己处理。
 #[derive(Clone)]
 enum PaletteAction {
+    /// 分栏、同步这类应用级命令。
+    App(AppCommand),
     GoTo(PathBuf),
     SwitchTab(usize),
     Pane(PaneCommand),
@@ -77,6 +102,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("cmd-p", TogglePalette, None),
+        // 双栏：Cmd+Alt+D 分栏、Tab 换焦点。Tab 是 Total Commander 那一系
+        // 双栏管理器的通用键位，单栏时按了没反应。
+        KeyBinding::new("cmd-alt-d", ToggleSplit, None),
+        KeyBinding::new("tab", SwapPane, None),
+        KeyBinding::new("cmd-alt-s", ToggleSync, None),
+        // F5/F6 拷到/移到另一栏，同样是双栏管理器沿用多年的键位。
+        KeyBinding::new("f5", CopyToOther, None),
+        KeyBinding::new("f6", MoveToOther, None),
     ]);
 }
 
@@ -85,7 +118,15 @@ pub struct WFilesApp {
     /// 缩略图缓存：所有标签共用一份，同一个文件只解一次。
     thumbs: Entity<Thumbnails>,
     tabs: Vec<Entity<Pane>>,
+    /// 焦点所在的标签。双栏时两栏各显示一个标签，焦点决定命令作用于谁。
     active: usize,
+    /// 双栏时**另一栏**显示哪个标签；None = 单栏。
+    split: Option<usize>,
+    /// 双栏时焦点那一栏是不是在左边。单独记这一位是为了让两栏位置稳定：
+    /// 换焦点只是挪焦点，不会让这一栏跳到对面去。
+    focus_on_left: bool,
+    /// 双栏同步浏览：一边换目录，另一边跟着走。
+    sync: bool,
     /// 输入对话框（新建文件夹/重命名）的输入框，随开随建。
     prompt_input: Option<Entity<InputState>>,
     /// 批量重命名对话框的输入框组。
@@ -125,12 +166,16 @@ impl WFilesApp {
             tabs.push(tab);
         }
         let active = session.active.min(tabs.len() - 1);
+        let split = session.split.filter(|&index| index < tabs.len() && index != active);
 
         let mut app = Self {
             ops: ops.clone(),
             thumbs,
             tabs,
             active,
+            split,
+            focus_on_left: split.is_none_or(|_| session.focus_on_left),
+            sync: split.is_some() && session.sync,
             prompt_input: None,
             bulk_inputs: None,
             palette: None,
@@ -150,7 +195,13 @@ impl WFilesApp {
             app.subscriptions.push(cx.subscribe_in(
                 tab,
                 window,
-                |this, _, _: &PaneEvent, _, cx| this.sync_session(cx),
+                |this, pane, event: &PaneEvent, window, cx| {
+                    this.sync_session(cx);
+                    match event {
+                        PaneEvent::Navigated => this.mirror_navigation(pane, window, cx),
+                        PaneEvent::Focused => this.note_focus(pane, cx),
+                    }
+                },
             ));
         }
         app.saved_session = app.snapshot(cx);
@@ -312,9 +363,15 @@ impl WFilesApp {
     // ---- 标签管理 ----
 
     fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let home = Self::initial_dir();
+        self.add_tab(home, window, cx);
+    }
+
+    /// 开一个新标签并让焦点落到它上面。返回它的下标。
+    fn add_tab(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let tab = cx.new(|cx| {
             Pane::new(
-                Self::initial_dir(),
+                path,
                 self.ops.clone(),
                 self.thumbs.clone(),
                 window,
@@ -324,12 +381,19 @@ impl WFilesApp {
         self.subscriptions.push(cx.subscribe_in(
             &tab,
             window,
-            |this, _, _: &PaneEvent, _, cx| this.sync_session(cx),
+            |this, pane, event: &PaneEvent, window, cx| {
+                this.sync_session(cx);
+                match event {
+                    PaneEvent::Navigated => this.mirror_navigation(pane, window, cx),
+                    PaneEvent::Focused => this.note_focus(pane, cx),
+                }
+            },
         ));
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.sync_session(cx);
         cx.notify();
+        self.active
     }
 
     fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -347,10 +411,19 @@ impl WFilesApp {
         }
 
         self.tabs.remove(index);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        } else if index < self.active {
+        // 两个下标都要跟着挪；另一栏正好被关掉就退回单栏。
+        self.split = match self.split {
+            Some(partner) if partner == index => None,
+            Some(partner) => Some(if partner > index { partner - 1 } else { partner }),
+            None => None,
+        };
+        if self.active > index {
             self.active -= 1;
+        }
+        self.active = self.active.min(self.tabs.len() - 1);
+        if self.split.is_none() {
+            self.focus_on_left = true;
+            self.sync = false;
         }
         self.sync_session(cx);
         cx.notify();
@@ -360,9 +433,149 @@ impl WFilesApp {
         if self.tabs.len() < 2 {
             return;
         }
-        self.active = (self.active + 1) % self.tabs.len();
+        let mut next = (self.active + 1) % self.tabs.len();
+        // 一轮撞上另一栏就再往前一个；两栏各占一个标签时没得可换，不动。
+        if Some(next) == self.split {
+            next = (next + 1) % self.tabs.len();
+            if next == self.active {
+                return;
+            }
+        }
+        self.active = next;
         self.sync_session(cx);
         cx.notify();
+    }
+
+    // ---- 双栏 ----
+
+    /// 此刻显示哪两个标签，按屏幕上的左右顺序。
+    fn visible(&self) -> Vec<usize> {
+        match self.split {
+            Some(partner) if self.focus_on_left => vec![self.active, partner],
+            Some(partner) => vec![partner, self.active],
+            None => vec![self.active],
+        }
+    }
+
+    fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.split.take().is_some() {
+            self.focus_on_left = true;
+            self.sync = false;
+            self.sync_session(cx);
+            cx.notify();
+            return;
+        }
+
+        let partner = if self.tabs.len() >= 2 {
+            (self.active + 1) % self.tabs.len()
+        } else {
+            // 只有一个标签：复制一份出来当另一栏，两边先看同一个目录，
+            // 用户再自己导航其中一边——这比凭空跳到主目录有用。
+            let here = self.tabs[self.active].read(cx).path().to_path_buf();
+            self.add_tab(here, window, cx);
+            let created = self.active;
+            self.active = 0;
+            created
+        };
+        self.split = Some(partner);
+        self.focus_on_left = true;
+        self.sync_session(cx);
+        cx.notify();
+    }
+
+    /// 把焦点换到另一栏，两栏在屏幕上的位置不动。
+    fn focus_other(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_partner(cx);
+        self.tabs[self.active].update(cx, |pane, cx| pane.focus(window, cx));
+    }
+
+    /// 交换"焦点栏"和"另一栏"两个下标，同时翻左右标志位——
+    /// 两个动作合起来才让位置保持不变。
+    fn focus_partner(&mut self, cx: &mut Context<Self>) {
+        let Some(partner) = self.split else {
+            return;
+        };
+        let previous = self.active;
+        self.active = partner;
+        self.split = Some(previous);
+        self.focus_on_left = !self.focus_on_left;
+        self.sync_session(cx);
+        cx.notify();
+    }
+
+    fn toggle_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.split.is_none() {
+            return;
+        }
+        self.sync = !self.sync;
+        // 一打开就把另一栏拉到同一个目录：开关的意义是"从现在起一起走"。
+        if self.sync {
+            self.mirror_navigation(&self.tabs[self.active].clone(), window, cx);
+        }
+        self.sync_session(cx);
+        cx.notify();
+    }
+
+    /// 把选中项拷（或移）到另一栏正在看的目录。
+    ///
+    /// 走的是和 Cmd+C / Cmd+X 同一条路：先放剪贴板再粘贴，
+    /// 所以冲突预检、撤销、进度全都照旧。
+    fn transfer_to_other(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(partner) = self.split else {
+            return;
+        };
+        let paths = self.tabs[self.active].read(cx).selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let dest = self.tabs[partner].read(cx).path().to_path_buf();
+        self.ops.update(cx, |ops, cx| {
+            if cut {
+                ops.cut(paths, cx)
+            } else {
+                ops.copy(paths, cx)
+            }
+        });
+        self.ops.update(cx, |ops, cx| ops.request_paste(dest, cx));
+    }
+
+    /// 同步浏览：焦点那一栏换了目录，另一栏跟着走。
+    ///
+    /// 只从焦点栏往外传，另一栏的变化不会再传回来，所以不会两边互相推。
+    fn mirror_navigation(
+        &mut self,
+        pane: &Entity<Pane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sync {
+            return;
+        }
+        let Some(partner) = self.split else {
+            return;
+        };
+        // 只从焦点栏往外传：另一栏的变化不会再传回来，两边不会互相推。
+        if self.tabs.get(self.active) != Some(pane) {
+            return;
+        }
+        let path = pane.read(cx).path().to_path_buf();
+        let other = self.tabs[partner].clone();
+        if other.read(cx).path() == path {
+            return;
+        }
+        // 用 follow_to 而不是 navigate_to：这一栏是被带着走的，不该抢焦点。
+        other.update(cx, |pane, cx| pane.follow_to(path, window, cx));
+    }
+
+    /// 某一栏被点了：点的是另一栏就把焦点挪过去，两栏位置不动。
+    fn note_focus(&mut self, pane: &Entity<Pane>, cx: &mut Context<Self>) {
+        let Some(partner) = self.split else {
+            return;
+        };
+        if self.tabs.get(partner) != Some(pane) {
+            return;
+        }
+        self.focus_partner(cx);
     }
 
     // ---- 会话 ----
@@ -375,6 +588,9 @@ impl WFilesApp {
                 .map(|tab| tab.read(cx).path().to_path_buf())
                 .collect(),
             active: self.active,
+            split: self.split,
+            focus_on_left: self.focus_on_left,
+            sync: self.sync,
         }
     }
 
@@ -653,6 +869,13 @@ impl WFilesApp {
             PaletteAction::NewTab => self.new_tab(window, cx),
             PaletteAction::CloseTab => self.close_tab(self.active, window, cx),
             PaletteAction::NextTab => self.next_tab(cx),
+            PaletteAction::App(command) => match command {
+                AppCommand::ToggleSplit => self.toggle_split(window, cx),
+                AppCommand::SwapPane => self.focus_other(window, cx),
+                AppCommand::ToggleSync => self.toggle_sync(window, cx),
+                AppCommand::CopyToOther => self.transfer_to_other(false, cx),
+                AppCommand::MoveToOther => self.transfer_to_other(true, cx),
+            },
         }
     }
 
@@ -730,6 +953,78 @@ impl WFilesApp {
                 ),
                 action: PaletteAction::SwitchTab(index),
             });
+        }
+
+        // ---- 双栏 ----
+        let split = self.split.is_some();
+        items.push(PaletteItem {
+            command: PaletteCommand::new(
+                "app:split",
+                if split { "取消分栏" } else { "分栏显示" },
+                "Cmd+Alt+D",
+                "窗口",
+                "split 双栏 分屏 两栏 pane",
+            ),
+            action: PaletteAction::App(AppCommand::ToggleSplit),
+        });
+        if split {
+            let selected = self.tabs[self.active].read(cx).selection_len();
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    "app:swap-pane",
+                    "切换到另一栏",
+                    "Tab",
+                    "窗口",
+                    "focus 焦点 切换 另一栏",
+                ),
+                action: PaletteAction::App(AppCommand::SwapPane),
+            });
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    "app:sync",
+                    if self.sync {
+                        "关闭双栏同步浏览"
+                    } else {
+                        "双栏同步浏览"
+                    },
+                    "Cmd+Alt+S",
+                    "窗口",
+                    "sync 同步 联动 导航",
+                ),
+                action: PaletteAction::App(AppCommand::ToggleSync),
+            });
+            if selected >= 1 {
+                let partner = self
+                    .split
+                    .and_then(|index| self.tabs.get(index))
+                    .map(|pane| pane.read(cx).path())
+                    .map(|path| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string())
+                    })
+                    .unwrap_or_default();
+                items.push(PaletteItem {
+                    command: PaletteCommand::new(
+                        "app:copy-other",
+                        format!("拷贝到另一栏：{partner}"),
+                        "F5",
+                        "文件",
+                        "copy 复制 另一栏 目标",
+                    ),
+                    action: PaletteAction::App(AppCommand::CopyToOther),
+                });
+                items.push(PaletteItem {
+                    command: PaletteCommand::new(
+                        "app:move-other",
+                        format!("移动到另一栏：{partner}"),
+                        "F6",
+                        "文件",
+                        "move 移动 剪切 另一栏 目标",
+                    ),
+                    action: PaletteAction::App(AppCommand::MoveToOther),
+                });
+            }
         }
 
         items.push(PaletteItem {
@@ -996,6 +1291,53 @@ impl WFilesApp {
 
     // ---- 渲染 ----
 
+    /// 中间那块：单栏放一个窗格，双栏放两个加一条分隔线。
+    fn render_panes(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let visible = self.visible();
+        if visible.len() < 2 {
+            // 单栏时直接放窗格本身，不多包一层：
+            // 外面那条 h_flex 是 items_center，多一层没有高度的 div
+            // 会把列表挤成内容高度，虚拟列表就画不出几行了。
+            return self.tabs[self.active].clone().into_any_element();
+        }
+
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            // 同理：位置容器在 items_center 的父级里，高度要写死成父级的满高。
+            .h_full()
+            .child(self.render_pane_slot(visible[0], cx))
+            .child(div().w(px(1.)).h_full().flex_shrink_0().bg(cx.theme().border))
+            .child(self.render_pane_slot(visible[1], cx))
+            .into_any_element()
+    }
+
+    /// 一栏：焦点那一栏顶上一条主色细线，让人一眼看出键盘交给谁了。
+    ///
+    /// 两栏都留着这条线的位置（没有焦点时用透明色），
+    /// 换焦点时布局不会跟着抖一下。
+    fn render_pane_slot(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let focused = index == self.active;
+        let accent = if focused {
+            cx.theme().primary
+        } else {
+            transparent_white()
+        };
+        v_flex()
+            .id(("pane-slot", index))
+            .test_support()
+            .aria_label(if focused { "焦点栏" } else { "另一栏" })
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .border_t_1()
+            .border_color(accent)
+            .child(self.tabs[index].clone())
+            .into_any_element()
+    }
+
     fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
         let muted = cx.theme().muted;
@@ -1053,9 +1395,7 @@ impl WFilesApp {
                         })),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.active = index;
-                    this.sync_session(cx);
-                    cx.notify();
+                    this.focus_tab(index, cx)
                 }))
         });
 
@@ -1077,6 +1417,7 @@ impl WFilesApp {
                     .on_click(cx.listener(|this, _, window, cx| this.new_tab(window, cx))),
             )
             .child(div().flex_1())
+            .child(self.render_split_buttons(cx))
             .child(
                 Button::new("open-palette")
                     .ghost()
@@ -1085,6 +1426,57 @@ impl WFilesApp {
                     .tooltip("命令面板（Cmd+P）")
                     .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
+    }
+
+    /// 分栏开关，以及分栏时才出现的同步浏览开关。
+    fn render_split_buttons(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let split = self.split.is_some();
+        let sync = self.sync;
+
+        let mut row = h_flex().gap_1().flex_shrink_0().child(
+            Button::new("toggle-split")
+                .ghost()
+                .small()
+                .icon(IconName::LayoutDashboard)
+                .tooltip(if split {
+                    "取消分栏（Cmd+Alt+D）"
+                } else {
+                    "分栏显示（Cmd+Alt+D）"
+                })
+                .selected(split)
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_split(window, cx))),
+        );
+
+        if split {
+            row = row.child(
+                Button::new("toggle-sync")
+                    .ghost()
+                    .small()
+                    .icon(IconName::RefreshCw)
+                    .tooltip(if sync {
+                        "关闭双栏同步浏览（Cmd+Alt+S）"
+                    } else {
+                        "双栏同步浏览（Cmd+Alt+S）"
+                    })
+                    .selected(sync)
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_sync(window, cx))),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// 点标签页：点的是另一栏就只挪焦点（两栏位置不动），
+    /// 否则让这个标签顶替焦点那一栏。
+    fn focus_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.split == Some(index) {
+            self.focus_partner(cx);
+            return;
+        }
+        if index < self.tabs.len() {
+            self.active = index;
+            self.sync_session(cx);
+            cx.notify();
+        }
     }
 
     fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1631,7 +2023,7 @@ impl Render for WFilesApp {
                     .flex_1()
                     .min_h_0()
                     .child(self.render_sidebar(cx))
-                    .child(self.tabs[self.active].clone()),
+                    .child(self.render_panes(cx)),
             )
             .child(self.render_status_bar(cx))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| {
@@ -1643,6 +2035,21 @@ impl Render for WFilesApp {
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)))
             .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
                 this.toggle_palette(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
+                this.toggle_split(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SwapPane, window, cx| {
+                this.focus_other(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSync, window, cx| {
+                this.toggle_sync(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyToOther, _, cx| {
+                this.transfer_to_other(false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveToOther, _, cx| {
+                this.transfer_to_other(true, cx)
             }));
 
         if has_overlay {

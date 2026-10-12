@@ -124,15 +124,52 @@ fn open_in(
     cx: &mut TestAppContext,
     dir: &Path,
 ) -> (SessionIsolation, gpui_kit::WindowHandle<Root>) {
-    let session = isolate_session();
-    Session {
-        tabs: vec![dir.to_path_buf()],
-        active: 0,
-    }
-    .save_to(&session.path().join("session.json"))
-    .expect("写测试会话");
+    open_session(
+        cx,
+        &Session {
+            tabs: vec![dir.to_path_buf()],
+            active: 0,
+            split: None,
+            focus_on_left: true,
+            sync: false,
+        },
+    )
+}
+
+/// 按给定的会话启动应用；双栏、同步这些状态只能这么带进去。
+fn open_session(
+    cx: &mut TestAppContext,
+    session: &Session,
+) -> (SessionIsolation, gpui_kit::WindowHandle<Root>) {
+    let isolation = isolate_session();
+    session
+        .save_to(&isolation.path().join("session.json"))
+        .expect("写测试会话");
     let handle = open_app(cx);
-    (session, handle)
+    (isolation, handle)
+}
+
+/// 某一栏里前几行的名字；两栏同屏时元素 id 是重复的，必须带范围查。
+fn row_names_in(window: &mut gpui_kit::Window, slot: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    {
+        let scope = window.within(("pane-slot", slot));
+        for position in 0usize..16 {
+            let Some(row) = scope.try_find(("row-name", position)) else {
+                break;
+            };
+            names.push(row.label().unwrap_or_default().to_string());
+        }
+    }
+    names
+}
+
+/// 某一栏标的是"焦点栏"还是"另一栏"。
+fn slot_label(window: &mut gpui_kit::Window, slot: usize) -> String {
+    window
+        .try_find(("pane-slot", slot))
+        .map(|row| row.label().unwrap_or_default().to_string())
+        .unwrap_or_default()
 }
 
 #[gpui_kit::test]
@@ -340,6 +377,9 @@ fn a_remembered_sort_is_applied_when_the_folder_opens(cx: &mut TestAppContext) {
     Session {
         tabs: vec![dir.path().to_path_buf()],
         active: 0,
+        sync: false,
+        focus_on_left: true,
+        split: None,
     }
     .save_to(&session.path().join("session.json"))
     .expect("写测试会话");
@@ -779,6 +819,29 @@ fn a_failed_item_can_be_retried(cx: &mut TestAppContext) {
     );
 }
 
+/// 等某一栏里出现指定名字的行。
+///
+/// 后台任务的结论要经执行器推进实体、再画帧才看得见，
+/// 所以每一轮都要 `run_until_parked` + `settle`。
+fn wait_for_row(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>, slot: usize, name: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        let found = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                row_names_in(window, slot)
+                    .iter()
+                    .any(|row| row.as_str() == name)
+            })
+            .expect("窗口还在");
+        if found || Instant::now() > deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// 等到某个元素消失（任务跑完、面板关掉之类）。
 fn wait_until_gone(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>, id: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -859,4 +922,194 @@ fn the_status_bar_drives_a_running_transfer(cx: &mut TestAppContext) {
     wait_until_gone(cx, handle, "status-detail");
 
     assert_eq!(file_count(&root.path().join("dest").join("src")), FILE_COUNT);
+}
+
+// ---- 双栏 ----
+
+#[gpui_kit::test]
+fn splitting_shows_a_second_pane(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    std::fs::write(root.path().join("a.txt"), "x").unwrap();
+    let (_session, handle) = open_in(cx, root.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find(("pane-slot", 0usize)).is_none(),
+            "默认是单栏"
+        );
+    });
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-d", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 只有一个标签时分栏会复制一份出来，两边先看同一个目录。
+        assert_eq!(row_names_in(window, 0), vec!["a.txt"]);
+        assert_eq!(row_names_in(window, 1), vec!["a.txt"]);
+        assert_eq!(slot_label(window, 0), "焦点栏");
+        assert_eq!(slot_label(window, 1), "另一栏");
+    });
+
+    // 再按一次回到单栏。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-d", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find(("pane-slot", 1usize)).is_none(),
+            "再按一次该回到单栏"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn tab_moves_the_focus_without_swapping_the_panes(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let left = root.path().join("left");
+    let right = root.path().join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![left, right],
+            active: 0,
+            split: Some(1),
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(slot_label(window, 0), "焦点栏");
+        assert_eq!(slot_label(window, 1), "另一栏");
+    });
+
+    step(cx, handle, |window, cx| {
+        window.press("tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(slot_label(window, 0), "另一栏", "焦点挪走了");
+        assert_eq!(slot_label(window, 1), "焦点栏");
+    });
+
+    // 换焦点不该让两栏的位置也换掉：右边那栏还是 right。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(row_names_in(window, 1).is_empty(), "右栏看的是空目录");
+    });
+}
+
+#[gpui_kit::test]
+fn f5_copies_the_selection_into_the_other_pane(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let left = root.path().join("left");
+    let right = root.path().join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    std::fs::write(left.join("report.txt"), "hi").unwrap();
+
+    // 拷进来的文件会让目录监听回调醒来唤醒任务，
+    // 测试调度器不允许别的线程这么干（见 [`new_ops`] 的说明）。
+    cx.background_executor.allow_parking();
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![left.clone(), right.clone()],
+            active: 0,
+            split: Some(1),
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(row_names_in(window, 0), vec!["report.txt"]);
+        assert!(row_names_in(window, 1).is_empty());
+    });
+
+    // 选中左栏那一项，F5 拷到另一栏。
+    step(cx, handle, |window, cx| {
+        window
+            .within(("pane-slot", 0usize))
+            .click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("f5", cx);
+    });
+
+    assert!(
+        wait_for_row(cx, handle, 1, "report.txt"),
+        "另一栏该刷新出拷过来的文件"
+    );
+    assert!(
+        right.join("report.txt").exists(),
+        "F5 应该把选中项拷进另一栏正在看的目录"
+    );
+    assert!(left.join("report.txt").exists(), "拷贝不动源文件");
+}
+
+#[gpui_kit::test]
+fn synced_panes_follow_each_other(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let inner = root.path().join("inner");
+    std::fs::create_dir(&inner).unwrap();
+    std::fs::write(inner.join("only.txt"), "x").unwrap();
+
+    // 两个标签都开在 root，并打开同步浏览。
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![root.path().to_path_buf(), root.path().to_path_buf()],
+            active: 0,
+            split: Some(1),
+            focus_on_left: true,
+            sync: true,
+        },
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(row_names_in(window, 0), vec!["inner"]);
+        assert_eq!(row_names_in(window, 1), vec!["inner"], "开启同步时两边一致");
+    });
+
+    // 左栏进到 inner，右栏该跟着走。
+    step(cx, handle, |window, cx| {
+        window
+            .within(("pane-slot", 0usize))
+            .click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(row_names_in(window, 0), vec!["only.txt"], "左栏进去了");
+        assert_eq!(
+            row_names_in(window, 1),
+            vec!["only.txt"],
+            "右栏该跟着进去"
+        );
+    });
+
+    // 关掉同步之后，右栏自己走自己的。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-s", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("backspace", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(row_names_in(window, 0), vec!["inner"], "左栏退回去了");
+        assert_eq!(row_names_in(window, 1), vec!["only.txt"], "右栏留在原地");
+    });
 }
