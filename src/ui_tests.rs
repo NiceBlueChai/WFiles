@@ -536,3 +536,327 @@ fn command_palette_hides_unavailable_commands(cx: &mut TestAppContext) {
         );
     });
 }
+
+// ---- 后台操作中心 ----
+
+use crate::ops_entity::Ops;
+
+/// 一个"拷起来要花点时间"的源目录。
+///
+/// 单个大文件在这台机器上一眨眼就拷完了（64 MB 不到 10 毫秒），
+/// 根本抓不到"拷到一半"这个瞬间。所以靠**数量**而不是体积来拖时间：
+/// 三千个文件就是三千次 open/write/close，稳在几百毫秒的量级。
+const FILE_COUNT: usize = 3_000;
+const FILE_SIZE: u64 = 4096;
+
+fn many_files(dir: &Path) -> u64 {
+    std::fs::create_dir_all(dir).unwrap();
+    for ix in 0..FILE_COUNT {
+        std::fs::write(dir.join(format!("f{ix}.bin")), vec![ix as u8; FILE_SIZE as usize]).unwrap();
+    }
+    FILE_COUNT as u64 * FILE_SIZE
+}
+
+fn file_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map(|entries| entries.count()).unwrap_or(0)
+}
+
+fn new_ops(cx: &mut TestAppContext) -> gpui_kit::Entity<Ops> {
+    // 后台线程会持续把进度送回来，唤醒等在 `recv()` 上的那个任务。
+    // GPUI 的测试调度器把"别的线程来唤醒"判成不确定行为并直接报错，
+    // 所以这几条测试要显式开 parking：它们验的本来就是真实的线程协作。
+    cx.background_executor.allow_parking();
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.new(|_| Ops::new())
+    })
+}
+
+/// 等后台任务把进度推上来，返回当前已拷贝的字节数。
+///
+/// 拷贝跑在真的 OS 线程上，只能给它真实时间；每轮都要
+/// `run_until_parked` —— 消息是经后台执行器送进实体的。
+/// 任务已经跑完时读到的是 0，调用方据此判断"没抓到中途"。
+fn wait_for_bytes(cx: &mut TestAppContext, ops: &gpui_kit::Entity<Ops>, at_least: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let done = cx.update(|cx| ops.read(cx).running().map_or(0, |running| running.bytes_done));
+        if done >= at_least || Instant::now() > deadline {
+            return done;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 此刻的已拷贝字节数（顺手把已就绪的消息推一次）。
+fn bytes_now(cx: &mut TestAppContext, ops: &gpui_kit::Entity<Ops>) -> u64 {
+    cx.run_until_parked();
+    cx.update(|cx| ops.read(cx).running().map_or(0, |running| running.bytes_done))
+}
+
+/// 等队列彻底排空：没在跑的，也没有排着的。
+fn wait_until_idle(cx: &mut TestAppContext, ops: &gpui_kit::Entity<Ops>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let idle = cx.update(|cx| {
+            let ops = ops.read(cx);
+            ops.running().is_none() && ops.queued() == 0
+        });
+        if idle || Instant::now() > deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn message_of(cx: &mut TestAppContext, ops: &gpui_kit::Entity<Ops>) -> String {
+    cx.update(|cx| {
+        ops.read(cx)
+            .last_message()
+            .map(str::to_string)
+            .unwrap_or_default()
+    })
+}
+
+#[gpui_kit::test]
+fn a_copy_can_be_paused_and_resumed(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let src = root.path().join("src");
+    let total = many_files(&src);
+    let dest = root.path().join("dest");
+    std::fs::create_dir(&dest).unwrap();
+
+    let ops = new_ops(cx);
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.copy(vec![src.clone()], cx)));
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.request_paste(dest.clone(), cx)));
+
+    let in_flight = wait_for_bytes(cx, &ops, 256 * 1024);
+    assert!(
+        in_flight > 0 && in_flight < total,
+        "要抓在拷贝到一半的时候暂停，实际停在 {in_flight}/{total}"
+    );
+
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.pause(cx)));
+    // 暂停是在下一个数据块边界才生效的，之前发出去的几条进度还在路上，
+    // 得先给它们落地的时间再取基准值，否则比的是"消息送达的快慢"。
+    std::thread::sleep(Duration::from_millis(80));
+    let at_pause = bytes_now(cx, &ops);
+    std::thread::sleep(Duration::from_millis(200));
+    let still = bytes_now(cx, &ops);
+    assert_eq!(still, at_pause, "暂停之后 200 毫秒不该再往前走");
+    assert!(
+        cx.update(|cx| {
+            ops.read(cx)
+                .running()
+                .is_some_and(|running| running.state == crate::ops::ControlState::Paused)
+        }),
+        "状态该标成已暂停"
+    );
+
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.resume(cx)));
+    wait_until_idle(cx, &ops);
+
+    assert_eq!(file_count(&dest.join("src")), FILE_COUNT, "恢复之后该拷完");
+    assert!(
+        message_of(cx, &ops).contains("拷贝完成 1 项"),
+        "实际是 {}",
+        message_of(cx, &ops)
+    );
+}
+
+#[gpui_kit::test]
+fn an_aborted_copy_leaves_no_truncated_file(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let src = root.path().join("src");
+    many_files(&src);
+    let dest = root.path().join("dest");
+    std::fs::create_dir(&dest).unwrap();
+
+    let ops = new_ops(cx);
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.copy(vec![src.clone()], cx)));
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.request_paste(dest.clone(), cx)));
+
+    assert!(wait_for_bytes(cx, &ops, 256 * 1024) > 0, "应该已经开工");
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.abort(cx)));
+    wait_until_idle(cx, &ops);
+
+    let copied = dest.join("src");
+    let count = file_count(&copied);
+    assert!(count < FILE_COUNT, "中止之后不该拷完，实际拷了 {count} 个");
+    // 拷了一半的那个会被删掉，留下的每一个都该是完整的。
+    for entry in std::fs::read_dir(&copied).unwrap().flatten() {
+        assert_eq!(
+            entry.metadata().unwrap().len(),
+            FILE_SIZE,
+            "{} 被截断了",
+            entry.file_name().to_string_lossy()
+        );
+    }
+    assert!(
+        message_of(cx, &ops).contains("已中止"),
+        "实际是 {}",
+        message_of(cx, &ops)
+    );
+}
+
+#[gpui_kit::test]
+fn a_second_transfer_waits_in_the_queue(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let src = root.path().join("src");
+    many_files(&src);
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+
+    let ops = new_ops(cx);
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.copy(vec![src.clone()], cx)));
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.request_paste(first.clone(), cx)));
+    assert!(wait_for_bytes(cx, &ops, 256 * 1024) > 0, "第一个该开工");
+
+    // 把第一个按住，第二个就只能排队——这是排队这条路径唯一确定的观测点。
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.pause(cx)));
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.copy(vec![src.clone()], cx)));
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.request_paste(second.clone(), cx)));
+
+    assert_eq!(cx.update(|cx| ops.read(cx).queued()), 1, "第二个该排在队里");
+    assert!(file_count(&second) == 0, "排在队里的不该提前开始拷贝");
+
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.resume(cx)));
+    wait_until_idle(cx, &ops);
+
+    assert_eq!(file_count(&first.join("src")), FILE_COUNT, "第一个");
+    assert_eq!(file_count(&second.join("src")), FILE_COUNT, "第二个");
+    assert_eq!(cx.update(|cx| ops.read(cx).queued()), 0, "队列该排空");
+}
+
+#[gpui_kit::test]
+#[cfg(unix)]
+fn a_failed_item_can_be_retried(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("临时目录");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    let file = src.join("locked.txt");
+    std::fs::write(&file, "hi").unwrap();
+    let dest = root.path().join("dest");
+    std::fs::create_dir(&dest).unwrap();
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // 以 root 跑的时候权限位挡不住读，这条就没得验了，直接跳过。
+    if std::fs::read(&file).is_ok() {
+        std::fs::remove_file(&file).ok();
+        return;
+    }
+
+    let ops = new_ops(cx);
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.copy(vec![file.clone()], cx)));
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.request_paste(dest.clone(), cx)));
+    wait_until_idle(cx, &ops);
+
+    assert!(!dest.join("locked.txt").exists());
+    assert_eq!(
+        cx.update(|cx| ops.read(cx).retry_label()),
+        Some("重试 1 项".to_string())
+    );
+
+    // 把权限放回来再重试：这一次该过。
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    cx.update(|cx| ops.update(cx, |ops, cx| ops.retry(cx)));
+    wait_until_idle(cx, &ops);
+
+    assert_eq!(
+        std::fs::read_to_string(dest.join("locked.txt")).expect("重试之后该拷过去"),
+        "hi"
+    );
+    assert_eq!(
+        cx.update(|cx| ops.read(cx).retry_label()),
+        None,
+        "成功了就不该再挂着重试按钮"
+    );
+}
+
+/// 等到某个元素消失（任务跑完、面板关掉之类）。
+fn wait_until_gone(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>, id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let gone = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                window.try_find(id.to_string()).is_none()
+            })
+            .expect("窗口还在");
+        if gone || Instant::now() > deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[gpui_kit::test]
+fn the_status_bar_drives_a_running_transfer(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let src = root.path().join("src");
+    many_files(&src);
+    std::fs::create_dir(root.path().join("dest")).unwrap();
+
+    let (_session, handle) = open_in(cx, root.path());
+    // 后台线程要持续把进度送回来，见 [`new_ops`] 里的说明。
+    cx.background_executor.allow_parking();
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 按名字排序：dest 在前，src 在后。
+        assert_eq!(row_names(window), vec!["dest", "src"]);
+    });
+
+    // 选中 src、复制，进到 dest 里粘贴。
+    step(cx, handle, |window, cx| {
+        window.click(("row-name", 1usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-c", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.click(("row-name", 0usize), cx);
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-v", cx);
+    });
+
+    assert!(
+        wait_for(cx, handle, "status-detail"),
+        "拷贝期间状态栏该显示进度"
+    );
+    assert!(wait_for(cx, handle, "stop"), "还该有中止按钮");
+
+    // 点暂停：状态栏改口，进度停住。
+    step(cx, handle, |window, cx| {
+        window.click("transport", cx);
+    });
+    let paused_text = cx
+        .update_window(handle.into(), |_, window, cx| {
+            settle(window, cx);
+            window
+                .try_find("status-detail")
+                .expect("暂停时任务还在")
+                .label()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .expect("窗口还在");
+    assert!(paused_text.contains("已暂停"), "实际是 {paused_text}");
+
+    // 点继续：跑完之后状态栏回到消息行。
+    step(cx, handle, |window, cx| {
+        window.click("transport", cx);
+    });
+    wait_until_gone(cx, handle, "status-detail");
+
+    assert_eq!(file_count(&root.path().join("dest").join("src")), FILE_COUNT);
+}

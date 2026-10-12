@@ -28,8 +28,8 @@ cargo fmt --check
 | `src/app.rs` | `WFilesApp` 应用外壳与全局状态 |
 | `src/pane.rs` | 面板系统（导航/列表 UI） |
 | `src/model.rs` | 数据模型（目录/条目/会话） |
-| `src/ops.rs` | 文件操作（复制/移动/删除/重命名） |
-| `src/ops_entity.rs` | 文件操作的 UI 枢纽：进度、冲突、撤销栈 |
+| `src/ops.rs` | 文件操作（复制/移动/删除/重命名）、字节计数与任务控制手柄 `Control` |
+| `src/ops_entity.rs` | 文件操作的 UI 枢纽：任务队列、进度与速度、冲突、撤销栈 |
 | `src/palette.rs` | 命令面板的匹配与排序（纯逻辑） |
 | `src/preview.rs` | Quick Look 内容层：类型判定、文本/二进制读取（纯逻辑） |
 | `src/thumbnails.rs` | 缩略图：后台解码 + 有上限的缓存 |

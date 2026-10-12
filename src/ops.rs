@@ -5,8 +5,12 @@
 
 use std::{
     fs,
-    io,
+    io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering::SeqCst},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -22,13 +26,83 @@ pub enum ConflictPolicy {
     Skip,
 }
 
-/// 一次操作的进度快照，界面据此画进度条。
+/// 一次操作的进度快照，界面据此画进度条、算速度和剩余时间。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Progress {
     /// 当前动作的人类可读描述，例如“正在拷贝 report.pdf”。
     pub label: String,
+    /// 已经处理完的条目数。
     pub done: usize,
+    /// 条目总数。
     pub total: usize,
+    /// 已经写过去的字节数。删除、重命名这类不按字节算的操作留 0。
+    pub bytes_done: u64,
+    /// 这次总共要搬多少字节。数不出来（没权限）就是 0，
+    /// 界面退化成只看条目数，不要拿 0 去除。
+    pub bytes_total: u64,
+}
+
+/// 一个正在跑的任务的控制手柄。
+///
+/// UI 拿一份、工作线程拿一份（两个句柄指向同一份状态），
+/// 所以"暂停"和"中止"不需要任何回调或消息往返——
+/// 工作线程在每个数据块之间自己问一次就行。
+#[derive(Clone, Default)]
+pub struct Control(Arc<AtomicU8>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlState {
+    Running,
+    Paused,
+    Aborting,
+}
+
+impl Control {
+    const RUNNING: u8 = 0;
+    const PAUSED: u8 = 1;
+    const ABORTING: u8 = 2;
+
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(Self::RUNNING)))
+    }
+
+    pub fn pause(&self) {
+        self.0.store(Self::PAUSED, SeqCst);
+    }
+
+    /// 继续。中止是不可撤销的，所以只在暂停态生效。
+    pub fn resume(&self) {
+        self.0
+            .compare_exchange(Self::PAUSED, Self::RUNNING, SeqCst, SeqCst)
+            .ok();
+    }
+
+    pub fn abort(&self) {
+        self.0.store(Self::ABORTING, SeqCst);
+    }
+
+    pub fn state(&self) -> ControlState {
+        match self.0.load(SeqCst) {
+            Self::PAUSED => ControlState::Paused,
+            Self::ABORTING => ControlState::Aborting,
+            _ => ControlState::Running,
+        }
+    }
+
+    /// 工作线程在每个数据块之间问一次：暂停时在这里等到恢复，
+    /// 要中止就返回 false。
+    ///
+    /// 睡 50 毫秒再问，不用条件变量：这个循环只在暂停期间转，
+    /// 而暂停本来就是人在等，50 毫秒的粒度绰绰有余。
+    pub fn should_continue(&self) -> bool {
+        loop {
+            match self.state() {
+                ControlState::Running => return true,
+                ControlState::Aborting => return false,
+                ControlState::Paused => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
 }
 
 /// 一次操作的结果：成功多少、跳过多少、哪些失败了。
@@ -286,18 +360,67 @@ fn cutoff_seconds(cutoff: SystemTime) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// 递归拷贝一个条目（文件或目录）到 `dest`。
-fn copy_entry(source: &Path, dest: &Path) -> io::Result<()> {
+/// 一次读写的数据块大小。
+const COPY_CHUNK: usize = 1024 * 1024;
+
+fn copy_entry(source: &Path, dest: &Path, report: &mut dyn FnMut(u64) -> bool) -> io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.is_dir() {
         fs::create_dir_all(dest)?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
-            copy_entry(&entry.path(), &dest.join(entry.file_name()))?;
+            copy_entry(&entry.path(), &dest.join(entry.file_name()), report)?;
         }
         Ok(())
     } else {
-        fs::copy(source, dest).map(|_| ())
+        copy_file(source, dest, report)
     }
+}
+
+/// 拷贝单个文件，每拷完一块上报一次字节数。
+///
+/// 不用 `fs::copy`：它没法报进度，也就没法在拷贝大文件的中途暂停或显示速度。
+/// 代价是放弃了 macOS APFS 上 clonefile 那种"瞬间复制"的优化——
+/// 一个能暂停、能显示剩余时间的操作中心比这个优化值钱：
+/// 用户暂停之后等三分钟才真的停下来，等于没有暂停。
+fn copy_file(source: &Path, target: &Path, report: &mut dyn FnMut(u64) -> bool) -> io::Result<()> {
+    // 拷到自己身上会把源文件先截断成 0 字节——`fs::copy` 内置了这个检查，
+    // 手写拷贝必须自己补上。
+    if same_file(source, target) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "源和目标在同一个文件上",
+        ));
+    }
+
+    let mut reader = fs::File::open(source)?;
+    let mut writer = fs::File::create(target)?;
+    let mut buffer = vec![0u8; COPY_CHUNK];
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        if !report(read as u64) {
+            // 只删这一个没拷完的文件，由**这一层**负责：
+            // 拷文件夹时兄弟们已经拷好了，在外面删会把整棵子树连坐删掉——
+            // 中止一个拷到 90% 的文件夹，用户至少该留着前 90%。
+            drop(writer);
+            remove_entry(target).ok();
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "已中止"));
+        }
+    }
+    writer.flush()?;
+    drop(writer);
+
+    // `fs::copy` 会带上权限位，手写拷贝必须自己补：
+    // 否则拷出来的脚本和程序会丢掉执行权限。
+    if let Ok(metadata) = fs::metadata(source) {
+        fs::set_permissions(target, metadata.permissions()).ok();
+    }
+    Ok(())
 }
 
 /// 递归删除，目录用完了才能这么干；调用方需确认过。
@@ -313,7 +436,8 @@ fn remove_entry(path: &Path) -> io::Result<()> {
 /// 把一组条目拷进 `dest_dir`。
 ///
 /// 冲突按 `policy` 统一处理（界面先问一次，不再逐项打断）。
-/// `on_progress` 每完成一项调用一次，返回 false 表示用户要求中止。
+/// `on_progress` 每完成一项、以及每拷完一个数据块都调用一次；
+/// 返回 false 表示用户要求中止（暂停由调用方在它内部等，worker 不必知道）。
 pub fn copy_entries(
     sources: &[PathBuf],
     dest_dir: &Path,
@@ -341,7 +465,10 @@ fn transfer_entries(
     on_progress: &mut dyn FnMut(&Progress) -> bool,
 ) -> Outcome {
     let total = sources.len();
+    // 总字节数在后台线程里数：这一趟本来就要遍历一遍，顺手就出来了。
+    let bytes_total = count_bytes(sources);
     let mut outcome = Outcome::default();
+    let mut bytes_done = 0u64;
 
     for (ix, source) in sources.iter().enumerate() {
         let name = source
@@ -354,9 +481,11 @@ fn transfer_entries(
             format!("正在拷贝 {name}")
         };
         if !on_progress(&Progress {
-            label,
+            label: label.clone(),
             done: ix,
             total,
+            bytes_done,
+            bytes_total,
         }) {
             outcome.skipped += total - ix;
             return outcome;
@@ -384,7 +513,23 @@ fn transfer_entries(
             continue;
         }
 
-        match transfer_one(source, &target, remove_source) {
+        // 把上报器关进一个块里：它借走了 `on_progress`，
+        // 不先还回来下一轮的进度就发不出去了。
+        let result = {
+            let mut report = |bytes: u64| {
+                bytes_done += bytes;
+                on_progress(&Progress {
+                    label: label.clone(),
+                    done: ix,
+                    total,
+                    bytes_done,
+                    bytes_total,
+                })
+            };
+            transfer_one(source, &target, remove_source, &mut report)
+        };
+
+        match result {
             Ok(()) => {
                 outcome.done += 1;
                 outcome.touched.push(target.clone());
@@ -392,7 +537,13 @@ fn transfer_entries(
                     outcome.transfers.push((source.clone(), target));
                 }
             }
-            Err(error) => outcome.failed.push((source.clone(), error.to_string())),
+            Err(TransferError::Aborted) => {
+                outcome.skipped += total - ix;
+                return outcome;
+            }
+            Err(TransferError::Failed(message)) => {
+                outcome.failed.push((source.clone(), message));
+            }
         }
     }
 
@@ -400,11 +551,27 @@ fn transfer_entries(
         label: "完成".to_string(),
         done: total,
         total,
+        bytes_done,
+        bytes_total,
     });
     outcome
 }
 
-fn transfer_one(source: &Path, target: &Path, remove_source: bool) -> Result<(), String> {
+/// 搬运单项的两种结局。
+///
+/// 分开是为了让"用户中止"不会变成一条失败记录——
+/// 操作中心会把失败项列出来让人重试，被中止的不该混进去。
+pub enum TransferError {
+    Aborted,
+    Failed(String),
+}
+
+fn transfer_one(
+    source: &Path,
+    target: &Path,
+    remove_source: bool,
+    report: &mut dyn FnMut(u64) -> bool,
+) -> Result<(), TransferError> {
     if remove_source {
         // 同卷移动一步到位；跨卷先拷贝再删源。
         if fs::rename(source, target).is_ok() {
@@ -412,10 +579,20 @@ fn transfer_one(source: &Path, target: &Path, remove_source: bool) -> Result<(),
         }
     }
 
-    copy_entry(source, target).map_err(|error| format!("拷贝失败：{error}"))?;
+    // 没拷完的那一个已经由 `copy_file` 自己删掉了，这里不能再删 `target`：
+    // 拷目录时 `target` 是整棵子树，里面有已经拷好的东西。
+    copy_entry(source, target, report).map_err(|error| {
+        if error.kind() == io::ErrorKind::Interrupted {
+            TransferError::Aborted
+        } else {
+            TransferError::Failed(format!("拷贝失败：{error}"))
+        }
+    })?;
 
     if remove_source {
-        remove_entry(source).map_err(|error| format!("已拷贝但删除源文件失败：{error}"))?;
+        remove_entry(source).map_err(|error| {
+            TransferError::Failed(format!("已拷贝但删除源文件失败：{error}"))
+        })?;
     }
     Ok(())
 }
@@ -423,6 +600,33 @@ fn transfer_one(source: &Path, target: &Path, remove_source: bool) -> Result<(),
 /// 拷贝/移动前先数一遍总条目数，让进度条从一开始就有正确的分母。
 pub fn count_entries(paths: &[PathBuf]) -> usize {
     paths.iter().map(|path| count_one(path)).sum()
+}
+
+/// 拷/移之前先数一遍总字节数：进度条、"还剩多久"都要这个分母。
+///
+/// 数不出来的（没权限、失效链接）按 0 算，界面退化成只看条目数。
+pub fn count_bytes(paths: &[PathBuf]) -> u64 {
+    paths.iter().map(|path| bytes_of(path)).sum()
+}
+
+fn bytes_of(path: &Path) -> u64 {
+    let Ok(link) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    // 目录只看链接本身：跟着链接走进一个指向父目录的链接会无限递归。
+    if link.is_dir() {
+        let Ok(read_dir) = fs::read_dir(path) else {
+            return 0;
+        };
+        return read_dir
+            .flatten()
+            .map(|entry| bytes_of(&entry.path()))
+            .sum();
+    }
+    // 文件跟着链接走：真要拷的是链接指向的内容，
+    // 链接自己那几十个字节（目标路径的长度）不是我们要搬的量。
+    // 失效链接在这里取不到元数据，按 0 算。
+    fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0)
 }
 
 fn count_one(path: &Path) -> usize {
@@ -943,22 +1147,193 @@ mod tests {
         let dest = root.path().join("dest");
         fs::create_dir(&dest).unwrap();
 
-        let mut seen = 0;
+        // 按"已经完成几项"来叫停，而不是数回调被调了几次：
+        // 回调现在每一项会来好几次（每拷完一个数据块一次），
+        // 数次数会把测试钉死在实现细节上。
         let outcome = copy_entries(
             &(0..6)
                 .map(|ix| src.join(format!("f{ix}.txt")))
                 .collect::<Vec<_>>(),
             &dest,
             ConflictPolicy::KeepBoth,
-            &mut |_| {
-                seen += 1;
-                seen < 3
-            },
+            &mut |progress| progress.done < 2,
         );
 
         assert_eq!(outcome.done, 2, "第 3 项开始前被叫停");
         assert_eq!(outcome.skipped, 4, "剩下的全部记为跳过");
         assert_eq!(fs::read_dir(&dest).unwrap().count(), 2);
+    }
+
+    // ---- 后台任务的控制手柄 ----
+
+    #[test]
+    fn control_runs_pauses_and_aborts() {
+        let control = Control::new();
+        assert_eq!(control.state(), ControlState::Running);
+        assert!(control.should_continue());
+
+        control.pause();
+        assert_eq!(control.state(), ControlState::Paused);
+
+        control.resume();
+        assert_eq!(control.state(), ControlState::Running);
+
+        control.abort();
+        assert!(!control.should_continue());
+
+        // 中止是单向的：发出去之后"继续"不该把它救回来，
+        // 否则用户点了停止，界面上还会显示正在跑。
+        control.resume();
+        assert_eq!(control.state(), ControlState::Aborting);
+    }
+
+    #[test]
+    fn control_handles_share_one_state() {
+        let ui = Control::new();
+        let worker = ui.clone();
+
+        worker.pause();
+        assert_eq!(ui.state(), ControlState::Paused, "工作线程那一份改了，UI 这边要看得见");
+
+        ui.abort();
+        assert!(!worker.should_continue());
+    }
+
+    #[test]
+    fn a_paused_worker_waits_until_it_is_resumed() {
+        let control = Control::new();
+        let worker = control.clone();
+        control.pause();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let continued = worker.should_continue();
+            tx.send(continued).expect("主线程还在等");
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "暂停期间 should_continue 该一直堵着"
+        );
+        control.resume();
+        let continued = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("恢复之后工作线程该继续");
+        assert!(continued);
+    }
+
+    // ---- 字节数 ----
+
+    #[test]
+    fn count_bytes_sums_every_file_in_a_tree() {
+        let root = temp();
+        let src = root.path().join("src");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("a.txt"), "12345").unwrap();
+        fs::write(src.join("nested/b.txt"), "1234567890").unwrap();
+
+        assert_eq!(count_bytes(std::slice::from_ref(&src)), 15);
+        assert_eq!(count_bytes(&[src.join("a.txt"), src]), 20);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn count_bytes_follows_a_link_and_forgets_a_broken_one() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp();
+        fs::write(root.path().join("real.txt"), "12345").unwrap();
+        symlink(root.path().join("real.txt"), root.path().join("link.txt")).unwrap();
+        symlink(root.path().join("nowhere"), root.path().join("gone.txt")).unwrap();
+
+        let paths = vec![root.path().join("link.txt"), root.path().join("gone.txt")];
+        // 链接算它指向的内容（5 字节），失效链接算 0。
+        assert_eq!(count_bytes(&paths), 5);
+    }
+
+    #[test]
+    fn copying_reports_the_bytes_it_has_written() {
+        let root = temp();
+        let src = root.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), "12345").unwrap();
+        fs::write(src.join("b.txt"), "1234567890").unwrap();
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let mut last = None;
+        copy_entries(
+            &[src.join("a.txt"), src.join("b.txt")],
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &mut |progress| {
+                last = Some(progress.clone());
+                true
+            },
+        );
+
+        let last = last.expect("至少汇报过一次");
+        assert_eq!(last.bytes_total, 15, "分母是总字节数");
+        assert_eq!(last.bytes_done, 15);
+        assert_eq!((last.done, last.total), (2, 2));
+    }
+
+    #[test]
+    fn aborting_halfway_through_a_file_leaves_no_partial_copy() {
+        let root = temp();
+        let src = root.path().join("src");
+        fs::create_dir(&src).unwrap();
+        // 1 MiB 一个数据块，写到第二块就叫停。
+        fs::write(src.join("big.bin"), vec![0u8; 2 * 1024 * 1024 + 1024]).unwrap();
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let outcome = copy_entries(
+            std::slice::from_ref(&src.join("big.bin")),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &mut |progress| progress.bytes_done < 2 * 1024 * 1024,
+        );
+
+        assert_eq!(outcome.done, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert!(outcome.failed.is_empty(), "中止不算失败，不该进重试列表");
+        assert!(
+            !dest.join("big.bin").exists(),
+            "中止之后不留半个文件：它被删掉了"
+        );
+    }
+
+    #[test]
+    fn aborting_inside_a_folder_keeps_what_was_already_copied() {
+        let root = temp();
+        let src = root.path().join("src");
+        fs::create_dir(&src).unwrap();
+        for ix in 0..3 {
+            fs::write(src.join(format!("f{ix}.bin")), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        }
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        // 拷到第二个文件的第一块就叫停。
+        let outcome = copy_entries(
+            std::slice::from_ref(&src),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &mut |progress| progress.bytes_done < 4 * 1024 * 1024,
+        );
+
+        assert_eq!(outcome.done, 0);
+        let copied = dest.join("src");
+        assert_eq!(
+            fs::metadata(copied.join("f0.bin")).expect("第一个该完整留着").len(),
+            3 * 1024 * 1024,
+        );
+        assert!(
+            !copied.join("f1.bin").exists(),
+            "拷了一半的那个要删掉，不留截断的文件"
+        );
+        assert!(!copied.join("f2.bin").exists());
     }
 
     #[test]

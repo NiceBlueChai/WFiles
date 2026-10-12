@@ -1,6 +1,6 @@
 //! 界面上用到的文本格式化。
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// 以 1024 进制显示字节数，只保留一位小数；不足 1 KB 时显示整数字节。
 pub fn file_size(bytes: u64) -> String {
@@ -16,6 +16,24 @@ pub fn file_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// 传输速度。直接复用 [`file_size`]，再加个 "/s"。
+pub fn speed(bytes_per_second: u64) -> String {
+    format!("{}/s", file_size(bytes_per_second))
+}
+
+/// 剩余时间。秒级精度足够，超过一小时不再细分到秒——
+/// "1 小时 23 分 07 秒" 里那个 07 秒没人会看。
+pub fn remaining(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0 => "不到 1 秒".to_string(),
+        1..=59 => format!("{seconds} 秒"),
+        60..=3_599 => format!("{} 分 {:02} 秒", seconds / 60, seconds % 60),
+        3_600..=86_399 => format!("{} 小时 {} 分", seconds / 3_600, seconds % 3_600 / 60),
+        _ => "超过 1 天".to_string(),
     }
 }
 
@@ -76,6 +94,22 @@ mod tests {
         assert_eq!(file_size(1536), "1.5 KB");
         assert_eq!(file_size(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(file_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn speeds_reuse_the_size_units() {
+        assert_eq!(speed(512), "512 B/s");
+        assert_eq!(speed(1024), "1.0 KB/s");
+        assert_eq!(speed(3 * 1024 * 1024), "3.0 MB/s");
+    }
+
+    #[test]
+    fn remaining_times_get_coarser_as_they_grow() {
+        assert_eq!(remaining(Duration::from_millis(400)), "不到 1 秒");
+        assert_eq!(remaining(Duration::from_secs(9)), "9 秒");
+        assert_eq!(remaining(Duration::from_secs(65)), "1 分 05 秒");
+        assert_eq!(remaining(Duration::from_secs(3_725)), "1 小时 2 分");
+        assert_eq!(remaining(Duration::from_secs(90_000)), "超过 1 天");
     }
 
     #[test]

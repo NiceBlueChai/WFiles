@@ -4,14 +4,15 @@
 //! 弹确认与冲突选择都在这里；完成后广播 [`OpsEvent`]，各窗格自己对照路径刷新。
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use gpui_kit::{AsyncApp, WeakEntity, *};
 
 use crate::bulk_rename::{self, BulkRename, BulkRenamePreview};
-use crate::ops::{self, ConflictPolicy, History, Outcome, Progress};
+use crate::ops::{self, ConflictPolicy, Control, ControlState, History, Outcome, Progress};
 
 /// 广播给窗格的事件：文件系统变了，该刷新的自己对照路径判断。
 #[derive(Clone, Debug)]
@@ -99,6 +100,112 @@ pub struct Running {
     pub label: String,
     pub done: usize,
     pub total: usize,
+    /// 已经搬过去的字节数。删除、重命名这类不按字节算的操作是 0。
+    pub bytes_done: u64,
+    /// 这次总共要搬多少字节；数不出来是 0，界面退化成只看条目数。
+    pub bytes_total: u64,
+    pub state: ControlState,
+    /// 只有拷贝/移动能中途停下：它们是一个数据块一个数据块写的，
+    /// 每块之间会看一眼控制手柄。删除和重命名是一口气跑完的短活，
+    /// 给了按钮点了也没反应，不如不给。
+    pub can_pause: bool,
+    started: Instant,
+    paused_at: Option<Instant>,
+    paused_total: Duration,
+}
+
+impl Running {
+    fn new(label: String, total: usize, can_pause: bool) -> Self {
+        Self {
+            label,
+            done: 0,
+            total: total.max(1),
+            bytes_done: 0,
+            bytes_total: 0,
+            state: ControlState::Running,
+            can_pause,
+            started: Instant::now(),
+            paused_at: None,
+            paused_total: Duration::ZERO,
+        }
+    }
+
+    fn mark_paused(&mut self) {
+        if self.paused_at.is_none() {
+            self.paused_at = Some(Instant::now());
+        }
+        self.state = ControlState::Paused;
+    }
+
+    fn mark_resumed(&mut self) {
+        if let Some(at) = self.paused_at.take() {
+            self.paused_total += at.elapsed();
+        }
+        self.state = ControlState::Running;
+    }
+
+    /// 真正干活的时长：暂停那一段不算。
+    /// 不扣掉的话，暂停五分钟再继续，速度会显示成几乎为零。
+    fn active(&self) -> Duration {
+        let paused_now = self.paused_at.map(|at| at.elapsed()).unwrap_or_default();
+        self.started
+            .elapsed()
+            .saturating_sub(self.paused_total)
+            .saturating_sub(paused_now)
+    }
+
+    /// 进度条的比例。有总字节数就按字节走——拷一个 2 GB 的文件时
+    /// "3/4" 这种条目进度没什么用；数不出字节才退回按条目数。
+    pub fn fraction(&self) -> f32 {
+        let ratio = if self.bytes_total > 0 {
+            self.bytes_done as f32 / self.bytes_total as f32
+        } else if self.total > 0 {
+            self.done as f32 / self.total as f32
+        } else {
+            0.
+        };
+        ratio.clamp(0., 1.)
+    }
+
+    /// 每秒字节数。开头半秒不报：那会儿除出来的数抖动得没法看。
+    pub fn bytes_per_second(&self) -> Option<u64> {
+        let elapsed = self.active();
+        if elapsed < Duration::from_millis(400) || self.bytes_done == 0 {
+            return None;
+        }
+        let rate = self.bytes_done as f64 / elapsed.as_secs_f64();
+        if !rate.is_finite() {
+            return None;
+        }
+        Some(rate as u64)
+    }
+
+    /// 还剩多久。速度还没出来、或者总字节数未知，就算不出来。
+    pub fn remaining(&self) -> Option<Duration> {
+        let rate = self.bytes_per_second()?;
+        let left = self.bytes_total.checked_sub(self.bytes_done)?;
+        if rate == 0 || left == 0 {
+            return Some(Duration::ZERO);
+        }
+        Some(Duration::from_secs_f64(left as f64 / rate as f64))
+    }
+}
+
+/// 排队等待的任务。
+struct Job {
+    label: String,
+    total: usize,
+    can_pause: bool,
+    /// 真正干活的闭包：领走一个控制手柄和一条回传通道。
+    run: Box<dyn FnOnce(Control, async_channel::Sender<WorkerMessage>) + Send>,
+}
+
+/// 上一次搬运里没成功的项，供"重试"用。
+struct Retry {
+    sources: Vec<PathBuf>,
+    dest: PathBuf,
+    cut: bool,
+    policy: ConflictPolicy,
 }
 
 /// 后台线程送回的消息。
@@ -111,7 +218,16 @@ enum JobResult {
     /// 移进回收站的结果。
     Trashed(Vec<(PathBuf, SystemTime)>),
     /// 拷贝/移动的结果。
-    Transferred { outcome: Outcome, cut: bool },
+    Transferred {
+        outcome: Outcome,
+        cut: bool,
+        /// 用户中途叫停。中止不算失败，也不进重试列表。
+        aborted: bool,
+        /// 重试要用的原始参数：目标目录、是不是剪切、冲突策略，
+        /// 源用失败项自己那一份（成功的不用重来）。
+        dest: PathBuf,
+        policy: ConflictPolicy,
+    },
     /// 批量重命名的结果。
     BulkRenamed {
         renamed: Vec<(PathBuf, PathBuf)>,
@@ -123,6 +239,13 @@ pub struct Ops {
     clipboard: Clipboard,
     history: History,
     running: Option<Running>,
+    /// 当前任务的控制手柄；队列里等着的还没有。
+    control: Option<Control>,
+    /// 排队等着的后续任务。文件操作一次只跑一个，
+    /// 免得两个拷贝抢同一块磁盘、也免得进度条打架。
+    queue: VecDeque<Job>,
+    /// 上一次搬运里失败的项，有它才显示"重试"。
+    retry: Option<Retry>,
     confirm: Option<Confirm>,
     conflict: Option<Conflict>,
     prompt: Option<Prompt>,
@@ -139,6 +262,9 @@ impl Ops {
             clipboard: Clipboard::default(),
             history: History::default(),
             running: None,
+            control: None,
+            queue: VecDeque::new(),
+            retry: None,
             confirm: None,
             conflict: None,
             prompt: None,
@@ -156,6 +282,64 @@ impl Ops {
 
     pub fn running(&self) -> Option<&Running> {
         self.running.as_ref()
+    }
+
+    /// 后面还排着几个任务。
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// “重试”按钮的文案；没有失败项时返回 None。
+    pub fn retry_label(&self) -> Option<String> {
+        let retry = self.retry.as_ref()?;
+        Some(format!("重试 {} 项", retry.sources.len()))
+    }
+
+    // ---- 任务控制：暂停 / 继续 / 中止 / 重试 ----
+
+    /// 暂停。工作线程会在下一个数据块边界停下，
+    /// 所以界面上标成"已暂停"会比实际停下的时刻早一点点——
+    /// 一个数据块是 1 MiB，这个误差看不出来。
+    pub fn pause(&mut self, cx: &mut Context<Self>) {
+        if let Some(control) = self.control.as_ref() {
+            control.pause();
+        }
+        if let Some(running) = self.running.as_mut() {
+            running.mark_paused();
+        }
+        cx.notify();
+    }
+
+    pub fn resume(&mut self, cx: &mut Context<Self>) {
+        if let Some(control) = self.control.as_ref() {
+            control.resume();
+        }
+        if let Some(running) = self.running.as_mut() {
+            running.mark_resumed();
+        }
+        cx.notify();
+    }
+
+    /// 中止。已经拷过去的项留着，正在拷的那一个会被删掉（不留半成品）。
+    pub fn abort(&mut self, cx: &mut Context<Self>) {
+        if let Some(control) = self.control.as_ref() {
+            control.abort();
+        }
+        if let Some(running) = self.running.as_mut() {
+            running.state = ControlState::Aborting;
+        }
+        self.last_message = Some("正在中止…".to_string());
+        self.last_message_is_error = false;
+        cx.notify();
+    }
+
+    /// 重跑上次失败的那些项。
+    pub fn retry(&mut self, cx: &mut Context<Self>) {
+        let Some(retry) = self.retry.take() else {
+            return;
+        };
+        cx.notify();
+        self.start_transfer(retry.sources, retry.dest, retry.cut, retry.policy, cx);
     }
 
     pub fn confirm(&self) -> Option<&Confirm> {
@@ -341,17 +525,20 @@ impl Ops {
 
         self.bulk = None;
         cx.emit(OpsEvent::BulkChanged { open: false });
-        self.spawn_job(
-            format!("正在批量重命名 {count} 项"),
-            count,
-            cx,
-            move |tx| {
-                let (renamed, failed) = bulk_rename::apply(&bulk.previews);
-                let _ = tx.try_send(WorkerMessage::Done(JobResult::BulkRenamed {
-                    renamed,
-                    failed,
-                }));
+        self.enqueue(
+            Job {
+                label: format!("正在批量重命名 {count} 项"),
+                total: count,
+                can_pause: false,
+                run: Box::new(move |_control, tx| {
+                    let (renamed, failed) = bulk_rename::apply(&bulk.previews);
+                    let _ = tx.try_send(WorkerMessage::Done(JobResult::BulkRenamed {
+                        renamed,
+                        failed,
+                    }));
+                }),
             },
+            cx,
         );
     }
 
@@ -547,45 +734,98 @@ impl Ops {
         } else {
             format!("正在拷贝 {} 项", sources.len())
         };
+        let retry_dest = dest.clone();
 
-        self.spawn_job(label, total, cx, move |tx| {
-            let outcome = if cut {
-                ops::move_entries(&sources, &dest, policy, &mut |progress| {
-                    tx.try_send(WorkerMessage::Progress(progress.clone())).is_ok()
-                })
-            } else {
-                ops::copy_entries(&sources, &dest, policy, &mut |progress| {
-                    tx.try_send(WorkerMessage::Progress(progress.clone())).is_ok()
-                })
-            };
-            let _ = tx.try_send(WorkerMessage::Done(JobResult::Transferred { outcome, cut }));
-        });
+        self.enqueue(
+            Job {
+                label,
+                total,
+                can_pause: true,
+                run: Box::new(move |control, tx| {
+                    // 每来一次进度都先看一眼手柄：暂停就在这里等到恢复，
+                    // 中止就返回 false，拷贝随即停在当前数据块的边界。
+                    let mut report = |progress: &Progress| {
+                        if !control.should_continue() {
+                            return false;
+                        }
+                        tx.try_send(WorkerMessage::Progress(progress.clone()))
+                            .is_ok()
+                    };
+                    let outcome = if cut {
+                        ops::move_entries(&sources, &dest, policy, &mut report)
+                    } else {
+                        ops::copy_entries(&sources, &dest, policy, &mut report)
+                    };
+                    let aborted = control.state() == ControlState::Aborting;
+                    let _ = tx.try_send(WorkerMessage::Done(JobResult::Transferred {
+                        outcome,
+                        cut,
+                        aborted,
+                        dest: retry_dest,
+                        policy,
+                    }));
+                }),
+            },
+            cx,
+        );
     }
 
     fn start_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let total = paths.len();
-        self.spawn_job(format!("正在移到回收站 {total} 项"), total, cx, move |tx| {
-            let trashed = ops::trash(&paths);
-            let _ = tx.try_send(WorkerMessage::Done(JobResult::Trashed(trashed)));
-        });
+        self.enqueue(
+            Job {
+                label: format!("正在移到回收站 {total} 项"),
+                total,
+                can_pause: false,
+                run: Box::new(move |_control, tx| {
+                    let trashed = ops::trash(&paths);
+                    let _ = tx.try_send(WorkerMessage::Done(JobResult::Trashed(trashed)));
+                }),
+            },
+            cx,
+        );
     }
 
-    /// 起一个后台任务：`worker` 在普通线程里跑，进度和结论经 channel 回到 UI。
-    fn spawn_job<F>(&mut self, label: String, total: usize, cx: &mut Context<Self>, worker: F)
-    where
-        F: FnOnce(async_channel::Sender<WorkerMessage>) + Send + 'static,
-    {
-        let (tx, rx) = async_channel::bounded(16);
-        self.running = Some(Running {
+    /// 排一个后台任务。一次只跑一个，先来先跑。
+    fn enqueue(&mut self, job: Job, cx: &mut Context<Self>) {
+        self.queue.push_back(job);
+        self.pump_queue(cx);
+    }
+
+    /// 没有任务在跑就把队首那个放出去。
+    fn pump_queue(&mut self, cx: &mut Context<Self>) {
+        if self.running.is_some() {
+            return;
+        }
+        let Some(job) = self.queue.pop_front() else {
+            return;
+        };
+        self.start_job(job, cx);
+    }
+
+    /// 真的起一个后台任务：`job.run` 在普通线程里跑，
+    /// 进度和结论经 channel 回到 UI。
+    fn start_job(&mut self, job: Job, cx: &mut Context<Self>) {
+        let Job {
             label,
-            done: 0,
-            total: total.max(1),
-        });
+            total,
+            can_pause,
+            run,
+        } = job;
+
+        let control = Control::new();
+        self.control = Some(control.clone());
+        self.running = Some(Running::new(label, total, can_pause));
         self.last_message = None;
         cx.notify();
 
+        // 无界通道：进度是按数据块来的，一个 1 GB 的文件有一千条。
+        // 用有界通道的话，UI 稍微慢一点 `try_send` 就会失败，
+        // 而"发送失败"在回调里的含义是"用户要中止"——那会莫名其妙断掉拷贝。
+        let (tx, rx) = async_channel::unbounded();
+
         // 真正干活的线程：同步 fs 操作 + 进度回调。
-        std::thread::spawn(move || worker(tx));
+        std::thread::spawn(move || run(control, tx));
 
         // UI 侧消费：进度与结论。
         // async move 前缀形式 + 克隆 AsyncApp：future 持有所有权，跨 await 安全。
@@ -605,12 +845,22 @@ impl Ops {
                 if let Some(running) = self.running.as_mut() {
                     running.done = progress.done.min(running.total);
                     running.label = progress.label;
+                    running.bytes_done = progress.bytes_done;
+                    running.bytes_total = progress.bytes_total;
                 }
                 cx.notify();
             }
             WorkerMessage::Done(result) => {
-                self.running = None;
-                match result {
+                self.finish_job(result, cx);
+            }
+        }
+    }
+
+    /// 收尾当前任务，然后把队列里的下一个放出去。
+    fn finish_job(&mut self, result: JobResult, cx: &mut Context<Self>) {
+        self.running = None;
+        self.control = None;
+        match result {
                     JobResult::Trashed(trashed) => {
                         if trashed.is_empty() {
                             self.last_message = Some("没有项目能移进回收站".to_string());
@@ -665,7 +915,29 @@ impl Ops {
                             renamed_to: renamed,
                         });
                     }
-                    JobResult::Transferred { outcome, cut } => {
+                    JobResult::Transferred {
+                        outcome,
+                        cut,
+                        aborted,
+                        dest,
+                        policy,
+                    } => {
+                        // 失败项留着让人重试；被中止的不算失败，重试列表里不该出现。
+                        self.retry = if outcome.failed.is_empty() {
+                            None
+                        } else {
+                            Some(Retry {
+                                sources: outcome
+                                    .failed
+                                    .iter()
+                                    .map(|(path, _)| path.clone())
+                                    .collect(),
+                                dest,
+                                cut,
+                                policy,
+                            })
+                        };
+
                         let removed = if cut {
                             outcome
                                 .transfers
@@ -705,7 +977,7 @@ impl Ops {
                             cx.emit(OpsEvent::ClipboardChanged);
                         }
 
-                        self.last_message = Some(summarize(&outcome, cut));
+                        self.last_message = Some(summarize(&outcome, cut, aborted));
                         self.last_message_is_error = !outcome.failed.is_empty();
                         cx.emit(OpsEvent::Changed {
                             removed,
@@ -713,17 +985,22 @@ impl Ops {
                             renamed_to,
                         });
                     }
-                }
-                cx.notify();
-            }
         }
+        cx.notify();
+
+        // 这个跑完了，队列里排着的下一个该上了。
+        self.pump_queue(cx);
     }
 }
 
-fn summarize(outcome: &Outcome, cut: bool) -> String {
+fn summarize(outcome: &Outcome, cut: bool, aborted: bool) -> String {
     let verb = if cut { "移动" } else { "拷贝" };
-    let mut text = format!("{verb}完成 {} 项", outcome.done);
-    if outcome.skipped > 0 {
+    let mut text = if aborted {
+        format!("已中止：{verb}完成 {} 项", outcome.done)
+    } else {
+        format!("{verb}完成 {} 项", outcome.done)
+    };
+    if outcome.skipped > 0 && !aborted {
         text.push_str(&format!("，跳过 {} 项", outcome.skipped));
     }
     if !outcome.failed.is_empty() {
@@ -742,4 +1019,81 @@ fn display_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    // 不能用 `use super::*`：那一层 glob 了 `gpui_kit::*`，
+    // 里面有个 `test` 会把 `#[test]` 属性挤掉（递归展开报错）。
+    use super::Running;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    #[test]
+    fn the_bar_follows_bytes_when_they_are_known() {
+        let mut running = Running::new("拷贝".to_string(), 4, true);
+        running.bytes_total = 100;
+        running.bytes_done = 25;
+        assert!((running.fraction() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_bar_falls_back_to_items_when_bytes_are_unknown() {
+        // 删除、重命名这类没有字节量的操作只能看条目数。
+        let mut running = Running::new("删除".to_string(), 4, false);
+        running.done = 1;
+        assert!((running.fraction() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_rate_waits_half_a_second_before_it_speaks() {
+        let mut running = Running::new("拷贝".to_string(), 1, true);
+        running.bytes_total = 10_000;
+        running.bytes_done = 1_000;
+
+        assert!(
+            running.bytes_per_second().is_none(),
+            "刚起步那一下除出来的数抖得没法看，先别报"
+        );
+        sleep(Duration::from_millis(450));
+        assert!(running.bytes_per_second().expect("半秒之后该报速度") > 0);
+    }
+
+    #[test]
+    fn paused_time_does_not_count_against_the_rate() {
+        let mut running = Running::new("拷贝".to_string(), 1, true);
+        running.bytes_total = 10_000;
+        running.bytes_done = 1_000;
+        sleep(Duration::from_millis(450));
+        let before = running.bytes_per_second().expect("速度");
+
+        running.mark_paused();
+        sleep(Duration::from_millis(300));
+        running.mark_resumed();
+
+        let after = running.bytes_per_second().expect("恢复之后还得有速度");
+        // 暂停那 300 毫秒被扣掉了：不扣的话速度会掉到六成。
+        assert!(
+            after * 10 > before * 6,
+            "暂停前 {before} B/s，恢复后 {after} B/s"
+        );
+    }
+
+    #[test]
+    fn remaining_needs_both_a_rate_and_a_total() {
+        let mut running = Running::new("拷贝".to_string(), 1, true);
+        assert!(
+            running.remaining().is_none(),
+            "总字节数都不知道，算不出还剩多久"
+        );
+
+        running.bytes_total = 10_000;
+        running.bytes_done = 500;
+        sleep(Duration::from_millis(450));
+        assert!(running.remaining().expect("该算出剩余时间") > Duration::ZERO);
+
+        // 拷完了就没有剩余。
+        running.bytes_done = 10_000;
+        assert_eq!(running.remaining(), Some(Duration::ZERO));
+    }
 }

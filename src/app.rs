@@ -17,7 +17,8 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::bulk_rename::BulkRename;
-use crate::ops::ConflictPolicy;
+use crate::format;
+use crate::ops::{ConflictPolicy, ControlState};
 use crate::ops_entity::{Ops, OpsEvent, PendingAction};
 use crate::palette::{self, Command as PaletteCommand};
 use crate::pane::{Pane, PaneCommand, PaneEvent};
@@ -1090,29 +1091,66 @@ impl WFilesApp {
         let muted = cx.theme().muted_foreground;
         let error_color = cx.theme().danger;
 
-        let content: AnyElement = if let Some(running) = self.ops.read(cx).running() {
-            let ratio = if running.total == 0 {
-                0.
-            } else {
-                (running.done as f32 / running.total as f32).clamp(0., 1.)
-            };
+        let content: AnyElement = if let Some(running) = self.ops.read(cx).running().cloned() {
+            let ratio = running.fraction();
+            let paused = running.state == ControlState::Paused;
+
+            let mut detail = h_flex()
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .child(div().truncate().child(running.label.clone()))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .child(format!("{}/{}", running.done, running.total)),
+                );
+
+            // 同一份内容攒一份纯文本：读屏要它，测试也要它
+            // （`label()` 读的是 aria label，读不到那一串子 div）。
+            let mut text = format!("{} {}/{}", running.label, running.done, running.total);
+
+            // 字节数、速度、剩余时间：只有真的在按字节搬东西时才报，
+            // 删除和重命名没有这些量，硬凑一个 "0 B/s" 出来是噪音。
+            if running.bytes_total > 0 {
+                let bytes = format!(
+                    "{} / {}",
+                    format::file_size(running.bytes_done),
+                    format::file_size(running.bytes_total)
+                );
+                detail = detail.child(div().flex_shrink_0().child(bytes.clone()));
+                text.push_str(&format!(" {bytes}"));
+
+                if let Some(rate) = running.bytes_per_second() {
+                    let rate = format::speed(rate);
+                    detail = detail.child(div().flex_shrink_0().child(rate.clone()));
+                    text.push_str(&format!(" {rate}"));
+                }
+                // 暂停时不显示剩余时间：那会儿速度不再增长，
+                // "还剩 3 分 20 秒" 会一直挂着不动，看着像坏了。
+                if !paused && let Some(left) = running.remaining() {
+                    let left = format!("还剩 {}", format::remaining(left));
+                    detail = detail.child(div().flex_shrink_0().child(left.clone()));
+                    text.push_str(&format!(" {left}"));
+                }
+            }
+            if paused {
+                detail = detail.child(div().flex_shrink_0().child("已暂停"));
+                text.push_str(" 已暂停");
+            }
+            let queued = self.ops.read(cx).queued();
+            if queued > 0 {
+                let waiting = format!("还有 {queued} 个任务");
+                detail = detail.child(div().flex_shrink_0().child(waiting.clone()));
+                text.push_str(&format!(" {waiting}"));
+            }
+
             v_flex()
                 .flex_1()
                 .min_w_0()
                 .gap_1()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(div().truncate().child(running.label.clone()))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .child(format!("{}/{}", running.done, running.total)),
-                        ),
-                )
+                .child(detail.id("status-detail").test_support().aria_label(text))
                 .child(
                     div()
                         .h(px(4.))
@@ -1145,6 +1183,68 @@ impl WFilesApp {
             div().flex_1().into_any_element()
         };
 
+        // 暂停/继续与中止：只在能停下来的任务上出现。
+        // 删除和重命名是一口气跑完的，给按钮点了也没反应。
+        let transport: AnyElement = if self
+            .ops
+            .read(cx)
+            .running()
+            .is_some_and(|running| running.can_pause)
+        {
+            let paused = self
+                .ops
+                .read(cx)
+                .running()
+                .is_some_and(|running| running.state == ControlState::Paused);
+            h_flex()
+                .gap_1()
+                .flex_shrink_0()
+                .child(
+                    Button::new("transport")
+                        .ghost()
+                        .small()
+                        .icon(if paused { IconName::Play } else { IconName::Pause })
+                        .tooltip(if paused { "继续" } else { "暂停" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ops.update(cx, |ops, cx| {
+                                if paused {
+                                    ops.resume(cx)
+                                } else {
+                                    ops.pause(cx)
+                                }
+                            })
+                        })),
+                )
+                .child(
+                    Button::new("stop")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Square)
+                        .tooltip("中止")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.ops.update(cx, |ops, cx| ops.abort(cx))
+                        })),
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        // 重试：上一趟有没成功的项才出现。跑着的时候不摆出来——
+        // 那时候位置让给暂停/中止。
+        let retry: AnyElement = match self.ops.read(cx).retry_label() {
+            Some(label) if self.ops.read(cx).running().is_none() => Button::new("retry")
+                .ghost()
+                .small()
+                .icon(IconName::RotateCw)
+                .tooltip(label)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.ops.update(cx, |ops, cx| ops.retry(cx))
+                }))
+                .into_any_element(),
+            _ => div().into_any_element(),
+        };
+
         let undo_label = self.ops.read(cx).undo_label();
         let has_undo = undo_label.is_some();
         let undo_button = Button::new("undo")
@@ -1172,6 +1272,8 @@ impl WFilesApp {
             .border_color(cx.theme().border)
             .items_center()
             .child(content)
+            .child(transport)
+            .child(retry)
             .child(undo_button)
     }
 
