@@ -2404,6 +2404,96 @@ fn choosing_a_hit_jumps_to_its_folder_and_selects_it(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_search_can_be_saved_run_again_and_forgotten(cx: &mut TestAppContext) {
+    let dir = searchable_dir();
+    let (session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-shift-f", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("*.rs", cx);
+    });
+    wait_for_results(cx, handle, "main.rs");
+
+    // 存为… → 起个名字 → 回车。
+    step(cx, handle, |window, cx| {
+        window.click("search-save", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("search-naming").is_some(),
+            "点存为该出现起名字那一行"
+        );
+        window.input("找源码", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("saved-search-0").is_some(),
+            "存下来之后该有一枚小签"
+        );
+    });
+
+    let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置该落盘");
+    assert_eq!(saved.saved_searches.len(), 1);
+    assert_eq!(saved.saved_searches[0].name, "找源码");
+    assert_eq!(saved.saved_searches[0].query, "*.rs");
+
+    // 把查询改坏，再点小签：查询该被填回来、结果该重新出现。
+    step(cx, handle, |window, cx| {
+        window.input("zzz", cx);
+    });
+    wait_for_status(cx, handle, "找到 0 个");
+    step(cx, handle, |window, cx| {
+        window.click("saved-search-0", cx);
+    });
+    let listed = wait_for_results(cx, handle, "main.rs");
+    assert!(listed.contains("main.rs"), "点小签该把查询填回来：{listed}");
+
+    // 存下来的搜索也能从命令面板里直接跑。
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("找源码", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("saved:找源码").is_some(),
+            "命令面板里该能搜到存下来的搜索"
+        );
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("search").is_some(), "回车该打开搜索面板");
+    });
+
+    // 最后把它忘掉。
+    step(cx, handle, |window, cx| {
+        window.click("forget-search-0", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("saved-search-0").is_none(),
+            "忘掉之后小签该消失"
+        );
+    });
+    let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置该落盘");
+    assert!(saved.saved_searches.is_empty(), "设置里也该没了");
+}
+
+#[gpui_kit::test]
 fn marking_a_file_sticks_and_the_mark_can_be_searched_for(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("note.txt"), "hello\n").unwrap();

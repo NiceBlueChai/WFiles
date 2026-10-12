@@ -90,6 +90,8 @@ enum PaletteAction {
     NewTab,
     CloseTab,
     NextTab,
+    /// 跑一条存下来的搜索：打开搜索面板并把那句查询填进去。
+    SavedSearch(String),
 }
 
 /// 命令面板的当前状态。候选项在打开时快照，
@@ -970,6 +972,15 @@ impl WFilesApp {
                 Settings::update(cx, |settings| settings.terminal = id.clone());
             }
             PaletteAction::ToggleTerminal => self.toggle_terminal(window, cx),
+            PaletteAction::SavedSearch(name) => {
+                let Some(saved) = Settings::read(cx).saved_search(&name).cloned() else {
+                    // 存过又被删掉了：命令面板是打开时快照的，这一条已经过期。
+                    return;
+                };
+                self.tabs[self.active].update(cx, |pane, cx| {
+                    pane.run_saved_search(&saved, window, cx)
+                });
+            }
             PaletteAction::NewTab => self.new_tab(window, cx),
             PaletteAction::CloseTab => self.close_tab(self.active, window, cx),
             PaletteAction::NextTab => self.next_tab(cx),
@@ -1024,6 +1035,19 @@ impl WFilesApp {
                     keywords,
                 ),
                 action: PaletteAction::Pane(command),
+            });
+        }
+
+        for saved in Settings::read(cx).saved_searches.iter() {
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("saved:{}", saved.name),
+                    saved.name.clone(),
+                    saved.query.clone(),
+                    "保存的搜索",
+                    format!("saved 保存的搜索 智能文件夹 {}", saved.query),
+                ),
+                action: PaletteAction::SavedSearch(saved.name.clone()),
             });
         }
 

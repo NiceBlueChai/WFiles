@@ -70,6 +70,11 @@ pub struct SearchPanel {
     task: Option<Task<()>>,
     /// 只看根目录这一层（不进子目录）。
     shallow: bool,
+    /// 正在给这一趟搜索起名字（存下来的那一行显示出来了）。
+    naming: bool,
+    /// 下一帧要把焦点给名字输入框。见 [`Self::render`]。
+    focus_name: bool,
+    name_input: Entity<InputState>,
     /// 输入框的订阅得一直攥在手里：`Subscription` 一丢，订阅就断了。
     /// 这个字段因此只写不读——它就是为了让订阅活到面板销毁那一刻。
     #[allow(dead_code)]
@@ -85,6 +90,14 @@ impl SearchPanel {
         let input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("找文件：name: ext: type: size: date: content:")
         });
+        let name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("给这个搜索起个名字"));
+        let name_subscription =
+            cx.subscribe_in(&name_input, window, |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.save_current(window, cx);
+                }
+            });
         let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
                 this.schedule(cx);
@@ -104,11 +117,44 @@ impl SearchPanel {
             cancel: None,
             task: None,
             shallow: false,
-            subscriptions: vec![subscription],
+            naming: false,
+            focus_name: false,
+            name_input,
+            subscriptions: vec![subscription, name_subscription],
             generation: 0,
             scroll: VirtualListScrollHandle::new(),
             row_sizes: Rc::new(Vec::new()),
         }
+    }
+
+    /// 把输入框换成这句查询并立刻开搜。存下来的搜索点一下走这里。
+    pub fn set_query(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_value(text, window, cx));
+        self.shallow = false;
+        self.schedule(cx);
+    }
+
+    /// 给当前这趟搜索起个名字存下来。
+    fn save_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.name_input.read(cx).value().trim().to_string();
+        let query = self.input.read(cx).value().trim().to_string();
+        if name.is_empty() || query.is_empty() {
+            return;
+        }
+        crate::settings::Settings::update(cx, |settings| {
+            settings.save_search(name, query, self.root.clone());
+        });
+        self.naming = false;
+        self.name_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// 忘掉一条存下来的搜索。
+    fn forget(&mut self, name: String, cx: &mut Context<Self>) {
+        crate::settings::Settings::update(cx, |settings| settings.forget_search(&name));
+        cx.notify();
     }
 
     /// 输入框的焦点柄。
@@ -356,7 +402,13 @@ impl SearchPanel {
 impl EventEmitter<SearchEvent> for SearchPanel {}
 
 impl Render for SearchPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 点了"存为…"就把焦点交给名字输入框，用户接着敲名字、回车存下。
+        if self.focus_name {
+            self.focus_name = false;
+            let handle = self.name_input.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
         let radius = cx.theme().radius;
@@ -405,6 +457,63 @@ impl Render for SearchPanel {
         };
 
         let root_label = self.root.display().to_string();
+        let saved = crate::settings::Settings::read(cx).saved_searches.clone();
+
+        // 存下来的搜索：一排小签，点一下就把查询填回输入框。
+        // 之所以不做成"智能文件夹"（一个装着结果的假目录）：
+        // 结果是活的，随时会变，假目录还得跟着刷新、还得拦住拖放和新建，
+        // 而这里点一下就能看到同样一份结果，代价小得多。
+        let saved_row = (!saved.is_empty()).then(|| {
+            h_flex()
+                .id("saved-searches")
+                .test_support()
+                .flex_wrap()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(border)
+                .children(saved.iter().enumerate().map(|(index, item)| {
+                    let name = item.name.clone();
+                    let query = item.query.clone();
+                    h_flex()
+                        .id(format!("saved-search-{index}"))
+                        .test_support()
+                        .aria_label(format!("{name}：{query}"))
+                        .gap_1()
+                        .items_center()
+                        .px_2()
+                        .py_1()
+                        .rounded(radius)
+                        .border_1()
+                        .border_color(border)
+                        .cursor_pointer()
+                        .child(div().text_xs().child(name.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .max_w(px(160.))
+                                .truncate()
+                                .child(query.clone()),
+                        )
+                        .child(
+                            Button::new(format!("forget-search-{index}"))
+                                .icon(IconName::Close)
+                                .xsmall()
+                                .ghost()
+                                .tooltip("忘掉这个搜索")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    // 别让这一下冒到签上：那会变成"填回查询"。
+                                    cx.stop_propagation();
+                                    this.forget(name.clone(), cx);
+                                })),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_query(&query, window, cx)
+                        }))
+                }))
+        });
 
         div()
             .id("search")
@@ -418,7 +527,7 @@ impl Render for SearchPanel {
             .bg(cx.theme().overlay)
             // 键盘走遮罩自己的 `on_key_down`（冒泡阶段），不依赖快捷键表——
             // 输入框里的 ↑↓ 也要能挪光标，而 Enter 不该去打开别的东西。
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // 面板开着的时候键盘归它：不放这一道闸，Cmd+C 会一边在输入框里
                 // 复制文字、一边让窗格把选中文件拷进剪贴板。
                 // 唯一放行的是开关面板那个键——按它等于收起面板。
@@ -448,6 +557,8 @@ impl Render for SearchPanel {
                 match key {
                     "up" => this.move_cursor(-1, cx),
                     "down" => this.move_cursor(1, cx),
+                    // 正在起名字的时候 Enter 是"存下"，不是"跳到那个文件"。
+                    "enter" if this.naming => this.save_current(window, cx),
                     "enter" => this.reveal_cursor(cx),
                     "escape" => cx.emit(SearchEvent::Close),
                     _ => {}
@@ -527,9 +638,54 @@ impl Render for SearchPanel {
                                         this.shallow = !this.shallow;
                                         this.schedule(cx);
                                     })),
+                            )
+                            .child(
+                                Button::new("search-save")
+                                    .label("存为…")
+                                    .small()
+                                    .ghost()
+                                    .tooltip("把这句查询存下来，起个名字")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.naming = true;
+                                        // 焦点等下一帧再给：按钮自己在点击之后
+                                        // 会把焦点收回去，当场给会被它盖掉。
+                                        this.focus_name = true;
+                                        cx.notify();
+                                    })),
                             ),
                     )
+                    // `Option<T>` 本身就是一个 0/1 个元素的迭代器，
+                    // 所以"要不要这一行"直接交给 `children`。
+                    .children(self.naming.then(|| {
+                            h_flex()
+                                .id("search-naming")
+                                .test_support()
+                                .px_3()
+                                .py_2()
+                                .gap_2()
+                                .items_center()
+                                .child(Input::new(&self.name_input).w(px(220.)))
+                                .child(
+                                    Button::new("search-save-confirm")
+                                        .label("存下")
+                                        .small()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.save_current(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("search-save-cancel")
+                                        .label("取消")
+                                        .small()
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.naming = false;
+                                            cx.notify();
+                                        })),
+                                )
+                    }))
                     .child(body)
+                    .children(saved_row)
                     .child(
                         h_flex()
                             .h(px(30.))

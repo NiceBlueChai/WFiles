@@ -40,6 +40,21 @@ pub struct Settings {
     /// 打在文件与文件夹上的标签和颜色。
     #[serde(default)]
     pub marks: crate::marks::Marks,
+    /// 存下来的搜索：起了名字的查询，点一下就能再跑一遍。
+    #[serde(default)]
+    pub saved_searches: Vec<SavedSearch>,
+}
+
+/// 一个存下来的搜索。
+///
+/// 连"从哪个目录找起"一起存：同一个 `*.rs` 在 `~/work` 和 `~/photos`
+/// 底下是两个完全不同的搜索，只存查询词会把它们混成一个。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSearch {
+    pub name: String,
+    /// 查询原文（`Query::parse` 能再解析一遍的那种）。
+    pub query: String,
+    pub root: PathBuf,
 }
 
 /// 一个目录记住的视图设置。
@@ -108,6 +123,7 @@ impl Default for Settings {
             layout: None,
             keys: crate::keymap::KeyMap::default(),
             marks: crate::marks::Marks::default(),
+            saved_searches: Vec::new(),
         }
     }
 }
@@ -162,6 +178,35 @@ impl Settings {
             self.folder_views.pop();
         }
         self.folder_views.insert(0, FolderView { path, sort, view });
+    }
+
+    /// 按名字找一条存下来的搜索。
+    pub fn saved_search(&self, name: &str) -> Option<&SavedSearch> {
+        self.saved_searches.iter().find(|it| it.name == name)
+    }
+
+    /// 存一条搜索。同名就覆盖——用户改了查询又存一次，多半是想换掉旧的。
+    ///
+    /// 名字是空的就不存：一条没有名字的保存搜索在界面上没法点。
+    pub fn save_search(&mut self, name: String, query: String, root: PathBuf) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let saved = SavedSearch { name, query, root };
+        match self
+            .saved_searches
+            .iter()
+            .position(|it| it.name == saved.name)
+        {
+            Some(position) => self.saved_searches[position] = saved,
+            None => self.saved_searches.push(saved),
+        }
+    }
+
+    /// 忘掉一条存下来的搜索。
+    pub fn forget_search(&mut self, name: &str) {
+        self.saved_searches.retain(|it| it.name != name);
     }
 
     pub fn file_path() -> Option<PathBuf> {
@@ -221,6 +266,52 @@ mod tests {
     /// 这个目录记住的排序；视图模式单独断言。
     fn sort_for(stored: &Settings, path: &Path) -> Option<Sort> {
         stored.view_for(path).map(|view| view.sort)
+    }
+
+    #[test]
+    fn a_saved_search_comes_back_with_its_root() {
+        let mut stored = Settings::default();
+        let root = PathBuf::from("/Users/me/Projects");
+        stored.save_search("找图".to_string(), "*.png".to_string(), root.clone());
+
+        let saved = stored.saved_search("找图").expect("该存下来了");
+        assert_eq!(saved.query, "*.png");
+        assert_eq!(saved.root, root);
+
+        // 整份设置走一遍磁盘也不该丢。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        stored.save_to(&path).unwrap();
+        let back = Settings::load_from(&path).expect("读回来");
+        assert_eq!(back.saved_searches, stored.saved_searches);
+    }
+
+    #[test]
+    fn saving_the_same_name_replaces_the_old_one() {
+        let mut stored = Settings::default();
+        let root = PathBuf::from("/tmp");
+        stored.save_search("找图".to_string(), "*.png".to_string(), root.clone());
+        stored.save_search("找图".to_string(), "size:>1M".to_string(), root.clone());
+
+        assert_eq!(stored.saved_searches.len(), 1, "同名不该存两条");
+        assert_eq!(stored.saved_search("找图").expect("还在").query, "size:>1M");
+    }
+
+    #[test]
+    fn a_nameless_search_is_not_saved() {
+        let mut stored = Settings::default();
+        stored.save_search("   ".to_string(), "*.rs".to_string(), PathBuf::from("/tmp"));
+        assert!(stored.saved_searches.is_empty(), "没名字就没法在界面上点它");
+    }
+
+    #[test]
+    fn a_saved_search_can_be_forgotten() {
+        let mut stored = Settings::default();
+        stored.save_search("找图".to_string(), "*.png".to_string(), PathBuf::from("/tmp"));
+        stored.save_search("找码".to_string(), "*.rs".to_string(), PathBuf::from("/tmp"));
+        stored.forget_search("找图");
+        assert_eq!(stored.saved_searches.len(), 1);
+        assert_eq!(stored.saved_search("找图"), None);
     }
 
     #[test]

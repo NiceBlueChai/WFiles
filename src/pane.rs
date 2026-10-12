@@ -1246,6 +1246,25 @@ impl Pane {
         self.close_marks(window, cx);
     }
 
+    /// 跑一条存下来的搜索：先去它记的那个目录，再开面板把查询填进去。
+    pub fn run_saved_search(
+        &mut self,
+        saved: &crate::settings::SavedSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.listing.path() != saved.root {
+            self.navigate_to(saved.root.clone(), true, window, cx);
+        }
+        if self.search.is_none() {
+            self.toggle_search(window, cx);
+        }
+        let Some(panel) = self.search.clone() else {
+            return;
+        };
+        panel.update(cx, |panel, cx| panel.set_query(&saved.query, window, cx));
+    }
+
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.take().is_some() {
             // 面板一关，后台那趟搜索也该停：丢掉实体，`Cancel` 随之 drop。
