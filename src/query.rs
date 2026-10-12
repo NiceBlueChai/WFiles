@@ -10,11 +10,12 @@
 //! - `-词` 或 `NOT 词`：排除。
 //! - `OR`：或。`a OR b` 只要有一个。
 //! - 通配符 `*` `?`：名字/路径/扩展名里都能用（`*.rs`）。
-//! - 字段：`name:` `path:` `ext:` `type:` `size:` `date:` `content:` `re:`
+//! - 字段：`name:` `path:` `ext:` `type:` `size:` `date:` `content:` `tag:` `color:` `re:`
 //!   - `size:>2M`、`size:<100K`（单位是 1024 进制）
 //!   - `date:>7d`（最近七天）、`date:<2026-01-01`
 //!   - `type:dir|file|image|video|audio|text|archive|code`
 //!   - `content:待找的词`：读文件内容找
+//!   - `tag:工作`、`color:red`：按打的标签与标的颜色找
 //!   - `re:^\d+$`：名字走正则
 
 use regex::Regex;
@@ -23,7 +24,7 @@ use std::time::{Duration, SystemTime};
 
 /// 一次匹配要用的文件信息。搜索器负责把它填出来，匹配器只读。
 #[derive(Clone, Copy, Debug)]
-pub struct Record<'a> {
+    pub struct Record<'a> {
     /// 文件名（原文）。
     pub name: &'a str,
     /// 完整路径（原文）。
@@ -33,6 +34,10 @@ pub struct Record<'a> {
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// 标的颜色名（[`crate::marks::COLORS`] 里的那种）；没标就是 `None`。
+    pub color: Option<&'a str>,
+    /// 打的标签。没有就是空切片。
+    pub tags: &'a [String],
 }
 
 /// 比较符。
@@ -101,6 +106,10 @@ enum Term {
     Date(Cmp, Moment),
     /// 文件内容里要有这个词（已小写）。
     Content(String),
+    /// 打了这个标签（已小写）。
+    Tag(String),
+    /// 标了这个颜色。
+    Color(String),
     Not(Box<Term>),
     And(Vec<Term>),
     Or(Vec<Term>),
@@ -254,6 +263,12 @@ fn matches(term: &Term, context: &Context) -> bool {
             }
         },
         Term::Content(needle) => context.content.is_some_and(|text| text.contains(needle)),
+        Term::Tag(tag) => context
+            .record
+            .tags
+            .iter()
+            .any(|it| it.to_lowercase() == *tag),
+        Term::Color(color) => context.record.color == Some(color.as_str()),
         Term::Not(inner) => !matches(inner, context),
         Term::And(list) => list.iter().all(|term| matches(term, context)),
         Term::Or(list) => list.iter().any(|term| matches(term, context)),
@@ -434,6 +449,19 @@ impl<'a> Parser<'a> {
                     return Err("content: 后面要写要找的词".to_string());
                 }
                 Ok(Term::Content(bare))
+            }
+            "tag" => {
+                if bare.is_empty() {
+                    return Err("tag: 后面要写标签".to_string());
+                }
+                Ok(Term::Tag(bare))
+            }
+            "color" => {
+                if !crate::marks::is_color(&bare) {
+                    let names: Vec<&str> = crate::marks::COLORS.iter().map(|(id, _)| *id).collect();
+                    return Err(format!("颜色只认 {}，不是“{bare}”", names.join("/")));
+                }
+                Ok(Term::Color(bare))
             }
             "type" | "t" => Ok(Term::Kind(match bare.as_str() {
                 "dir" | "folder" | "目录" => "dir",
@@ -673,6 +701,8 @@ mod tests {
             is_dir: false,
             size: 1024,
             modified: Some(SystemTime::UNIX_EPOCH),
+            color: None,
+            tags: &[],
         }
     }
 
@@ -684,10 +714,13 @@ mod tests {
             is_dir: true,
             size: 4096,
             modified: Some(SystemTime::UNIX_EPOCH),
+            color: None,
+            tags: &[],
         }
     }
 
-    fn hits(query: &str, record: &Record<'static>) -> bool {
+
+    fn hits(query: &str, record: &Record<'_>) -> bool {
         Query::parse(query)
             .unwrap_or_else(|error| panic!("{query} 解析失败：{error}"))
             .matches_at(record, SystemTime::UNIX_EPOCH, None)
@@ -748,7 +781,32 @@ mod tests {
             is_dir: false,
             size: 1,
             modified: None,
+            color: None,
+            tags: &[],
         }));
+    }
+
+    #[test]
+    fn marks_narrow_things_down() {
+        let tags = vec!["工作".to_string(), "重要".to_string()];
+        let red = Record {
+            color: Some("red"),
+            tags: &tags,
+            ..file("a.txt")
+        };
+        assert!(hits("color:red", &red));
+        assert!(!hits("color:blue", &red));
+        assert!(hits("tag:工作", &red));
+        assert!(hits("tag:重要", &red));
+        assert!(!hits("tag:待办", &red));
+        assert!(hits("color:red tag:工作", &red));
+        assert!(!hits("color:blue tag:工作", &red));
+    }
+
+    #[test]
+    fn an_unknown_color_is_reported() {
+        let error = Query::parse("color:pink").unwrap_err();
+        assert!(error.contains("red"), "错误里该列出认得的颜色：{error}");
     }
 
     #[test]
@@ -772,6 +830,8 @@ mod tests {
             is_dir: false,
             size: 2 * 1024 * 1024,
             modified: None,
+            color: None,
+            tags: &[],
         };
         assert!(hits("size:>1M", &two_megs));
         assert!(hits("size:>=2M", &two_megs));
@@ -791,6 +851,8 @@ mod tests {
             is_dir: false,
             size: 1,
             modified: Some(now - Duration::from_secs(2 * 86_400)),
+            color: None,
+            tags: &[],
         };
         let old = Record {
             modified: Some(now - Duration::from_secs(90 * 86_400)),
@@ -814,6 +876,8 @@ mod tests {
             is_dir: false,
             size: 1,
             modified: None,
+            color: None,
+            tags: &[],
         };
         assert!(!hits("date:>1970-01-01", &record));
     }

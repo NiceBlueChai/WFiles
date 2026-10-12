@@ -9,6 +9,7 @@
 //!   而且它们会先占满内存。
 //! - 内容搜索只读"看起来像文本"的文件，且单个不超过 [`MAX_CONTENT_BYTES`]。
 
+use crate::marks::Marks;
 use crate::query::{Query, Record};
 use std::collections::VecDeque;
 use std::fs;
@@ -122,6 +123,9 @@ pub struct Search {
     /// 最多往下走几层子目录；`None` 是不限，`Some(0)` 是"就根目录这一层"。
     pub max_depth: Option<usize>,
     pub limit: usize,
+    /// 打的标签与标的颜色。查询里出现 `tag:` / `color:` 时才用得上，
+    /// 但一律带上更省事：不用先去问查询"你要不要"。
+    pub marks: Marks,
 }
 
 impl Search {
@@ -131,7 +135,14 @@ impl Search {
             query,
             max_depth: None,
             limit: MAX_RESULTS,
+            marks: Marks::default(),
         }
+    }
+
+    /// 带上标签与颜色。
+    pub fn with_marks(mut self, marks: Marks) -> Self {
+        self.marks = marks;
+        self
     }
 
     /// 只往下走 `depth` 层子目录。`0` 是"就这一层，别往里钻"。
@@ -220,6 +231,8 @@ impl Search {
                     is_dir,
                     size,
                     modified,
+                    color: self.marks.color_of(&path),
+                    tags: self.marks.tags_of(&path),
                     text: text.as_ref(),
                 };
                 if let Some(hit) = self.consider(&item, now, &needles) {
@@ -249,6 +262,8 @@ impl Search {
             is_dir: item.is_dir,
             size: item.size,
             modified: item.modified,
+            color: item.color,
+            tags: item.tags,
         };
         let text = item.text;
         if !self
@@ -277,6 +292,8 @@ struct Item<'a> {
     is_dir: bool,
     size: u64,
     modified: Option<SystemTime>,
+    color: Option<&'a str>,
+    tags: &'a [String],
     text: Option<&'a Text>,
 }
 
@@ -579,6 +596,32 @@ mod tests {
         let loops: Vec<_> = hits.iter().filter(|hit| hit.name == "loop").collect();
         assert!(loops.is_empty(), "不该跟着链接走进去：{loops:?}");
         assert_eq!(names(&hits).len(), 2, "实际：{:?}", names(&hits));
+    }
+
+    #[test]
+    fn marks_are_matched_too() {
+        let root = tree();
+        let mut marks = Marks::default();
+        marks.set_color(&root.path().join("notes.txt"), Some("red".to_string()));
+        marks.set_tags(&root.path().join("src/main.rs"), vec!["工作".to_string()]);
+
+        let search = Search::new(
+            root.path().to_path_buf(),
+            Query::parse("color:red").expect("解析"),
+        )
+        .with_marks(marks.clone());
+        let mut hits = Vec::new();
+        search.walk(&AtomicBool::new(false), &mut |hit| hits.push(hit));
+        assert_eq!(names(&hits), vec!["notes.txt".to_string()]);
+
+        let search = Search::new(
+            root.path().to_path_buf(),
+            Query::parse("tag:工作").expect("解析"),
+        )
+        .with_marks(marks);
+        let mut hits = Vec::new();
+        search.walk(&AtomicBool::new(false), &mut |hit| hits.push(hit));
+        assert_eq!(names(&hits), vec!["main.rs".to_string()]);
     }
 
     #[test]

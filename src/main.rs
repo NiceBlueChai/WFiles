@@ -5,6 +5,7 @@ mod clipboard;
 mod drag;
 mod format;
 mod keymap;
+mod marks;
 mod model;
 mod ops;
 mod ops_entity;

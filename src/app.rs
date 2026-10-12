@@ -1004,6 +1004,7 @@ impl WFilesApp {
             PaneCommand::OpenTerminal,
             PaneCommand::QuickLook,
             PaneCommand::Search,
+            PaneCommand::Mark,
             PaneCommand::ViewArchive,
             PaneCommand::CreateArchive,
             PaneCommand::ViewList,
@@ -1230,6 +1231,8 @@ impl WFilesApp {
             // 光标得正指着一个 zip 才谈得上"看里面"；打包则要求有选中项。
             PaneCommand::ViewArchive => pane.archive_enabled(),
             PaneCommand::CreateArchive => selected >= 1,
+            // 标记是对一个文件做的事，多选时说不清该标谁。
+            PaneCommand::Mark => selected == 1,
             _ => true,
         }
     }
@@ -1287,6 +1290,12 @@ impl WFilesApp {
                 "Cmd+Shift+F",
                 "文件",
                 "search 搜索 查找 find 内容 content grep",
+            ),
+            PaneCommand::Mark => (
+                "加标签 / 标颜色",
+                "Cmd+Alt+M",
+                "文件",
+                "mark 标记 标签 颜色 tag color 色标",
             ),
             PaneCommand::ViewArchive => {
                 ("查看压缩包内容", "", "文件", "zip 压缩包 archive 解压 unzip 浏览")

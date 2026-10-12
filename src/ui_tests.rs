@@ -2404,6 +2404,106 @@ fn choosing_a_hit_jumps_to_its_folder_and_selects_it(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn marking_a_file_sticks_and_the_mark_can_be_searched_for(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.txt"), "hello\n").unwrap();
+    let (session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-m", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("marks").is_some(),
+            "Cmd+Alt+M 应该打开标记面板"
+        );
+        window.click("mark-color-red", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("工作 重要", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("marks").is_none(), "回车该收起面板");
+    });
+
+    // 落了盘才算真的记住：重启之后还得在。
+    let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置该落盘");
+    let mark = saved
+        .marks
+        .get(&dir.path().join("note.txt"))
+        .expect("该有记号");
+    assert_eq!(mark.color.as_deref(), Some("red"));
+    assert_eq!(mark.tags, ["工作", "重要"]);
+
+    // 标过的东西要能搜出来。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-shift-f", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("color:red", cx);
+    });
+    let listed = wait_for_results(cx, handle, "note.txt");
+    assert!(listed.contains("note.txt"), "标成红色的该能被搜到：{listed}");
+
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+    });
+
+    // 再开一次面板把标记清掉。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-m", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("mark-clear", cx);
+    });
+    let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置该落盘");
+    assert!(
+        saved.marks.get(&dir.path().join("note.txt")).is_none(),
+        "清除之后不该留着记号：{:?}",
+        saved.marks
+    );
+}
+
+#[gpui_kit::test]
+fn the_mark_panel_is_reachable_from_the_command_palette(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.txt"), "x").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("标记", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("pane:Mark").is_some(),
+            "命令面板里该能搜到标记"
+        );
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("marks").is_some(), "回车应该打开面板");
+    });
+}
+
+#[gpui_kit::test]
 fn the_search_panel_is_reachable_from_the_command_palette(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (_session, handle) = open_in(cx, dir.path());

@@ -37,6 +37,9 @@ pub struct Settings {
     /// 用户改过的快捷键。没改过的命令不在这里，走出厂按键。
     #[serde(default)]
     pub keys: crate::keymap::KeyMap,
+    /// 打在文件与文件夹上的标签和颜色。
+    #[serde(default)]
+    pub marks: crate::marks::Marks,
 }
 
 /// 一个目录记住的视图设置。
@@ -104,6 +107,7 @@ impl Default for Settings {
             folder_views: Vec::new(),
             layout: None,
             keys: crate::keymap::KeyMap::default(),
+            marks: crate::marks::Marks::default(),
         }
     }
 }
@@ -113,7 +117,12 @@ impl Settings {
     ///
     /// 读不出来就用默认值——设置损坏不该挡住启动。
     pub fn install(cx: &mut impl gpui_kit::BorrowAppContext) {
-        let settings = Self::load();
+        let mut settings = Self::load();
+        // 删掉的文件不该在配置里一直占着位：启动时顺手清一次，
+        // 真清掉了东西才写盘（平白写一次会把 mtime 也改了）。
+        if settings.marks.drop_missing() {
+            let _ = settings.save();
+        }
         cx.set_global(settings);
     }
 

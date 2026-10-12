@@ -179,7 +179,10 @@ impl SearchPanel {
 
         let generation = self.generation;
         let (tx, rx) = async_channel::unbounded::<search::Event>();
-        let mut search = Search::new(self.root.clone(), query).with_limit(PANEL_LIMIT);
+        let mut search = Search::new(self.root.clone(), query)
+            .with_limit(PANEL_LIMIT)
+            // 打过的标签与标过的颜色也要能搜（`tag:` / `color:`）。
+            .with_marks(crate::settings::Settings::read(cx).marks.clone());
         if self.shallow {
             search = search.with_depth(0);
         }

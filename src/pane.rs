@@ -30,6 +30,7 @@ use crate::clipboard;
 use crate::drag::{self, DraggedPaths};
 use crate::format;
 use crate::keymap;
+use crate::marks;
 use crate::model::{Listing, Selection, Sort, SortKey, ViewMode};
 use crate::ops_entity::{Ops, OpsEvent};
 use crate::preview::{self, Preview};
@@ -101,6 +102,7 @@ gpui_kit::actions!(
         OpenTerminal,
         QuickLook,
         Search,
+        Mark,
         ViewList,
         ViewGrid,
         ViewColumns,
@@ -167,6 +169,7 @@ fn key_binding_for(
         PaneCommand::OpenTerminal => KeyBinding::new(key, OpenTerminal, context),
         PaneCommand::QuickLook => KeyBinding::new(key, QuickLook, context),
         PaneCommand::Search => KeyBinding::new(key, Search, context),
+        PaneCommand::Mark => KeyBinding::new(key, Mark, context),
         PaneCommand::ViewList => KeyBinding::new(key, ViewList, context),
         PaneCommand::ViewGrid => KeyBinding::new(key, ViewGrid, context),
         PaneCommand::ViewColumns => KeyBinding::new(key, ViewColumns, context),
@@ -205,6 +208,8 @@ pub enum PaneCommand {
     QuickLook,
     /// 在当前目录下搜：连子目录、连文件内容一起找。
     Search,
+    /// 给选中的那一项标个颜色、打个标签。
+    Mark,
     /// 看看这个压缩包里有什么。
     ViewArchive,
     /// 把选中的东西打成一个 zip。
@@ -219,7 +224,7 @@ pub enum PaneCommand {
 
 impl PaneCommand {
     /// 全部命令。配置层与命令面板都靠它枚举，加一条命令只改这一处。
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::NewFolder,
         Self::Rename,
         Self::BulkRename,
@@ -235,6 +240,7 @@ impl PaneCommand {
         Self::OpenTerminal,
         Self::QuickLook,
         Self::Search,
+        Self::Mark,
         Self::ViewArchive,
         Self::CreateArchive,
         Self::ViewList,
@@ -263,6 +269,7 @@ impl PaneCommand {
             Self::OpenTerminal => "open_terminal",
             Self::QuickLook => "quick_look",
             Self::Search => "search",
+            Self::Mark => "mark",
             Self::ViewArchive => "view_archive",
             Self::CreateArchive => "create_archive",
             Self::ViewList => "view_list",
@@ -294,6 +301,7 @@ impl PaneCommand {
             Self::OpenTerminal => "terminal 终端 shell 快捷键 按键 keybinding",
             Self::QuickLook => "preview 预览 查看 快捷键 按键 keybinding",
             Self::Search => "search 搜索 查找 find 内容 content 快捷键 按键 keybinding",
+            Self::Mark => "mark 标记 标签 颜色 tag color 快捷键 按键 keybinding",
             Self::ViewArchive => "zip 压缩包 解压 快捷键 按键 keybinding",
             Self::CreateArchive => "zip 压缩包 打包 快捷键 按键 keybinding",
             Self::ViewList => "view list 列表 快捷键 按键 keybinding",
@@ -358,6 +366,14 @@ struct ArchiveState {
     entries: Vec<archive::Entry>,
     /// 读不出来时把原因摆在面板里，而不是弹一个对话框打断操作。
     error: Option<String>,
+}
+
+/// 正在给哪个文件做标记：路径、显示名、标签输入框。
+#[derive(Clone)]
+struct MarkState {
+    path: PathBuf,
+    name: String,
+    input: Entity<InputState>,
 }
 
 /// 一次"弹簧文件夹"预约：鼠标停在哪个文件夹上、这一票是第几号。
@@ -455,6 +471,8 @@ pub struct Pane {
     /// 正在后台打包/解压时把任务握在手里（丢掉即放弃），
     /// 顺带让按钮知道自己该灰着。
     archive_busy: Option<Task<()>>,
+    /// 正在给哪个文件做标记（颜色与标签）；`None` 就是没在标。
+    marking: Option<MarkState>,
     /// 正在给哪条命令录新按键；`None` 就是没在录。
     capturing: Option<PaneCommand>,
     /// 录按键浮层的焦点；录的时候焦点必须在这上面才收得到键。
@@ -502,6 +520,7 @@ impl Pane {
             watch_task: None,
             quick_look: None,
             search: None,
+            marking: None,
             archive_view: None,
             archive_busy: None,
             capturing: None,
@@ -1138,12 +1157,224 @@ impl Pane {
         cx.notify();
     }
 
+    /// 有没有浮层压在窗格上。有浮层时窗格的命令一律不执行
+    /// （见 [`Self::run_command`]），键盘也归浮层。
+    fn overlay_open(&self) -> bool {
+        self.search.is_some() || self.marking.is_some()
+    }
+
+    /// 打开标记浮层：给选中的那一项标色、打标签。再按一次就收起。
+    fn toggle_marks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selection.single().map(PathBuf::from) else {
+            return;
+        };
+        if self.marking.as_ref().is_some_and(|it| it.path == path) {
+            self.close_marks(window, cx);
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let current = Settings::read(cx).marks.get(&path).cloned().unwrap_or_default();
+        let joined = current.tags.join(" ");
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("标签，空格分开"));
+        input.update(cx, |input, cx| input.set_value(&joined, window, cx));
+        // Enter 由输入框自己吃掉（它把按键拦下了，冒泡收不到），
+        // 所以这里订阅它的 PressEnter；Esc 走浮层的 `on_key_down`。
+        self.subscriptions.push(cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.save_marks(window, cx);
+                }
+            },
+        ));
+        // 输入框是这一帧才挂上去的，焦点要等挂好再给（见搜索面板那边的说明）。
+        let focus = input.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.marking = Some(MarkState { path, name, input });
+        cx.notify();
+    }
+
+    fn close_marks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.marking.take().is_some() {
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// 点了一个色块：立刻落盘，浮层不关——还要接着打标签。
+    ///
+    /// 再点同一个色块就是"把这个颜色去掉"。
+    fn set_mark_color(&mut self, color: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.marking.as_ref() else {
+            return;
+        };
+        let path = state.path.clone();
+        let chosen = Settings::read(cx).marks.color_of(&path) == Some(color);
+        Settings::update(cx, |settings| {
+            settings
+                .marks
+                .set_color(&path, (!chosen).then(|| color.to_string()));
+        });
+        // 点色块会把焦点带走，点完还回输入框：用户还要接着打标签。
+        let focus = state.input.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// 存下标签并收起浮层。
+    fn save_marks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.marking.as_ref() else {
+            return;
+        };
+        let path = state.path.clone();
+        let tags = marks::parse_tags(&state.input.read(cx).value().to_string());
+        Settings::update(cx, |settings| settings.marks.set_tags(&path, tags));
+        self.close_marks(window, cx);
+    }
+
+    /// 颜色标签一起去掉。
+    fn clear_marks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.marking.as_ref() else {
+            return;
+        };
+        let path = state.path.clone();
+        Settings::update(cx, |settings| settings.marks.clear(&path));
+        self.close_marks(window, cx);
+    }
+
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.take().is_some() {
             // 面板一关，后台那趟搜索也该停：丢掉实体，`Cancel` 随之 drop。
             self.focus.focus(window, cx);
             cx.notify();
         }
+    }
+
+    /// 标记浮层：一排色块 + 一个标签输入框。
+    fn render_marks(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(state) = self.marking.clone() else {
+            return div().into_any_element();
+        };
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let foreground = cx.theme().foreground;
+        let current = Settings::read(cx)
+            .marks
+            .get(&state.path)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut card = v_flex()
+            .id("marks-card")
+            .test_support()
+            .w(px(420.))
+            .gap_3()
+            .p_5()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(border)
+            .bg(cx.theme().background)
+            .child(div().font_semibold().truncate().child(state.name.clone()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("点一下标色，再点一下去掉"),
+            )
+            .child(
+                h_flex().gap_2().children(
+                    marks::COLORS
+                        .iter()
+                        .map(|(id, label)| {
+                            let chosen = current.color.as_deref() == Some(*id);
+                            div()
+                                .id(format!("mark-color-{id}"))
+                                .test_support()
+                                .aria_label((*label).to_string())
+                                .w(px(26.))
+                                .h(px(26.))
+                                .rounded_full()
+                                .cursor_pointer()
+                                .bg(rgb(marks::color_hex(id)))
+                                .border_2()
+                                .border_color(if chosen { foreground } else { border })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_mark_color(id, window, cx)
+                                }))
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .child(Input::new(&state.input).w_full())
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("mark-clear")
+                            .label("清除标记")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.clear_marks(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("mark-save")
+                            .label("完成")
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_marks(window, cx)
+                            })),
+                    ),
+            );
+        let used = Settings::read(cx).marks.all_tags();
+        if !used.is_empty() {
+            card = card.child(
+                div()
+                    .id("mark-used-tags")
+                    .test_support()
+                    .aria_label(used.join(" "))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!("用过的标签：{}", used.join(" "))),
+            );
+        }
+
+        div()
+            .id("marks")
+            .test_support()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(cx.theme().overlay)
+            .on_click(cx.listener(|this, _, window, cx| this.close_marks(window, cx)))
+            // 只吃 Esc 与 Enter：其余的键要放给输入框，
+            // `stop_propagation` 连字符一起吞掉就打不进字了（见搜索面板）。
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        cx.stop_propagation();
+                        this.close_marks(window, cx);
+                    }
+                    "enter" => {
+                        cx.stop_propagation();
+                        this.save_marks(window, cx);
+                    }
+                    _ => {}
+                }
+            }))
+            .child(
+                card.on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .into_any_element(),
+            )
+            .into_any_element()
     }
 
     /// 搜索结果里点了一个：切到它所在的目录并把它选中。
@@ -1288,10 +1519,11 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 搜索面板开着的时候窗格被遮住了，命令不该在看不见的地方生效：
-        // 那样在输入框里按 Cmd+C 会一边复制文字、一边把选中文件塞进剪贴板。
-        // 唯一例外是搜索自己——按它等于收起面板。
-        if self.search.is_some() && !matches!(command, PaneCommand::Search) {
+        // 浮层（搜索面板、标记面板）开着的时候窗格被遮住了，
+        // 命令不该在看不见的地方生效：那样在输入框里按 Cmd+C
+        // 会一边复制文字、一边把选中文件塞进剪贴板。
+        // 唯一例外是开关自己的那条——按它等于收起浮层。
+        if self.overlay_open() && !matches!(command, PaneCommand::Search | PaneCommand::Mark) {
             return;
         }
         match command {
@@ -1310,6 +1542,7 @@ impl Pane {
             PaneCommand::OpenTerminal => self.open_terminal(cx),
             PaneCommand::QuickLook => self.toggle_quick_look(cx),
             PaneCommand::Search => self.toggle_search(window, cx),
+            PaneCommand::Mark => self.toggle_marks(window, cx),
             PaneCommand::ViewArchive => self.toggle_archive(cx),
             PaneCommand::CreateArchive => self.create_archive(cx),
             PaneCommand::ViewList => self.set_view(ViewMode::List, cx),
@@ -1805,6 +2038,20 @@ impl Pane {
                                 .size_4()
                                 .into_any_element(),
                             }),
+                    )
+                    .when_some(
+                        Settings::read(cx).marks.color_of(&path).map(marks::color_hex),
+                        |this, hex| {
+                            // 标了色的文件在名字前面带一个色点。
+                            this.child(
+                                div()
+                                    .w(px(8.))
+                                    .h(px(8.))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(rgb(hex)),
+                            )
+                        },
                     )
                     .child(div().flex_1().min_w_0().truncate().child(name))
                     .child(
@@ -2637,6 +2884,9 @@ impl Pane {
             .on_action(cx.listener(|this, _: &Search, window, cx| {
                 this.run_command(PaneCommand::Search, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &Mark, window, cx| {
+                this.run_command(PaneCommand::Mark, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ViewList, window, cx| {
                 this.run_command(PaneCommand::ViewList, window, cx)
             }))
@@ -2709,6 +2959,10 @@ impl Pane {
                     cx,
                 ))
                 .child(detail_row("修改", format::modified(entry.modified), cx))
+                .when_some(
+                    mark_text(Settings::read(cx).marks.get(entry.path.as_path())),
+                    |this, text| this.child(detail_row("标记", text, cx)),
+                )
                 .child(detail_row("位置", entry.path.display().to_string(), cx))
                 .into_any_element(),
             None if self.selection.len() > 1 => {
@@ -2863,6 +3117,7 @@ impl Pane {
             PaneCommand::OpenTerminal => "打开终端",
             PaneCommand::QuickLook => "快速查看",
             PaneCommand::Search => "搜索当前目录",
+            PaneCommand::Mark => "加标签 / 标颜色",
             PaneCommand::ViewArchive => "查看压缩包",
             PaneCommand::CreateArchive => "打包成 Zip",
             PaneCommand::ViewList => "列表视图",
@@ -3400,6 +3655,9 @@ impl Render for Pane {
         if self.capturing.is_some() {
             root = root.child(self.render_key_capture(cx));
         }
+        if self.marking.is_some() {
+            root = root.child(self.render_marks(cx));
+        }
         // 搜索面板压在最上面：它自己带遮罩，且要盖住另外几个浮层。
         if let Some(panel) = self.search.clone() {
             root = root.child(panel.into_any_element());
@@ -3415,6 +3673,20 @@ fn sort_label(sort: Sort) -> &'static str {
         SortKey::Modified => "修改时间",
         SortKey::Kind => "类型",
     }
+}
+
+/// 详情面板里"标记"那一行：颜色加标签，两样都没有就不显示。
+fn mark_text(mark: Option<&crate::marks::Mark>) -> Option<String> {
+    let mark = mark?;
+    if mark.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(color) = &mark.color {
+        parts.push(marks::color_label(color).to_string());
+    }
+    parts.extend(mark.tags.iter().cloned());
+    Some(parts.join(" · "))
 }
 
 fn detail_row(label: &str, value: String, cx: &App) -> impl IntoElement {
