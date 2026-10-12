@@ -34,6 +34,7 @@ use crate::drag::{self, DraggedPaths};
 use crate::format;
 use crate::keymap;
 use crate::marks;
+use crate::meta::{Metadata, MetadataEvent};
 use crate::model::{Listing, Selection, Sort, SortKey, ViewMode};
 use crate::ops_entity::{Ops, OpsEvent};
 use crate::preview::{self, Preview};
@@ -45,6 +46,8 @@ use crate::watch;
 
 const ROW_HEIGHT: f32 = 40.;
 const COL_SIZE: f32 = 100.;
+/// 元数据列：六种（Git 状态 / 图片尺寸 / …）共用这一个位置，宽度也就一个。
+const COL_META: f32 = 120.;
 const COL_MODIFIED: f32 = 130.;
 const COL_KIND: f32 = 90.;
 
@@ -428,6 +431,8 @@ pub struct Pane {
     ops: Entity<Ops>,
     /// 缩略图缓存由应用持有、所有标签共用：同一个文件不用每个标签各解一遍。
     thumbs: Entity<Thumbnails>,
+    /// 元数据列的缓存与后台探测。
+    meta: Entity<Metadata>,
     listing: Listing,
     selection: Selection,
     back: Vec<PathBuf>,
@@ -497,6 +502,7 @@ impl Pane {
         path: PathBuf,
         ops: Entity<Ops>,
         thumbs: Entity<Thumbnails>,
+        meta: Entity<Metadata>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -509,6 +515,7 @@ impl Pane {
         let mut pane = Self {
             ops,
             thumbs,
+            meta,
             listing,
             selection: Selection::default(),
             back: Vec::new(),
@@ -567,6 +574,27 @@ impl Pane {
                     || this.quick_look.as_ref().is_some_and(|look| look.path == *path);
                 if visible {
                     cx.notify();
+                }
+            },
+        ));
+
+        // 元数据是后台探出来的：值回来了/仓库状态回来了，重画一次就能看到。
+        pane.subscriptions.push(cx.subscribe_in(
+            &pane.meta,
+            window,
+            |this, _, event: &MetadataEvent, _, cx| match event {
+                MetadataEvent::Ready(path) => {
+                    // 只在这个文件还看得见的时候才重画。
+                    if this.listing.entry(path).is_some() {
+                        cx.notify();
+                    }
+                }
+                // Git 一次调用回来一批，没法一个个对：
+                // 但只重画确实在这个仓库里的窗格（双栏时另一栏可能在别处）。
+                MetadataEvent::GitReady(root) => {
+                    if this.listing.path().starts_with(root) {
+                        cx.notify();
+                    }
                 }
             },
         ));
@@ -2001,6 +2029,15 @@ impl Pane {
             .font_medium()
             .child(div().w(px(20.)).flex_shrink_0())
             .child(self.header_cell(0, SortKey::Name, "名称", None, cx))
+            .when_some(self.meta_label(cx), |this, label| {
+                this.child(
+                    div()
+                        .w(px(COL_META))
+                        .flex_shrink_0()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+            })
             .child(self.header_cell(1, SortKey::Size, "大小", Some(COL_SIZE), cx))
             .child(self.header_cell(2, SortKey::Modified, "修改时间", Some(COL_MODIFIED), cx))
             .child(self.header_cell(3, SortKey::Kind, "类型", Some(COL_KIND), cx))
@@ -2149,6 +2186,21 @@ impl Pane {
                         },
                     )
                     .child(div().flex_1().min_w_0().truncate().child(name))
+                    .when_some(self.meta_text(&path, is_dir, cx), |this, text| {
+                        // 整列常驻、里面可以空：不然每行少一个格子会左右跳。
+                        this.child(
+                            div()
+                                .id(("row-meta", position))
+                                .test_support()
+                                .aria_label(text.clone())
+                                .w(px(COL_META))
+                                .flex_shrink_0()
+                                .text_sm()
+                                .truncate()
+                                .text_color(muted)
+                                .child(text),
+                        )
+                    })
                     .child(
                         div()
                             .w(px(COL_SIZE))
@@ -3715,6 +3767,23 @@ impl Pane {
     }
 
     /// 向缩略图层要一张图；列表里用小图，Quick Look 用大图。
+    /// 元数据列的表头：显示的是"当前这一列是什么"。没开就是 `None`（整列不画）。
+    fn meta_label(&mut self, cx: &mut Context<Self>) -> Option<&'static str> {
+        self.meta
+            .update(cx, |meta, cx| meta.field(cx))
+            .map(|field| field.label())
+    }
+
+    /// 这一行元数据那一格写什么。`None` = 这一列现在不显示。
+    fn meta_text(
+        &mut self,
+        path: &Path,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.meta.update(cx, |meta, cx| meta.text(path, is_dir, cx))
+    }
+
     fn thumbnail_of(
         &mut self,
         path: &Path,

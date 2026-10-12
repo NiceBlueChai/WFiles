@@ -2975,3 +2975,118 @@ fn escape_closes_the_diff_panel(cx: &mut TestAppContext) {
         assert!(window.try_find("diff").is_none(), "Esc 该关掉面板");
     });
 }
+
+// ---- 可选元数据列 ----
+
+/// 元数据是后台探出来的：给它一点真实时间，每一轮都画帧。
+///
+/// 这一格一开列就存在（里面可以是空的，列宽才不会跳），
+/// 所以等到"有字"才算数。
+fn wait_for_meta_row(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    index: usize,
+) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        cx.run_until_parked();
+        let found = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                window
+                    .try_find(("row-meta", index))
+                    .map(|row| row.label().unwrap_or_default().to_string())
+            })
+            .expect("窗口还在");
+        if found.as_ref().is_some_and(|label| !label.is_empty())
+            || Instant::now() > deadline
+        {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 从命令面板里挑一种元数据列。走的是真界面路径：
+/// 面板、匹配、点击，全过了才说明这条功能是接上的。
+fn pick_meta_column(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    query: &'static str,
+    id: &'static str,
+) {
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input(query, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(id, cx);
+    });
+}
+
+#[gpui_kit::test]
+fn the_metadata_column_shows_image_dimensions(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pic.png");
+    image::RgbImage::from_fn(320, 180, |x, y| image::Rgb([x as u8, y as u8, 128]))
+        .save(&path)
+        .unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    pick_meta_column(cx, handle, "图片尺寸", "app:meta-image");
+
+    let label = wait_for_meta_row(cx, handle, 0).expect("该探出图片尺寸");
+    assert!(label.contains("320 × 180"), "该报像素尺寸：{label}");
+}
+
+#[gpui_kit::test]
+fn the_metadata_column_shows_git_status(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dir.path())
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !initialized {
+        // 没装 git 的机器上这条没意义，别把测试跑红。
+        return;
+    }
+    std::fs::write(dir.path().join("new.txt"), "hello").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+    let position = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        row_position(window, "new.txt")
+    });
+
+    pick_meta_column(cx, handle, "Git 状态", "app:meta-git");
+
+    let label = wait_for_meta_row(cx, handle, position).expect("该读出 Git 状态");
+    assert!(label.contains("未跟踪"), "新文件该是未跟踪：{label}");
+}
+
+#[gpui_kit::test]
+fn the_metadata_column_can_be_turned_off_again(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pic.png");
+    image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([1, 2, 3]))
+        .save(&path)
+        .unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    pick_meta_column(cx, handle, "图片尺寸", "app:meta-image");
+    assert!(
+        wait_for_meta_row(cx, handle, 0).is_some(),
+        "开了那一列就该有那一格"
+    );
+
+    pick_meta_column(cx, handle, "不显示元数据列", "app:meta-off");
+    let gone = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.try_find(("row-meta", 0usize)).is_none()
+    });
+    assert!(gone, "关掉之后这一格该消失");
+}

@@ -12,6 +12,7 @@ mod drag;
 mod format;
 mod keymap;
 mod marks;
+mod meta;
 mod model;
 mod ops;
 mod ops_entity;

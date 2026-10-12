@@ -22,6 +22,7 @@ use crate::compare::Options as CompareOptions;
 use crate::compare_entity::{CompareEvent, ComparePanel};
 use crate::diff_entity::{DiffEvent, DiffPanel};
 use crate::drag::{self, DraggedPaths};
+use crate::meta::{Field as MetaField, Metadata};
 use crate::format;
 use crate::ops::{ConflictPolicy, ControlState};
 use crate::ops_entity::{Ops, OpsEvent, PendingAction};
@@ -95,6 +96,8 @@ enum PaletteAction {
     EditKey(PaneCommand),
     /// 把某个终端设为默认；只改设置，不打开窗口。
     SetTerminal(String),
+    /// 列表右边那一列元数据显示什么；`None` = 不显示这一列。
+    MetaColumn(Option<MetaField>),
     /// 开关底部的内嵌终端面板。
     ToggleTerminal,
     NewTab,
@@ -175,6 +178,8 @@ pub struct WFilesApp {
     compare: Option<Entity<ComparePanel>>,
     /// 文件内容比较面板。
     diff: Option<Entity<DiffPanel>>,
+    /// 元数据列的缓存与后台探测：所有标签共用一份，同一个文件只探一次。
+    meta: Entity<Metadata>,
 }
 
 impl WFilesApp {
@@ -183,19 +188,34 @@ impl WFilesApp {
         Settings::install(cx);
         let ops = cx.new(|_| Ops::new());
         let thumbs = cx.new(|_| Thumbnails::new());
+        let meta = cx.new(|_| Metadata::new());
 
         // 恢复上次的标签；一个都不剩就开主页。
         let session = Session::load().sanitized();
         let mut tabs: Vec<Entity<Pane>> = Vec::new();
         for path in &session.tabs {
             let tab = cx.new(|cx| {
-                Pane::new(path.clone(), ops.clone(), thumbs.clone(), window, cx)
+                Pane::new(
+                    path.clone(),
+                    ops.clone(),
+                    thumbs.clone(),
+                    meta.clone(),
+                    window,
+                    cx,
+                )
             });
             tabs.push(tab);
         }
         if tabs.is_empty() {
             let tab = cx.new(|cx| {
-                Pane::new(Self::initial_dir(), ops.clone(), thumbs.clone(), window, cx)
+                Pane::new(
+                    Self::initial_dir(),
+                    ops.clone(),
+                    thumbs.clone(),
+                    meta.clone(),
+                    window,
+                    cx,
+                )
             });
             tabs.push(tab);
         }
@@ -221,6 +241,7 @@ impl WFilesApp {
             term: None,
             compare: None,
             diff: None,
+            meta,
         };
 
         app.subscriptions.push(cx.subscribe_in(
@@ -467,6 +488,7 @@ impl WFilesApp {
                 path,
                 self.ops.clone(),
                 self.thumbs.clone(),
+                self.meta.clone(),
                 window,
                 cx,
             )
@@ -752,6 +774,20 @@ impl WFilesApp {
         cx.notify();
     }
 
+    /// 换列表右边那一列元数据。
+    ///
+    /// 只改设置：值由 `Metadata` 自己去跟设置对（它每次被问起时都对一次），
+    /// 这样"设置里改了"和"面板上点了"是同一条路，不会出现两处状态打架。
+    fn set_meta_column(&mut self, field: Option<MetaField>, cx: &mut Context<Self>) {
+        Settings::update(cx, |settings| {
+            settings.meta_column = field.map_or_else(String::new, |field| field.id().to_string());
+        });
+        for tab in &self.tabs {
+            tab.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
+    }
+
     /// 打开比较面板，或者在开着的时候收起它。
     fn toggle_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.compare.take().is_some() {
@@ -868,6 +904,9 @@ impl WFilesApp {
                 changed,
                 renamed_to,
             } => {
+                // 文件动过了，Git 那一列的状态就得重来：
+                // 复制、移动、删除都会让它变。
+                self.meta.update(cx, |meta, _| meta.invalidate_git());
                 for tab in &self.tabs {
                     tab.update(cx, |pane, cx| {
                         pane.apply_external_change(removed, changed, renamed_to, window, cx)
@@ -1122,6 +1161,7 @@ impl WFilesApp {
             PaletteAction::SetTerminal(id) => {
                 Settings::update(cx, |settings| settings.terminal = id.clone());
             }
+            PaletteAction::MetaColumn(field) => self.set_meta_column(field, cx),
             PaletteAction::ToggleTerminal => self.toggle_terminal(window, cx),
             PaletteAction::SavedSearch(name) => {
                 let Some(saved) = Settings::read(cx).saved_search(&name).cloned() else {
@@ -1273,6 +1313,38 @@ impl WFilesApp {
                     "diff 比较 内容 差异 行 十六进制 hex 字节",
                 ),
                 action: PaletteAction::App(AppCommand::Diff),
+            });
+        }
+
+        // ---- 元数据列 ----
+        // 六种共用一列，所以这里是"选一个"，不是六个开关：
+        // 全铺开会挤掉文件名，而一次通常只关心其中一种。
+        let shown = Settings::peek(cx, |settings| MetaField::from_id(&settings.meta_column));
+        for field in MetaField::ALL {
+            if shown == Some(field) {
+                continue;
+            }
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("app:meta-{}", field.id()),
+                    format!("元数据列：{}", field.label()),
+                    "",
+                    "元数据列",
+                    field.keywords(),
+                ),
+                action: PaletteAction::MetaColumn(Some(field)),
+            });
+        }
+        if shown.is_some() {
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    "app:meta-off",
+                    "不显示元数据列",
+                    "",
+                    "元数据列",
+                    "关掉 关闭 隐藏 不要 元数据列",
+                ),
+                action: PaletteAction::MetaColumn(None),
             });
         }
 

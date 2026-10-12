@@ -43,6 +43,15 @@ pub struct Settings {
     /// 存下来的搜索：起了名字的查询，点一下就能再跑一遍。
     #[serde(default)]
     pub saved_searches: Vec<SavedSearch>,
+    /// 列表右侧那列元数据显示什么（存的是 `meta::Field` 的 id）；空就是不显示。
+    ///
+    /// 六种（Git 状态 / 图片尺寸 / 媒体时长 / EXIF / ID3 / PDF 页数）共用一列：
+    /// 全铺开会挤掉文件名，而一次通常只关心其中一种。
+    ///
+    /// 存 id 字符串而不是枚举本身：手改配置写错一个字，最多这一列不出现，
+    /// 不会让整份配置解析失败——那会把终端、标记、快捷键一起弄丢。
+    #[serde(default)]
+    pub meta_column: String,
 }
 
 /// 一个存下来的搜索。
@@ -124,6 +133,7 @@ impl Default for Settings {
             keys: crate::keymap::KeyMap::default(),
             marks: crate::marks::Marks::default(),
             saved_searches: Vec::new(),
+            meta_column: String::new(),
         }
     }
 }
@@ -142,9 +152,20 @@ impl Settings {
         cx.set_global(settings);
     }
 
+    /// 只读一眼，不克隆。
+    ///
+    /// 列表每一行都要问一次设置（这一格显示什么、有没有标色），
+    /// 每行克隆一份设置——里面还带着全部标记——太贵了。
+    pub fn peek<R>(cx: &gpui_kit::App, f: impl FnOnce(&Self) -> R) -> R {
+        match cx.try_global::<Self>() {
+            Some(settings) => f(settings),
+            None => f(&Self::default()),
+        }
+    }
+
     /// 当前设置。没装 `Global` 时给默认值。
     pub fn read(cx: &gpui_kit::App) -> Self {
-        cx.try_global::<Self>().cloned().unwrap_or_default()
+        Self::peek(cx, |settings| settings.clone())
     }
 
     /// 改设置：更新 `Global` 并立刻写盘。
