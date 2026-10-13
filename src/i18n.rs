@@ -151,6 +151,16 @@ pub fn tr_args(cx: &gpui_kit::App, text: &str, args: &[(&str, String)]) -> Strin
     fill(&tr(cx, text), args)
 }
 
+/// [`tr`] 的纯函数版：语言已经解析好了，直接查。
+///
+/// 给那些**拿到的是别人的 `cx`** 的地方用——最常见的是
+/// `cx.new(|cx| …)` 闭包里，那个 `cx` 是新建实体的上下文，
+/// 拿它 `tr()` 读到的是空设置，界面上一律回落中文。写
+/// `let locale = …; cx.new(|cx| tr_in(locale, "…"))` 就绕开了。
+pub fn tr_in(locale: Locale, text: &str) -> String {
+    lookup(locale, text)
+}
+
 /// [`tr_args`] 的纯函数内核，**只查表不填占位符**。
 ///
 /// 给那些"要被单测验文案"的纯函数用：它们没有 `cx`（`cx` 的存在意义就是
@@ -404,6 +414,72 @@ static EN: &[(&str, &str)] = &[
     ("列表视图", "List view"),
     ("网格视图", "Grid view"),
     ("分列视图", "Columns view"),
+    // ---- 侧栏的三个分区标题 ----
+    // 它们是 `render_volumes_section` / `render_cloud_section` /
+    // `render_remote_section` 里那三行 `.child("…")`，字号一样、位置一样，
+    // 英文下面对不齐会很显眼，所以放在一组。
+    ("磁盘", "Disks"),
+    ("云盘", "Cloud"),
+    ("远程", "Remote"),
+    // ---- 连接入口（侧栏「远程」那一节下面那一行）----
+    ("连接服务器", "Connect to Server"),
+    ("连接服务器…", "Connect to Server…"),
+    // ---- 命令面板浮层 ----
+    // 占位符要翻：它就在输入框里，用户一直在看。
+    ("搜索命令、位置或标签页", "Search commands, places, or tabs"),
+    ("没有匹配的命令", "No matching command"),
+    // 底部那排按键提示。`↑↓` / `Enter` / `Esc` 是**键名本身**，不翻；
+    // 翻的是它后面那个动作词。
+    ("↑↓ 选择", "↑↓ to select"),
+    ("Enter 执行", "Enter to run"),
+    ("Esc 关闭", "Esc to close"),
+    // ---- 标签栏与状态栏 ----
+    ("新建标签页（Cmd+T）", "New Tab (Cmd+T)"),
+    ("命令面板（Cmd+P）", "Command Palette (Cmd+P)"),
+    ("已暂停", "Paused"),
+    ("中止", "Cancel"),
+    (
+        "{count} 个远程文件编辑中（保存即回传）",
+        "{count} remote files being edited (saved back on save)",
+    ),
+    // ---- 对话框的公共按钮 ----
+    // "取消"在确认框、冲突框、输入框、批量重命名、连接框里各有一处，
+    // 全部走这一个 key——五个地方各写一份，迟早有一处漏翻。
+    ("取消", "Cancel"),
+    // ---- 冲突对话框（四个策略）----
+    // 这四个词是**策略名**，用户要靠它们判断自己的文件会怎样，
+    // 不能随手译得含糊。"保留两者"是两个文件名都留下（自动加后缀）。
+    ("保留两者", "Keep Both"),
+    ("替换", "Replace"),
+    ("跳过", "Skip"),
+    (
+        "选择会应用到本次操作的剩余全部项目。",
+        "This choice applies to all remaining items in this operation.",
+    ),
+    // ---- 批量重命名对话框 ----
+    ("名称冲突", "Name conflict"),
+    ("无变化", "No change"),
+    ("将执行", "Will run"),
+    (
+        "占位符：{name} 原主干 · {ext} 原扩展名（含点）· {n} 序号",
+        "Placeholders: {name} stem · {ext} extension (with dot) · {n} number",
+    ),
+    (
+        "共 {total} 项，其中 {executable} 项会被执行",
+        "{total} items, {executable} of them will run",
+    ),
+    ("执行重命名", "Rename"),
+    // 输入框占位符。
+    ("名称", "Name"),
+    // ---- 连接对话框 ----
+    ("协议", "Protocol"),
+    ("常用服务", "Common Providers"),
+    // 「坚果云」是**一家公司的名字**（Nutstore），不翻成 "Nutstore Cloud"：
+    // 它在中文界面里也是这三个字，用户按这三个字认它。
+    ("坚果云", "坚果云"),
+    ("正在连接…", "Connecting…"),
+    ("连接", "Connect"),
+    ("关闭（Esc）", "Close (Esc)"),
     // ---- 侧栏的"位置"（`places()` 的第四项是路径，不翻）----
     // 终端名翻不了：`Option::name` 用来在面板里显示，但它同时是**用户装的那个
     // 程序的名字**——Windows 上的"Windows Terminal"、Linux 上的"GNOME 终端"
@@ -416,10 +492,22 @@ static EN: &[(&str, &str)] = &[
 #[cfg(test)]
 fn suspect_entries() -> Vec<&'static str> {
     EN.iter()
-        .filter(|(key, text)| text.is_empty() || *key == *text)
+        .filter(|(key, text)| text.is_empty() || (*key == *text && !KEPT_AS_IS.contains(key)))
         .map(|(key, _)| *key)
         .collect()
 }
+
+/// **故意跟原文一样的条目**：这些不是漏翻，是原样显示才对。
+///
+/// 列出来而不是放宽判据（"只要 key 在这个名单里就算过"）的原因：
+/// 名单一多，就会有人把该翻的往里塞，而那条测试再也拦不住漏翻。
+/// 所以每加一条都要在这里写清为什么。
+#[cfg(test)]
+const KEPT_AS_IS: &[&str] = &[
+    // 「坚果云」是一家公司的名字，中文界面里也是这三个字。
+    // 译成 "Nutstore Cloud" 的话，反倒跟官网、SaaS 文档里的写法对不上。
+    "坚果云",
+];
 
 /// 命令行 `--lang` 指定的语言。
 ///

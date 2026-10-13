@@ -757,7 +757,10 @@ impl WFilesApp {
                     .text_xs()
                     .font_medium()
                     .text_color(cx.theme().muted_foreground)
-                    .child("磁盘"),
+                    .id("sidebar-disks")
+                    .test_support()
+                    .aria_label(crate::i18n::tr(cx, "磁盘"))
+                    .child(crate::i18n::tr(cx, "磁盘")),
             )
             .children(rows)
             .into_any_element()
@@ -814,7 +817,10 @@ impl WFilesApp {
                     .text_xs()
                     .font_medium()
                     .text_color(cx.theme().muted_foreground)
-                    .child("云盘"),
+                    .id("sidebar-cloud")
+                    .test_support()
+                    .aria_label(crate::i18n::tr(cx, "云盘"))
+                    .child(crate::i18n::tr(cx, "云盘")),
             )
             .children(rows)
             .into_any_element()
@@ -879,12 +885,12 @@ impl WFilesApp {
         rows.push(
             ListItem::new("remote-new")
                 .rounded(cx.theme().radius)
-                .accessibility_label("连接服务器")
+                .accessibility_label(crate::i18n::tr(cx, "连接服务器"))
                 .child(
                     h_flex()
                         .gap_3()
                         .child(Icon::new(IconName::Plus).size_4())
-                        .child("连接服务器…"),
+                        .child(crate::i18n::tr(cx, "连接服务器…")),
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.open_connect(window, cx)))
                 .into_any_element(),
@@ -900,7 +906,10 @@ impl WFilesApp {
                     .text_xs()
                     .font_medium()
                     .text_color(cx.theme().muted_foreground)
-                    .child("远程"),
+                    .id("sidebar-remote")
+                    .test_support()
+                    .aria_label(crate::i18n::tr(cx, "远程"))
+                    .child(crate::i18n::tr(cx, "远程")),
             )
             .children(rows)
             .when_some(note, |this, note| {
@@ -1630,10 +1639,13 @@ impl WFilesApp {
                             .prompt()
                             .map(|prompt| prompt.initial.clone())
                             .unwrap_or_default();
+                        // 同 `open_palette`：闭包里的 `cx` 是新建实体的，
+                        // 占位符的文案得在外面查好传进去。
+                        let locale = Settings::read(cx).locale();
                         let input = cx.new(|cx| {
                             InputState::new(window, cx)
                                 .default_value(initial)
-                                .placeholder("名称")
+                                .placeholder(crate::i18n::tr_in(locale, "名称"))
                                 .submit_on_enter(true)
                         });
                         input.update(cx, |input, cx| input.focus(window, cx));
@@ -1794,7 +1806,13 @@ impl WFilesApp {
             selected: 0,
         });
 
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索命令、位置或标签页"));
+        // 占位符要查表，但 `cx.new` 闭包里那个 `cx` 是**新建实体**的上下文，
+        // 不是外层窗口的——拿它 `tr()` 读到的是空设置，界面上一律回落中文。
+        let locale = Settings::read(cx).locale();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr_in(locale, "搜索命令、位置或标签页"))
+        });
         input.update(cx, |input, cx| input.focus(window, cx));
         // 注意用闭包自己的 window 参数，不能捕获外层的：
         // subscribe_in 要求闭包 'static，捕获 &mut Window 会逃逸。
@@ -2717,7 +2735,11 @@ impl WFilesApp {
                 .py_6()
                 .text_sm()
                 .text_color(muted)
-                .child("没有匹配的命令")
+                // 读屏软件得知道"搜到0 条"，不然用户只听见一片静默。
+                .id("palette-empty")
+                .test_support()
+                .aria_label(crate::i18n::tr(cx, "没有匹配的命令"))
+                .child(crate::i18n::tr(cx, "没有匹配的命令"))
                 .into_any_element()
         } else {
             // overflow_y_scroll 属于 StatefulInteractiveElement，
@@ -2772,9 +2794,9 @@ impl WFilesApp {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child("↑↓ 选择")
-                    .child("Enter 执行")
-                    .child("Esc 关闭"),
+                    .child(crate::i18n::tr(cx, "↑↓ 选择"))
+                    .child(crate::i18n::tr(cx, "Enter 执行"))
+                    .child(crate::i18n::tr(cx, "Esc 关闭")),
             );
 
         div()
@@ -2956,7 +2978,7 @@ impl WFilesApp {
                     .ghost()
                     .small()
                     .icon(IconName::Plus)
-                    .tooltip("新建标签页（Cmd+T）")
+                    .tooltip(crate::i18n::tr(cx, "新建标签页（Cmd+T）"))
                     .on_click(cx.listener(|this, _, window, cx| this.new_tab(window, cx))),
             )
             .child(div().flex_1())
@@ -2966,7 +2988,7 @@ impl WFilesApp {
                     .ghost()
                     .small()
                     .icon(IconName::Command)
-                    .tooltip("命令面板（Cmd+P）")
+                    .tooltip(crate::i18n::tr(cx, "命令面板（Cmd+P）"))
                     .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
     }
@@ -3071,7 +3093,7 @@ impl WFilesApp {
                 }
             }
             if paused {
-                detail = detail.child(div().flex_shrink_0().child("已暂停"));
+                detail = detail.child(div().flex_shrink_0().child(crate::i18n::tr(cx, "已暂停")));
                 text.push_str(" 已暂停");
             }
             let queued = self.ops.read(cx).queued();
@@ -3166,7 +3188,7 @@ impl WFilesApp {
                         .ghost()
                         .small()
                         .icon(IconName::Square)
-                        .tooltip("中止")
+                        .tooltip(crate::i18n::tr(cx, "中止"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.ops.update(cx, |ops, cx| ops.abort(cx))
                         })),
@@ -3202,7 +3224,11 @@ impl WFilesApp {
                 .text_xs()
                 .whitespace_nowrap()
                 .text_color(muted)
-                .child(format!("{count} 个远程文件编辑中（保存即回传）"))
+                .child(crate::i18n::tr_args(
+                    cx,
+                    "{count} 个远程文件编辑中（保存即回传）",
+                    &[("count", count.to_string())],
+                ))
                 .into_any_element(),
         };
 
@@ -3362,7 +3388,7 @@ impl WFilesApp {
             .child(confirm.message.clone())
             .into_any_element();
         let cancel = Button::new("confirm-cancel")
-            .label("取消")
+            .label(crate::i18n::tr(cx, "取消"))
             .ghost()
             .on_click(
                 cx.listener(|this, _, _, cx| this.ops.update(cx, |ops, cx| ops.confirm_cancel(cx))),
@@ -3403,12 +3429,12 @@ impl WFilesApp {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("选择会应用到本次操作的剩余全部项目。"),
+                    .child(crate::i18n::tr(cx, "选择会应用到本次操作的剩余全部项目。")),
             )
             .into_any_element();
 
         let keep_both = Button::new("conflict-keep-both")
-            .label("保留两者")
+            .label(crate::i18n::tr(cx, "保留两者"))
             .primary()
             .on_click(cx.listener(|this, _, _, cx| {
                 this.ops.update(cx, |ops, cx| {
@@ -3417,7 +3443,7 @@ impl WFilesApp {
             }))
             .into_any_element();
         let replace = Button::new("conflict-replace")
-            .label("替换")
+            .label(crate::i18n::tr(cx, "替换"))
             .danger()
             .on_click(cx.listener(|this, _, _, cx| {
                 this.ops.update(cx, |ops, cx| {
@@ -3426,7 +3452,7 @@ impl WFilesApp {
             }))
             .into_any_element();
         let skip = Button::new("conflict-skip")
-            .label("跳过")
+            .label(crate::i18n::tr(cx, "跳过"))
             .ghost()
             .on_click(cx.listener(|this, _, _, cx| {
                 this.ops
@@ -3435,7 +3461,7 @@ impl WFilesApp {
             .into_any_element();
         let cancel =
             Button::new("conflict-cancel")
-                .label("取消")
+                .label(crate::i18n::tr(cx, "取消"))
                 .ghost()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.ops.update(cx, |ops, cx| ops.cancel_conflict(cx))
@@ -3491,7 +3517,7 @@ impl WFilesApp {
         }
 
         let cancel = Button::new("prompt-cancel")
-            .label("取消")
+            .label(crate::i18n::tr(cx, "取消"))
             .ghost()
             .on_click(cx.listener(|this, _, _, cx| this.dismiss_prompt(cx)))
             .into_any_element();
@@ -3579,19 +3605,19 @@ impl WFilesApp {
                 div()
                     .text_xs()
                     .text_color(danger)
-                    .child("名称冲突")
+                    .child(crate::i18n::tr(cx, "名称冲突"))
                     .into_any_element()
             } else if item.unchanged {
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child("无变化")
+                    .child(crate::i18n::tr(cx, "无变化"))
                     .into_any_element()
             } else {
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child("将执行")
+                    .child(crate::i18n::tr(cx, "将执行"))
                     .into_any_element()
             };
 
@@ -3627,12 +3653,10 @@ impl WFilesApp {
         let body = v_flex()
             .gap_3()
             .child(rules)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("占位符：{name} 原主干 · {ext} 原扩展名（含点）· {n} 序号"),
-            )
+            .child(div().text_xs().text_color(muted).child(crate::i18n::tr(
+                cx,
+                "占位符：{name} 原主干 · {ext} 原扩展名（含点）· {n} 序号",
+            )))
             .child(
                 div()
                     .id("bulk-preview")
@@ -3648,17 +3672,24 @@ impl WFilesApp {
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child(format!("共 {total} 项，其中 {executable} 项会被执行")),
+                    .child(crate::i18n::tr_args(
+                        cx,
+                        "共 {total} 项，其中 {executable} 项会被执行",
+                        &[
+                            ("total", total.to_string()),
+                            ("executable", executable.to_string()),
+                        ],
+                    )),
             )
             .into_any_element();
 
         let cancel = Button::new("bulk-cancel")
-            .label("取消")
+            .label(crate::i18n::tr(cx, "取消"))
             .ghost()
             .on_click(cx.listener(|this, _, _, cx| this.dismiss_bulk(cx)))
             .into_any_element();
         let ok = Button::new("bulk-ok")
-            .label("执行重命名")
+            .label(crate::i18n::tr(cx, "执行重命名"))
             .primary()
             .disabled(executable == 0)
             .on_click(cx.listener(|this, _, _, cx| {
@@ -3719,7 +3750,12 @@ impl WFilesApp {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(div().text_xs().text_color(muted).child("协议"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(crate::i18n::tr(cx, "协议")),
+                    )
                     .child(h_flex().gap_2().children(kinds)),
             )
             .child(labeled("名称（可留空，默认取主机名）", &state.name))
@@ -3755,10 +3791,15 @@ impl WFilesApp {
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(div().text_xs().text_color(muted).child("常用服务"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(crate::i18n::tr(cx, "常用服务")),
+                        )
                         .child(
                             Button::new("connect-preset-jianguoyun")
-                                .label("坚果云")
+                                .label(crate::i18n::tr(cx, "坚果云"))
                                 .ghost()
                                 .small()
                                 .on_click(cx.listener(move |_, _, window, cx| {
@@ -3797,17 +3838,17 @@ impl WFilesApp {
                     .test_support()
                     .text_xs()
                     .text_color(muted)
-                    .child("正在连接…"),
+                    .child(crate::i18n::tr(cx, "正在连接…")),
             );
         }
 
         let cancel = Button::new("connect-cancel")
-            .label("取消")
+            .label(crate::i18n::tr(cx, "取消"))
             .ghost()
             .on_click(cx.listener(|this, _, _, cx| this.close_connect(cx)))
             .into_any_element();
         let ok = Button::new("connect-ok")
-            .label("连接")
+            .label(crate::i18n::tr(cx, "连接"))
             .primary()
             .disabled(state.busy)
             .on_click(cx.listener(|this, _, _, cx| this.submit_connect(cx)))
@@ -3931,7 +3972,7 @@ impl WFilesApp {
                     .child(
                         h_flex().flex_shrink_0().justify_end().child(
                             Button::new("quick-look-close")
-                                .label("关闭（Esc）")
+                                .label(crate::i18n::tr(cx, "关闭（Esc）"))
                                 .ghost()
                                 .small()
                                 .on_click(cx.listener(move |_, _, _, cx| {

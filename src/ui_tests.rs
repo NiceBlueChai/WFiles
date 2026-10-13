@@ -5257,3 +5257,57 @@ fn the_pane_chrome_speaks_english(cx: &mut TestAppContext) {
     // 它，造不出带修饰键的那次点击。那两句文案缝成了纯函数
     // （`pane::MultiSelectionSummary`），在 `pane::tests` 里逐语言验。
 }
+
+#[gpui_kit::test]
+fn the_sidebar_sections_speak_english(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+
+    // 三个分区标题。判据是"一个中文都不剩"，不是"逐个等于某句话"——
+    // 后者只能查出你想到的那几条。
+    for id in ["sidebar-disks", "sidebar-cloud", "sidebar-remote"] {
+        let text = step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            a11y_label_at(window, id)
+        });
+        assert!(!text.is_empty(), "{id} 查不到无障碍名");
+        assert!(
+            !text.chars().any(|c| c as u32 > 0x2E80),
+            "{id} 的英文文案里还有中文：{text:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn an_empty_command_palette_says_so_in_the_chosen_language(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+        settle(window, cx);
+    });
+
+    // 先确认默认语言下那句在（不然下面那条挂了我不知道是漏翻还是元素没了）。
+    step(cx, handle, |window, cx| {
+        window.input("这个词一定搜不到任何命令", cx);
+        settle(window, cx);
+    });
+    let empty = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "palette-empty")
+    });
+    assert!(
+        !empty.is_empty(),
+        "搜不到时该有「没有匹配的命令」这一行，实际查不到该元素"
+    );
+    assert!(
+        !empty.chars().any(|c| c as u32 > 0x2E80),
+        "英文面板的空态提示里还有中文：{empty:?}"
+    );
+}
