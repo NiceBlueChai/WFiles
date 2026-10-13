@@ -5163,3 +5163,89 @@ fn the_command_palette_stays_chinese_by_default(cx: &mut TestAppContext) {
         "中文界面里出现了英文分组名 Files"
     );
 }
+
+#[gpui_kit::test]
+fn the_pane_status_bar_speaks_english(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    // 中文（默认）。
+    let chinese = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "pane-status")
+    });
+    assert!(
+        chinese.contains("个项目"),
+        "中文状态栏该说「N 个项目」，实际是 {chinese:?}"
+    );
+
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+
+    // `update_status` 把结果**缓存**进 `self.status`，语言切换不会重算它。
+    // 所以这里要点一下列表（触发一次状态变化）才能看到新语言——
+    // 这不是缺陷，是"状态栏在事件里算好"这个设计的必然结果，
+    // 记在 `update_status` 的文档注释里了。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("down", cx);
+    });
+    let english = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "pane-status")
+    });
+    assert!(
+        english.contains("item"),
+        "英文状态栏该说「N items」，实际是 {english:?}"
+    );
+    // 一个中文都不剩——漏一处的后果是"半翻译状态栏"。
+    assert!(
+        !english.chars().any(|c| c as u32 > 0x2E80),
+        "英文状态栏里还有中文：{english:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn the_pane_chrome_speaks_english(cx: &mut TestAppContext) {
+    // 开在一个刚建的空目录上 → 走"这个文件夹是空的"那条路。
+    // （另一条是"没有匹配的项目"，得有查询才走到；那是两句不同的文案。）
+    let home = tempfile::tempdir().expect("临时目录");
+    let (_session, handle) = open_in(cx, home.path());
+
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+
+    // 侧栏上那几处（tagline / places title / local）已经在另一条测试里验过，
+    // 这条只管窗格里那些：工具条 tooltip 与空态。
+    let empty_label = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window
+            .try_find("empty-hint-label")
+            .and_then(|e| e.label().map(|l| l.to_string()))
+            .unwrap_or_default()
+    });
+    assert!(
+        empty_label.contains("empty"),
+        "英文空态该说 empty，实际是 {empty_label:?}"
+    );
+    assert!(
+        !empty_label.chars().any(|c| c as u32 > 0x2E80),
+        "英文空态里还有中文：{empty_label:?}"
+    );
+
+    // 视图名另开一个目录验：空目录走的是 `render_empty` 那条路，
+    // 列表本身压根不渲染，`file-list` 这个元素不存在，量不到东西。
+    let full = tempfile::tempdir().expect("临时目录");
+    std::fs::write(full.path().join("a.txt"), b"x").expect("建文件");
+    let (_session2, handle2) = open_in(cx, full.path());
+    step(cx, handle2, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+    let view = step_value(cx, handle2, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "file-list")
+    });
+    assert_eq!(view, "List view", "列表视图的无障碍名该跟着语言走");
+}

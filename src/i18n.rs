@@ -288,6 +288,92 @@ static EN: &[(&str, &str)] = &[
     ("图片尺寸", "Image Size"),
     ("媒体时长", "Duration"),
     ("PDF 页数", "PDF Pages"),
+    // ---- 窗格：地址栏与工具条----
+    ("后退", "Back"),
+    ("前进", "Forward"),
+    ("刷新", "Refresh"),
+    ("更多操作", "More Actions"),
+    ("新建文件夹（Cmd+Shift+N）", "New Folder (Cmd+Shift+N)"),
+    ("拷贝（Cmd+C）", "Copy (Cmd+C)"),
+    ("剪切（Cmd+X）", "Cut (Cmd+X)"),
+    ("粘贴（Cmd+V）", "Paste (Cmd+V)"),
+    ("筛选当前文件夹", "Filter this folder"),
+    // ---- 窗格：列表表头与排序 ----
+    ("修改时间", "Modified"),
+    ("升序", "ascending"),
+    ("降序", "descending"),
+    ("按{key}{order}", "by {key} {order}"),
+    // ---- 窗格：详情面板 ----
+    ("详细信息", "Details"),
+    ("修改", "Modified"),
+    ("标记", "Tags"),
+    ("云盘", "Cloud"),
+    ("选择一个项目查看详情", "Select an item to see its details"),
+    (
+        "批量操作会按列表顺序逐个应用。",
+        "Batch actions apply to items in list order.",
+    ),
+    // ---- 窗格：空态 ----
+    ("这个文件夹是空的", "This folder is empty"),
+    ("没有匹配的项目", "No matching items"),
+    // ---- 窗格：状态栏 ----
+    ("{total} 个项目", "{total} items"),
+    ("{visible} / {total} 个项目", "{visible} of {total} items"),
+    ("，已选中 {count} 项", ", {count} selected"),
+    ("远程位置 · {text}", "Remote · {text}"),
+    ("远程位置 · {sub} · {text}", "Remote · {sub} · {text}"),
+    (
+        "连不上服务器，显示 {ago} 列的这份",
+        "Can't reach server, showing the copy from {ago}",
+    ),
+    ("无法打开：{error}", "Can't open: {error}"),
+    // ---- 窗格：标签与标记 ----
+    (
+        "点一下标色，再点一下去掉",
+        "Click to colour, click again to remove",
+    ),
+    ("清除标记", "Clear Tags"),
+    ("标签，空格分开", "Tags, separated by spaces"),
+    ("用过的标签：{tags}", "Used tags: {tags}"),
+    ("完成", "Done"),
+    // ---- 窗格：改键浮层 ----
+    ("给「{title}」按个键", "Press a key for “{title}”"),
+    ("现在是：{current}", "Now: {current}"),
+    ("现在是：没有按键", "Now: no key"),
+    (
+        "退格 = 恢复出厂，Esc = 取消",
+        "Backspace = factory reset, Esc = cancel",
+    ),
+    ("{title} 已恢复出厂按键", "{title} reset to default"),
+    (
+        "{title} 改为 {key}，重启后生效",
+        "{title} is now {key} (takes effect after restart)",
+    ),
+    // ---- 窗格：压缩包 ----
+    ("{files} 个文件 · 共 {total}", "{files} files · {total}"),
+    ("这个包是空的", "This archive is empty"),
+    ("解压到「{stem}」", "Extract to “{stem}”"),
+    ("{target}：{count} 个文件", "{target}: {count} files"),
+    ("归档", "Archive"),
+    ("正在打包 {name}…", "Creating {name}…"),
+    ("正在解压 {name}…", "Extracting {name}…"),
+    // ---- 窗格：远程与复制 ----
+    ("先选中一个远程文件", "Select a remote file first"),
+    ("已在{name}中打开 {path}", "Opened {path} in {name}"),
+    ("已复制 {count} 个路径", "Copied {count} paths"),
+    ("已复制 {count} 个文件名", "Copied {count} file names"),
+    // ---- 窗格：其它 ----
+    ("上一级", "Up"),
+    ("回到上一级", "Go Up"),
+    ("关闭（Esc）", "Close (Esc)"),
+    ("收起详情板（Cmd+Alt+O）", "Hide Details (Cmd+Alt+O)"),
+    ("展开详情板（Cmd+Alt+O）", "Show Details (Cmd+Alt+O)"),
+    ("正在取这个目录…", "Reading folder…"),
+    // 三种视图的无障碍名。读屏软件靠它报"现在是列表还是网格"，
+    // 所以这三个词也算界面文案，不是纯测试用的钩子。
+    ("列表视图", "List view"),
+    ("网格视图", "Grid view"),
+    ("分列视图", "Columns view"),
     // ---- 侧栏的"位置"（`places()` 的第四项是路径，不翻）----
     // 终端名翻不了：`Option::name` 用来在面板里显示，但它同时是**用户装的那个
     // 程序的名字**——Windows 上的"Windows Terminal"、Linux 上的"GNOME 终端"

@@ -555,7 +555,9 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("筛选当前文件夹"));
+        let filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(cx, "筛选当前文件夹"))
+        });
         let (listing, error) = match Listing::read(&path) {
             Ok(listing) => (listing, None),
             Err(error) => (Listing::empty(path.clone()), Some(error)),
@@ -669,7 +671,7 @@ impl Pane {
                         None => {
                             this.error = None;
                             this.fill_remote(path, cx);
-                            this.update_status();
+                            this.update_status(cx);
                         }
                         // 没取回来：如果屏幕上还留着磁盘上那份，
                         // 就别把它换成一块错误页——用户要的是"昨天有什么"，
@@ -680,15 +682,16 @@ impl Pane {
                                 .update(cx, |remotes, _| remotes.staleness(path));
                             match stale_at {
                                 Some(at) => {
-                                    this.status = format!(
-                                        "连不上服务器，显示 {} 列的这份",
-                                        crate::offline::ago(at)
+                                    this.status = crate::i18n::tr_args(
+                                        cx,
+                                        "连不上服务器，显示 {ago} 列的这份",
+                                        &[("ago", crate::offline::ago(at))],
                                     );
                                 }
                                 // 一份缓存都没有，就老实说连不上。
                                 None => {
                                     this.error = Some(reason.clone());
-                                    this.update_status();
+                                    this.update_status(cx);
                                 }
                             }
                         }
@@ -716,7 +719,7 @@ impl Pane {
         pane.sync_row_sizes();
         // 崩溃恢复：把上次选中的那些接上（行高定下来了才能往那儿滚）。
         pane.restore_selection(cx);
-        pane.update_status();
+        pane.update_status(cx);
         pane.start_watching(cx);
         // 一打开就能用方向键，不需要先点一下列表。
         pane.focus.focus(window, cx);
@@ -810,7 +813,7 @@ impl Pane {
         if self.listing.set_query(&query) {
             self.sync_row_sizes();
             self.scroll_to_top();
-            self.update_status();
+            self.update_status(cx);
         }
         cx.notify();
     }
@@ -898,35 +901,68 @@ impl Pane {
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
-    fn update_status(&mut self) {
+    /// 状态栏那句话。在事件里算好缓存进 `self.status`，不是渲染时现算。
+    ///
+    /// 收 `cx` 是为了按当前语言显示。
+    ///
+    /// **缓存带来的后果**：切语言之后状态栏要等下一次状态变化才刷新
+    /// （选中项变了、目录换了才会调这里）。语言切换走的是"整窗重画"，
+    /// 而状态栏读的是这个缓存字段，所以切语言那一帧状态栏可能还是旧语言。
+    /// 记在这儿，别以为是 bug 就去重算。
+    fn update_status(&mut self, cx: &gpui_kit::App) {
         if let Some(error) = &self.error {
-            self.status = format!("无法打开：{error}");
+            self.status =
+                crate::i18n::tr_args(cx, "无法打开：{error}", &[("error", error.clone())]);
             return;
         }
 
         let visible = self.listing.visible_count();
         let total = self.listing.total_count();
         let mut text = if visible == total {
-            format!("{total} 个项目")
+            crate::i18n::tr_args(cx, "{total} 个项目", &[("total", total.to_string())])
         } else {
-            format!("{visible} / {total} 个项目")
+            crate::i18n::tr_args(
+                cx,
+                "{visible} / {total} 个项目",
+                &[
+                    ("visible", visible.to_string()),
+                    ("total", total.to_string()),
+                ],
+            )
         };
         // 远程位置要写明：列表长得跟本地一样，不说的话用户会以为
         // 自己在本地目录里，删改起来心里没底。
         if let Some((_, sub)) = remote::parse_location(self.listing.path()) {
             text = if sub.is_empty() {
-                format!("远程位置 · {text}")
+                crate::i18n::tr_args(cx, "远程位置 · {text}", &[("text", text)])
             } else {
-                format!("远程位置 · {sub} · {text}")
-            };
+                crate::i18n::tr_args(
+                    cx,
+                    "远程位置 · {sub} · {text}",
+                    &[("sub", sub.clone()), ("text", text)],
+                )
+            }
         }
         // 在云盘的同步文件夹里也要写明：这里删改会牵动另一台机器上的同一份，
         // 不说的话用户以为自己在动一个普通本地目录。
         if let Some(root) = crate::cloud::root_for(self.listing.path(), crate::cloud::detected()) {
-            text = format!("{} · {text}", root.provider.name());
+            text = crate::i18n::tr_args(
+                cx,
+                "{provider} · {text}",
+                &[
+                    ("provider", root.provider.name().to_string()),
+                    ("text", text),
+                ],
+            );
         }
         if !self.selection.is_empty() {
-            text.push_str(&format!("，已选中 {} 项", self.selection.len()));
+            // 逗号前缀写在模板里：中文这句要逗号断开，英文是直接跟在后面的
+            // （", 3 selected"）。这个差别就是它该进模板而不该进代码的原因。
+            text.push_str(&crate::i18n::tr_args(
+                cx,
+                "，已选中 {count} 项",
+                &[("count", self.selection.len().to_string())],
+            ));
         }
         self.status = text;
     }
@@ -991,7 +1027,7 @@ impl Pane {
                 self.error = Some(error);
             }
         }
-        self.update_status();
+        self.update_status(cx);
         cx.notify();
     }
 
@@ -1036,10 +1072,10 @@ impl Pane {
             // 已经列过了（内存或磁盘上有）：当场填进去。
             Some(_) => {
                 self.fill_remote(&path, cx);
-                self.update_status();
+                self.update_status(cx);
             }
             // 后台正在取：先说清楚在等什么，别让人以为这是个空目录。
-            None => self.status = "正在取这个目录…".to_string(),
+            None => self.status = crate::i18n::tr(cx, "正在取这个目录…"),
         }
         cx.emit(PaneEvent::Navigated);
         cx.notify();
@@ -1117,7 +1153,7 @@ impl Pane {
         if let Some((id, sub)) = remote::parse_location(&path) {
             self.remotes
                 .update(cx, |remotes, cx| remotes.reload(&id, &sub, cx));
-            self.status = "正在取这个目录…".to_string();
+            self.status = crate::i18n::tr(cx, "正在取这个目录…");
             cx.notify();
             return;
         }
@@ -1135,7 +1171,7 @@ impl Pane {
             }
             Err(error) => self.error = Some(error),
         }
-        self.update_status();
+        self.update_status(cx);
         cx.notify();
     }
 
@@ -1162,7 +1198,7 @@ impl Pane {
             self.open_archive(path, cx);
         } else if let Err(error) = open::that(&path) {
             self.error = Some(error.to_string());
-            self.update_status();
+            self.update_status(cx);
             cx.notify();
         }
     }
@@ -1194,8 +1230,8 @@ impl Pane {
     /// 与其默默什么都不做，不如把原因写进状态栏。
     fn edit_remote(&mut self, cx: &mut Context<Self>) {
         let Some((id, sub)) = Self::editable_remote(&self.selection, &self.listing) else {
-            self.error = Some("先选中一个远程文件".to_string());
-            self.update_status();
+            self.error = Some(crate::i18n::tr(cx, "先选中一个远程文件"));
+            self.update_status(cx);
             cx.notify();
             return;
         };
@@ -1213,7 +1249,7 @@ impl Pane {
             let row = self.row_of(position);
             self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
         }
-        self.update_status();
+        self.update_status(cx);
         cx.notify();
     }
 
@@ -1224,7 +1260,7 @@ impl Pane {
 
         self.selection.select_all(&self.listing);
         self.note_restore();
-        self.update_status();
+        self.update_status(cx);
         cx.notify();
     }
 
@@ -1235,7 +1271,7 @@ impl Pane {
 
         self.selection.clear();
         self.note_restore();
-        self.update_status();
+        self.update_status(cx);
         cx.notify();
     }
 
@@ -1295,7 +1331,7 @@ impl Pane {
         self.scroll
             .scroll_to_item(self.row_of(position), ScrollStrategy::Nearest);
         self.note_restore();
-        self.update_status();
+        self.update_status(cx);
         cx.notify();
     }
 
@@ -1366,7 +1402,11 @@ impl Pane {
             &paths,
             clipboard::ClipboardText::FullPath,
         )));
-        self.status = format!("已复制 {} 个路径", paths.len());
+        self.status = crate::i18n::tr_args(
+            cx,
+            "已复制 {count} 个路径",
+            &[("count", paths.len().to_string())],
+        );
         cx.notify();
     }
 
@@ -1380,7 +1420,11 @@ impl Pane {
             &paths,
             clipboard::ClipboardText::NameOnly,
         )));
-        self.status = format!("已复制 {} 个文件名", paths.len());
+        self.status = crate::i18n::tr_args(
+            cx,
+            "已复制 {count} 个文件名",
+            &[("count", paths.len().to_string())],
+        );
         cx.notify();
     }
 
@@ -1409,7 +1453,11 @@ impl Pane {
         let settings = Settings::read(cx);
         match terminal::open(&settings.terminal, &dir) {
             Ok(name) => {
-                self.status = format!("已在{name}中打开 {}", dir.display());
+                self.status = crate::i18n::tr_args(
+                    cx,
+                    "已在{name}中打开 {path}",
+                    &[("name", name.clone()), ("path", dir.display().to_string())],
+                );
             }
             Err(error) => {
                 self.status = error;
@@ -1622,7 +1670,9 @@ impl Pane {
             .cloned()
             .unwrap_or_default();
         let joined = current.tags.join(" ");
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("标签，空格分开"));
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(cx, "标签，空格分开"))
+        });
         input.update(cx, |input, cx| input.set_value(&joined, window, cx));
         // Enter 由输入框自己吃掉（它把按键拦下了，冒泡收不到），
         // 所以这里订阅它的 PressEnter；Esc 走浮层的 `on_key_down`。
@@ -1731,66 +1781,70 @@ impl Pane {
             .cloned()
             .unwrap_or_default();
 
-        let mut card =
-            v_flex()
-                .id("marks-card")
-                .test_support()
-                .w(px(420.))
-                .gap_3()
-                .p_5()
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(border)
-                .bg(cx.theme().background)
-                .child(div().font_semibold().truncate().child(state.name.clone()))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("点一下标色，再点一下去掉"),
-                )
-                .child(
-                    h_flex().gap_2().children(
-                        marks::COLORS
-                            .iter()
-                            .map(|(id, label)| {
-                                let chosen = current.color.as_deref() == Some(*id);
-                                div()
-                                    .id(format!("mark-color-{id}"))
-                                    .test_support()
-                                    .aria_label((*label).to_string())
-                                    .w(px(26.))
-                                    .h(px(26.))
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .bg(rgb(marks::color_hex(id)))
-                                    .border_2()
-                                    .border_color(if chosen { foreground } else { border })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.set_mark_color(id, window, cx)
-                                    }))
-                            })
-                            .collect::<Vec<_>>(),
+        let mut card = v_flex()
+            .id("marks-card")
+            .test_support()
+            .w(px(420.))
+            .gap_3()
+            .p_5()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(border)
+            .bg(cx.theme().background)
+            .child(div().font_semibold().truncate().child(state.name.clone()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(crate::i18n::tr(cx, "点一下标色，再点一下去掉")),
+            )
+            .child(
+                h_flex().gap_2().children(
+                    marks::COLORS
+                        .iter()
+                        .map(|(id, label)| {
+                            let chosen = current.color.as_deref() == Some(*id);
+                            div()
+                                .id(format!("mark-color-{id}"))
+                                .test_support()
+                                .aria_label((*label).to_string())
+                                .w(px(26.))
+                                .h(px(26.))
+                                .rounded_full()
+                                .cursor_pointer()
+                                .bg(rgb(marks::color_hex(id)))
+                                .border_2()
+                                .border_color(if chosen { foreground } else { border })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_mark_color(id, window, cx)
+                                }))
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .child(Input::new(&state.input).w_full())
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("mark-clear")
+                            .label(crate::i18n::tr(cx, "清除标记"))
+                            .small()
+                            .ghost()
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.clear_marks(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("mark-save")
+                            .label(crate::i18n::tr(cx, "完成"))
+                            .small()
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.save_marks(window, cx)),
+                            ),
                     ),
-                )
-                .child(Input::new(&state.input).w_full())
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("mark-clear")
-                                .label("清除标记")
-                                .small()
-                                .ghost()
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.clear_marks(window, cx)),
-                                ),
-                        )
-                        .child(Button::new("mark-save").label("完成").small().on_click(
-                            cx.listener(|this, _, window, cx| this.save_marks(window, cx)),
-                        )),
-                );
+            );
         let used = Settings::read(cx).marks.all_tags();
         if !used.is_empty() {
             card = card.child(
@@ -1800,7 +1854,11 @@ impl Pane {
                     .aria_label(used.join(" "))
                     .text_xs()
                     .text_color(muted)
-                    .child(format!("用过的标签：{}", used.join(" "))),
+                    .child(crate::i18n::tr_args(
+                        cx,
+                        "用过的标签：{tags}",
+                        &[("tags", used.join(" "))],
+                    )),
             );
         }
 
@@ -1857,7 +1915,7 @@ impl Pane {
             self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
         }
         self.focus.focus(window, cx);
-        self.update_status();
+        self.update_status(cx);
         cx.notify();
     }
 
@@ -1884,7 +1942,7 @@ impl Pane {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| state.name.clone());
         let dest = archive::unused_dir(self.listing.path(), &stem);
-        self.status = format!("正在解压 {}…", state.name);
+        self.status = crate::i18n::tr_args(cx, "正在解压 {name}…", &[("name", state.name.clone())]);
 
         let (tx, rx) = async_channel::bounded(1);
         let wanted = Vec::new();
@@ -1908,14 +1966,18 @@ impl Pane {
             sources[0]
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "归档".to_string())
+                .unwrap_or_else(|| crate::i18n::tr(cx, "归档"))
         } else {
             base.file_name()
                 .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "归档".to_string())
+                .unwrap_or_else(|| crate::i18n::tr(cx, "归档"))
         };
         let zip = archive::unused_name(&base, &stem, "zip");
-        self.status = format!("正在打包 {}…", zip.display());
+        self.status = crate::i18n::tr_args(
+            cx,
+            "正在打包 {name}…",
+            &[("name", zip.display().to_string())],
+        );
 
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
@@ -1952,12 +2014,19 @@ impl Pane {
         self.archive_busy = None;
         match result {
             Ok((target, files)) => {
-                self.status = format!("{}：{} 个文件", target.display(), files);
+                self.status = crate::i18n::tr_args(
+                    cx,
+                    "{target}：{count} 个文件",
+                    &[
+                        ("target", target.display().to_string()),
+                        ("count", files.to_string()),
+                    ],
+                );
                 self.refresh(cx);
             }
             Err(error) => {
                 self.error = Some(error);
-                self.update_status();
+                self.update_status(cx);
             }
         }
         cx.notify();
@@ -2156,7 +2225,7 @@ impl Pane {
                     .icon(IconName::ChevronLeft)
                     .ghost()
                     .small()
-                    .tooltip("后退")
+                    .tooltip(crate::i18n::tr(cx, "后退"))
                     .disabled(self.back.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
             )
@@ -2165,7 +2234,7 @@ impl Pane {
                     .icon(IconName::ChevronRight)
                     .ghost()
                     .small()
-                    .tooltip("前进")
+                    .tooltip(crate::i18n::tr(cx, "前进"))
                     .disabled(self.forward.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.go_forward(window, cx))),
             )
@@ -2174,7 +2243,7 @@ impl Pane {
                     .icon(IconName::ArrowUp)
                     .ghost()
                     .small()
-                    .tooltip("上一级")
+                    .tooltip(crate::i18n::tr(cx, "上一级"))
                     .disabled(self.listing.path().parent().is_none())
                     .on_click(cx.listener(|this, _, window, cx| this.go_up(window, cx))),
             )
@@ -2186,7 +2255,7 @@ impl Pane {
                     .icon(IconName::RefreshCw)
                     .ghost()
                     .small()
-                    .tooltip("刷新")
+                    .tooltip(crate::i18n::tr(cx, "刷新"))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             // 筛选框在这一行的**最右**：它是"看我眼前这些"，跟"我在哪"
@@ -2224,7 +2293,7 @@ impl Pane {
             .px_3()
             .gap_2()
             .children(self.render_file_ops(cx))
-            .child(self.render_more_menu())
+            .child(self.render_more_menu(cx))
             .child(div().flex_1())
             .children(self.render_view_buttons(cx))
             .child(
@@ -2234,9 +2303,9 @@ impl Pane {
                     .small()
                     .selected(self.details_shown)
                     .tooltip(if self.details_shown {
-                        "收起详情板（Cmd+Alt+O）"
+                        crate::i18n::tr(cx, "收起详情板（Cmd+Alt+O）")
                     } else {
-                        "展开详情板（Cmd+Alt+O）"
+                        crate::i18n::tr(cx, "展开详情板（Cmd+Alt+O）")
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.details_shown = !this.details_shown;
@@ -2299,28 +2368,28 @@ impl Pane {
                 .icon(IconName::FolderPlus)
                 .ghost()
                 .small()
-                .tooltip("新建文件夹（Cmd+Shift+N）")
+                .tooltip(crate::i18n::tr(cx, "新建文件夹（Cmd+Shift+N）"))
                 .disabled(!can_write)
                 .on_click(cx.listener(|this, _, _, cx| this.request_new_folder(cx))),
             Button::new("op-copy")
                 .icon(IconName::Copy)
                 .ghost()
                 .small()
-                .tooltip("拷贝（Cmd+C）")
+                .tooltip(crate::i18n::tr(cx, "拷贝（Cmd+C）"))
                 .disabled(selected == 0)
                 .on_click(cx.listener(|this, _, _, cx| this.request_copy(cx))),
             Button::new("op-cut")
                 .icon(IconName::Scissors)
                 .ghost()
                 .small()
-                .tooltip("剪切（Cmd+X）")
+                .tooltip(crate::i18n::tr(cx, "剪切（Cmd+X）"))
                 .disabled(selected == 0)
                 .on_click(cx.listener(|this, _, _, cx| this.request_cut(cx))),
             Button::new("op-paste")
                 .icon(IconName::ClipboardPaste)
                 .ghost()
                 .small()
-                .tooltip("粘贴（Cmd+V）")
+                .tooltip(crate::i18n::tr(cx, "粘贴（Cmd+V）"))
                 .disabled(!can_paste)
                 .on_click(cx.listener(|this, _, _, cx| this.request_paste(cx))),
         ]
@@ -2333,7 +2402,7 @@ impl Pane {
     /// 每一条的命令面板条目和快捷键都还在（快捷键往往还是最快的入口）。
     ///
     /// 置灰状态跟着选中数走：进得去、看到「当前不能按」比干脆不显示有用。
-    fn render_more_menu(&mut self) -> impl IntoElement {
+    fn render_more_menu(&mut self, cx: &gpui_kit::App) -> impl IntoElement {
         let selected = self.selection.len();
         let quick_look = self.quick_look_target().is_some();
         let archive_is_zip = self.archive_target().is_some();
@@ -2343,12 +2412,12 @@ impl Pane {
             .icon(IconName::Ellipsis)
             .ghost()
             .small()
-            .tooltip("更多操作")
+            .tooltip(crate::i18n::tr(cx, "更多操作"))
             // 下面这个闭包是 `Fn` 而不是 `FnOnce`——`dropdown_menu` 每帧
             // 渲染都会调它一次（菜单实体关掉再开还要重建）。所以 `Rc` 的
             // clone 必须发生在**闭包体内**：写在外面就成了「每次调用都要
             // move 一次同一个 `me`」，第一帧就编译不过（E0507）。
-            .dropdown_menu(move |menu, _window, _cx| {
+            .dropdown_menu(move |menu, _window, cx| {
                 let me_rename = me.clone();
                 let me_bulk = me.clone();
                 let me_trash = me.clone();
@@ -2359,7 +2428,7 @@ impl Pane {
                 let me_archive = me.clone();
 
                 menu.item(
-                    PopupMenuItem::new("重命名")
+                    PopupMenuItem::new(crate::i18n::tr(cx, "重命名"))
                         .icon(IconName::SquarePen)
                         .disabled(selected != 1)
                         .on_click(move |_, _, cx| {
@@ -2367,7 +2436,7 @@ impl Pane {
                         }),
                 )
                 .item(
-                    PopupMenuItem::new("批量重命名")
+                    PopupMenuItem::new(crate::i18n::tr(cx, "批量重命名"))
                         .icon(IconName::TextCursorInput)
                         .disabled(selected < 2)
                         .on_click(move |_, _, cx| {
@@ -2376,7 +2445,7 @@ impl Pane {
                 )
                 .separator()
                 .item(
-                    PopupMenuItem::new("移到回收站")
+                    PopupMenuItem::new(crate::i18n::tr(cx, "移到回收站"))
                         .icon(IconName::Trash)
                         .disabled(selected == 0)
                         .on_click(move |_, _, cx| {
@@ -2385,7 +2454,7 @@ impl Pane {
                 )
                 .separator()
                 .item(
-                    PopupMenuItem::new("复制路径")
+                    PopupMenuItem::new(crate::i18n::tr(cx, "复制路径"))
                         .icon(IconName::Link)
                         .disabled(selected == 0)
                         .on_click(move |_, _, cx| {
@@ -2393,7 +2462,7 @@ impl Pane {
                         }),
                 )
                 .item(
-                    PopupMenuItem::new("复制文件名")
+                    PopupMenuItem::new(crate::i18n::tr(cx, "复制文件名"))
                         .icon(IconName::Signature)
                         .disabled(selected == 0)
                         .on_click(move |_, _, cx| {
@@ -2402,7 +2471,7 @@ impl Pane {
                 )
                 .separator()
                 .item(
-                    PopupMenuItem::new("快速查看")
+                    PopupMenuItem::new(crate::i18n::tr(cx, "快速查看"))
                         .icon(IconName::Eye)
                         .disabled(!quick_look)
                         .on_click(move |_, _, cx| {
@@ -2410,7 +2479,7 @@ impl Pane {
                         }),
                 )
                 .item(
-                    PopupMenuItem::new("在这里打开终端")
+                    PopupMenuItem::new(crate::i18n::tr(cx, "在这里打开终端"))
                         .icon(IconName::Terminal)
                         .on_click(move |_, _, cx| {
                             run_on_pane(&me_term, cx, |pane, cx| pane.open_terminal(cx));
@@ -2418,9 +2487,9 @@ impl Pane {
                 )
                 .item(
                     PopupMenuItem::new(if archive_is_zip {
-                        "查看压缩包内容"
+                        crate::i18n::tr(cx, "查看压缩包内容")
                     } else {
-                        "打包成 Zip"
+                        crate::i18n::tr(cx, "打包成 Zip")
                     })
                     .icon(IconName::FileArchive)
                     .disabled(selected == 0)
@@ -2493,7 +2562,7 @@ impl Pane {
                             // 容器里就是 15px 的净支出，那是最贵的一段宽度。
                             // 只有一个字符，32px 的方块靠 tooltip 说明它是什么。
                             .label("…")
-                            .tooltip("回到上一级")
+                            .tooltip(crate::i18n::tr(cx, "回到上一级"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.navigate_to(target.clone(), true, window, cx);
                             })),
@@ -2622,7 +2691,7 @@ impl Pane {
             // 否则"名称"三个字比下面所有行的文件名右移 20 px。
             .child(div().w(px(20.)).flex_shrink_0())
             .child(div().w(px(8.)).flex_shrink_0())
-            .child(self.header_cell(0, SortKey::Name, "名称", None, cx))
+            .child(self.header_cell(0, SortKey::Name, crate::i18n::tr(cx, "名称"), None, cx))
             .when_some(self.meta_label(cx), |this, label| {
                 this.child(
                     div()
@@ -2632,9 +2701,27 @@ impl Pane {
                         .child(label),
                 )
             })
-            .child(self.header_cell(1, SortKey::Size, "大小", Some(COL_SIZE), cx))
-            .child(self.header_cell(2, SortKey::Modified, "修改时间", Some(COL_MODIFIED), cx))
-            .child(self.header_cell(3, SortKey::Kind, "类型", Some(COL_KIND), cx))
+            .child(self.header_cell(
+                1,
+                SortKey::Size,
+                crate::i18n::tr(cx, "大小"),
+                Some(COL_SIZE),
+                cx,
+            ))
+            .child(self.header_cell(
+                2,
+                SortKey::Modified,
+                crate::i18n::tr(cx, "修改时间"),
+                Some(COL_MODIFIED),
+                cx,
+            ))
+            .child(self.header_cell(
+                3,
+                SortKey::Kind,
+                crate::i18n::tr(cx, "类型"),
+                Some(COL_KIND),
+                cx,
+            ))
     }
 
     /// `width` 为 `None` 时这一列吃掉剩余宽度（名称列）。
@@ -2642,7 +2729,7 @@ impl Pane {
         &self,
         index: usize,
         key: SortKey,
-        label: &str,
+        label: String,
         width: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2840,7 +2927,7 @@ impl Pane {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     this.select_row(path.clone(), event.modifiers);
-                    this.update_status();
+                    this.update_status(cx);
                     // 双击打开只在“干净”的点击下发生，带修饰键时用户是在多选。
                     let plain_double_click = event.click_count >= 2
                         && !event.modifiers.shift
@@ -2879,7 +2966,7 @@ impl Pane {
             .id("file-list")
             // 让集成测试能一眼看出"现在是列表还是网格"，顺带给读屏软件报一声。
             .test_support()
-            .aria_label("列表视图")
+            .aria_label(crate::i18n::tr(cx, "列表视图"))
             .relative()
             .flex_1()
             .min_h_0()
@@ -2904,9 +2991,12 @@ impl Pane {
     /// 空目录（或筛选后一个都不剩）时的居中提示，两种视图共用。
     fn render_empty(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let (icon, label) = if self.listing.query().is_empty() {
-            (IconName::FolderOpen, "这个文件夹是空的")
+            (
+                IconName::FolderOpen,
+                crate::i18n::tr(cx, "这个文件夹是空的"),
+            )
         } else {
-            (IconName::SearchX, "没有匹配的项目")
+            (IconName::SearchX, crate::i18n::tr(cx, "没有匹配的项目"))
         };
         div()
             // 带 id 才有 `Stateful<Div>`，拖放那几个方法挂在它上面。
@@ -2922,7 +3012,15 @@ impl Pane {
                     .items_center()
                     .text_color(cx.theme().muted_foreground)
                     .child(Icon::new(icon).size_8())
-                    .child(div().text_sm().child(label)),
+                    // 观察点与无障碍名放在**内层**这个 div 上，不放外层：
+                    // 外层的返回类型是 `Stateful<Div>`（拖放方法挂在它上面），
+                    // 而 `.test_support()` 会把它包成 `Observed<…>`，类型就变了。
+                    // 文字本来就在这一层，放这里正好。
+                    .id("empty-hint-label")
+                    .test_support()
+                    .aria_label(label.clone())
+                    .text_sm()
+                    .child(label),
             )
     }
 
@@ -2943,7 +3041,7 @@ impl Pane {
         let grid = v_flex()
             .id("file-grid")
             .test_support()
-            .aria_label("网格视图")
+            .aria_label(crate::i18n::tr(cx, "网格视图"))
             .relative()
             .flex_1()
             .min_h_0()
@@ -3076,7 +3174,7 @@ impl Pane {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     this.select_row(path.clone(), event.modifiers);
-                    this.update_status();
+                    this.update_status(cx);
                     let plain_double_click = event.click_count >= 2
                         && !event.modifiers.shift
                         && !event.modifiers.secondary();
@@ -3112,7 +3210,7 @@ impl Pane {
         h_flex()
             .id("columns")
             .test_support()
-            .aria_label("分列视图")
+            .aria_label(crate::i18n::tr(cx, "分列视图"))
             .flex_1()
             .min_h_0()
             .gap(px(COLUMN_GAP))
@@ -3354,13 +3452,13 @@ impl Pane {
                             this.navigate_to(path.clone(), true, window, cx);
                         } else if let Err(error) = open::that(&path) {
                             this.error = Some(error.to_string());
-                            this.update_status();
+                            this.update_status(cx);
                             cx.notify();
                         }
                         return;
                     }
                     this.select_row(path.clone(), event.modifiers);
-                    this.update_status();
+                    this.update_status(cx);
                     let plain_double_click = event.click_count >= 2
                         && !event.modifiers.shift
                         && !event.modifiers.secondary();
@@ -3735,9 +3833,15 @@ impl Pane {
                         .truncate()
                         .child(entry.name.clone()),
                 )
-                .child(detail_row("类型", entry.kind_label(), cx))
+                .child(detail_row(
+                    "类型",
+                    crate::i18n::tr(cx, "类型"),
+                    entry.kind_label(),
+                    cx,
+                ))
                 .child(detail_row(
                     "大小",
+                    crate::i18n::tr(cx, "大小"),
                     if entry.is_dir {
                         "—".to_string()
                     } else {
@@ -3745,7 +3849,12 @@ impl Pane {
                     },
                     cx,
                 ))
-                .child(detail_row("修改", format::modified(entry.modified), cx))
+                .child(detail_row(
+                    "修改",
+                    crate::i18n::tr(cx, "修改"),
+                    format::modified(entry.modified),
+                    cx,
+                ))
                 // 云盘状态只对选中那一项判：判一次要问一次文件系统，
                 // 列表里十万行不能每行问一遍。
                 .when_some(
@@ -3753,6 +3862,7 @@ impl Pane {
                     |this, (root, state)| {
                         this.child(detail_row(
                             "云盘",
+                            crate::i18n::tr(cx, "云盘"),
                             format!("{} · {}", root.label(), state.label()),
                             cx,
                         ))
@@ -3760,9 +3870,16 @@ impl Pane {
                 )
                 .when_some(
                     mark_text(Settings::read(cx).marks.get(entry.path.as_path())),
-                    |this, text| this.child(detail_row("标记", text, cx)),
+                    |this, text| {
+                        this.child(detail_row("标记", crate::i18n::tr(cx, "标记"), text, cx))
+                    },
                 )
-                .child(detail_row("位置", entry.path.display().to_string(), cx))
+                .child(detail_row(
+                    "位置",
+                    crate::i18n::tr(cx, "位置"),
+                    entry.path.display().to_string(),
+                    cx,
+                ))
                 .into_any_element(),
             None if self.selection.len() > 1 => {
                 let selected = self.selection.ordered(&self.listing);
@@ -3798,7 +3915,7 @@ impl Pane {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("批量操作会按列表顺序逐个应用。"),
+                            .child(crate::i18n::tr(cx, "批量操作会按列表顺序逐个应用。")),
                     )
                     .into_any_element()
             }
@@ -3809,7 +3926,11 @@ impl Pane {
                 .gap_3()
                 .text_color(cx.theme().muted_foreground)
                 .child(Icon::new(IconName::PanelRight).size_8())
-                .child(div().text_sm().child("选择一个项目查看详情"))
+                .child(
+                    div()
+                        .text_sm()
+                        .child(crate::i18n::tr(cx, "选择一个项目查看详情")),
+                )
                 .into_any_element(),
         };
 
@@ -3822,7 +3943,12 @@ impl Pane {
             .border_l_1()
             .border_color(cx.theme().border)
             .p_4()
-            .child(div().pb_4().font_semibold().child("详细信息"))
+            .child(
+                div()
+                    .pb_4()
+                    .font_semibold()
+                    .child(crate::i18n::tr(cx, "详细信息")),
+            )
             .child(content)
     }
 
@@ -3847,10 +3973,18 @@ impl Pane {
                     .truncate()
                     .child(self.status.clone()),
             )
-            .child(div().flex_shrink_0().child(format!(
-                "按{}{}",
-                sort_label(sort),
-                if sort.descending { "降序" } else { "升序" }
+            .child(div().flex_shrink_0().child(crate::i18n::tr_args(
+                cx,
+                "按{key}{order}",
+                &[
+                    ("key", sort_label(sort, cx)),
+                    // 升序/降序整个词都要查表，所以先查好再当实参传进去，
+                    // 不在实参位置上再查一次。
+                    (
+                        "order",
+                        crate::i18n::tr(cx, if sort.descending { "降序" } else { "升序" }),
+                    ),
+                ],
             )))
     }
 }
@@ -3884,10 +4018,20 @@ impl Pane {
         let mut map = keymap::KeyMap::read(cx);
         if matches!(key.as_str(), "backspace" | "delete") {
             map.clear(command);
-            self.status = format!("{} 已恢复出厂按键", Self::command_title(command));
+            self.status = crate::i18n::tr_args(
+                cx,
+                "{title} 已恢复出厂按键",
+                &[("title", Self::command_title(command, cx))],
+            );
         } else {
             map.set(command, key.clone());
-            self.status = format!("{} 改为 {}，重启后生效", Self::command_title(command), key);
+            // 带名字的占位符：英文是 "{title} is now {key}，takes effect after restart"，
+            // 实参位置跟中文不同，位置占位符换不了。
+            self.status = crate::i18n::tr_args(
+                cx,
+                "{title} 改为 {key}，重启后生效",
+                &[("title", Self::command_title(command, cx)), ("key", key)],
+            );
         }
         map.save(cx);
         // 浮层一撤，焦点就没了着落；不还回列表，Cmd+P 这类带上下文的键会失灵。
@@ -3902,8 +4046,14 @@ impl Pane {
         cx.notify();
     }
 
-    fn command_title(command: PaneCommand) -> &'static str {
-        match command {
+    /// 窗格内部用的**短标题**（状态栏、按键浮层）。
+    ///
+    /// **故意比命令面板那套短**："拷贝"而不是"拷贝选中项"、"刷新"而不是
+    /// "刷新当前目录"。窗格工具条上每一格只有几十像素宽，长标题要么被截断、
+    /// 要么把整条工具条挤宽；而面板是纵向列表，宽裕，标题说全更清楚。
+    /// 两套文案各自翻，不要试图合成一套——合成的结果是窗格里也变长。
+    fn command_title(command: PaneCommand, cx: &gpui_kit::App) -> String {
+        let text = match command {
             PaneCommand::NewFolder => "新建文件夹",
             PaneCommand::Rename => "重命名",
             PaneCommand::BulkRename => "批量重命名",
@@ -3927,7 +4077,8 @@ impl Pane {
             PaneCommand::ViewColumns => "分列视图",
             PaneCommand::Analyze => "分析：大小 / 重复 / 校验和",
             PaneCommand::EditRemote => "编辑远程文件（保存即回传）",
-        }
+        };
+        crate::i18n::tr(cx, text)
     }
 
     /// 录按键的浮层：整个窗格盖住，等你按一下。
@@ -3935,7 +4086,7 @@ impl Pane {
         let Some(command) = self.capturing else {
             return div().into_any_element();
         };
-        let title = Self::command_title(command);
+        let title = Self::command_title(command, cx);
         let current = keymap::KeyMap::read(cx).key_for(command);
         let muted = cx.theme().muted_foreground;
 
@@ -3972,7 +4123,11 @@ impl Pane {
                     .border_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
-                    .child(div().font_semibold().child(format!("给「{title}」按个键")))
+                    .child(div().font_semibold().child(crate::i18n::tr_args(
+                        cx,
+                        "给「{title}」按个键",
+                        &[("title", title.clone())],
+                    )))
                     .child(
                         div()
                             .id("key-capture-current")
@@ -3981,16 +4136,20 @@ impl Pane {
                             .text_sm()
                             .text_color(muted)
                             .child(if current.is_empty() {
-                                "现在是：没有按键".to_string()
+                                crate::i18n::tr(cx, "现在是：没有按键")
                             } else {
-                                format!("现在是：{current}")
+                                crate::i18n::tr_args(
+                                    cx,
+                                    "现在是：{current}",
+                                    &[("current", current.clone())],
+                                )
                             }),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("退格 = 恢复出厂，Esc = 取消"),
+                            .child(crate::i18n::tr(cx, "退格 = 恢复出厂，Esc = 取消")),
                     ),
             )
             .into_any_element()
@@ -4007,7 +4166,14 @@ impl Pane {
 
         let files = state.entries.iter().filter(|entry| !entry.is_dir).count();
         let total: u64 = state.entries.iter().map(|entry| entry.size).sum();
-        let subtitle = format!("{} 个文件 · 共 {}", files, format::file_size(total));
+        let subtitle = crate::i18n::tr_args(
+            cx,
+            "{files} 个文件 · 共 {total}",
+            &[
+                ("files", files.to_string()),
+                ("total", format::file_size(total)),
+            ],
+        );
 
         let body = match &state.error {
             Some(error) => div()
@@ -4031,7 +4197,7 @@ impl Pane {
                 .justify_center()
                 .text_sm()
                 .text_color(muted)
-                .child("这个包是空的")
+                .child(crate::i18n::tr(cx, "这个包是空的"))
                 .into_any_element(),
             None => div()
                 .id("archive-entries")
@@ -4101,14 +4267,18 @@ impl Pane {
                             .gap_2()
                             .child(
                                 Button::new("archive-extract")
-                                    .label(format!("解压到「{stem}」"))
+                                    .label(crate::i18n::tr_args(
+                                        cx,
+                                        "解压到「{stem}」",
+                                        &[("stem", stem.clone())],
+                                    ))
                                     .small()
                                     .disabled(state.error.is_some() || busy)
                                     .on_click(cx.listener(|this, _, _, cx| this.extract_here(cx))),
                             )
                             .child(
                                 Button::new("archive-close")
-                                    .label("关闭（Esc）")
+                                    .label(crate::i18n::tr(cx, "关闭（Esc）"))
                                     .ghost()
                                     .small()
                                     .on_click(cx.listener(|this, _, _, cx| this.close_archive(cx))),
@@ -4277,13 +4447,15 @@ impl Render for Pane {
     }
 }
 
-fn sort_label(sort: Sort) -> &'static str {
-    match sort.key {
+/// 状态栏里"现在按哪一列排"的标签（"名称 升序"那半句的前半截）。
+fn sort_label(sort: Sort, cx: &gpui_kit::App) -> String {
+    let text = match sort.key {
         SortKey::Name => "名称",
         SortKey::Size => "大小",
         SortKey::Modified => "修改时间",
         SortKey::Kind => "类型",
-    }
+    };
+    crate::i18n::tr(cx, text)
 }
 
 /// 详情面板里"标记"那一行：颜色加标签，两样都没有就不显示。
@@ -4300,19 +4472,27 @@ fn mark_text(mark: Option<&crate::marks::Mark>) -> Option<String> {
     Some(parts.join(" · "))
 }
 
-fn detail_row(label: &str, value: String, cx: &App) -> impl IntoElement {
+/// 详情面板里的一行：左边标签（类型 / 大小 / 修改…），右边值。
+///
+/// `label` 收 `String` 而不是 `&str`：它已经查过表了（`tr()` 返回 `String`），
+/// 让调用方再从 `&str` 转一次是白转。
+///
+/// **`key` 是稳定的英文标识，与 `label` 分开**：元素 id 用来让测试和界面调试
+/// 定位"哪一行"，不能跟着界面语言变——否则切到英文之后 `detail-云盘`
+/// 就找不到了，而那行内容一个字都没变。
+fn detail_row(key: &'static str, label: String, value: String, cx: &App) -> impl IntoElement {
     v_flex()
         .gap_1()
         .child(
             div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(label.to_string()),
+                .child(label),
         )
         .child(
             div()
                 // 每一行都挂 id：界面调试和集成测试按"哪一行"定位，不用数第几个。
-                .id(format!("detail-{label}"))
+                .id(format!("detail-{key}"))
                 .test_support()
                 .aria_label(value.clone())
                 .text_sm()
