@@ -553,7 +553,10 @@ impl WFilesApp {
             .bg(cx.theme().sidebar)
             .child(
                 h_flex()
-                    .h(px(52.))
+                    // 40 不是随手取的：右侧地址栏那一行就是 40 px。
+                    // 两边不等高的话，右侧第二行（工具栏）会在侧栏这条
+                    // 分隔线下面露出来，看着像错位。
+                    .h(px(40.))
                     .px_3()
                     .gap_3()
                     .flex_shrink_0()
@@ -2954,6 +2957,15 @@ impl WFilesApp {
             .ghost()
             .small()
             .icon(IconName::Undo2)
+            // `max_w` 不是装饰：`Button` 的根节点写死 `flex_shrink_0`，
+            // 在任何 flex 容器里都不会收缩。而 `describe()` 会把两个完整
+            // 文件名拼进标签（"重命名 X 为 Y"），实测两个 60 字的中文名
+            // 能把按钮撑到 1278 px——装在 1180 px 的窗口里，右边缘 1338 px，
+            // 整个状态栏被它顶出屏幕。
+            //
+            // 完整描述在 tooltip 与无障碍名里都留着，标签只负责一眼看出
+            // "能撤什么"，不负责读全。
+            .max_w(px(260.))
             .tooltip(match &undo_label {
                 Some(label) => format!("撤销：{label}（Cmd+Z）"),
                 None => "暂无可撤销的操作".to_string(),
@@ -2967,6 +2979,8 @@ impl WFilesApp {
             );
 
         h_flex()
+            .id("status-bar")
+            .test_support()
             .h(px(34.))
             .px_3()
             .gap_3()

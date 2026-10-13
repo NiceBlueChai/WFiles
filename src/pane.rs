@@ -2096,29 +2096,39 @@ impl Pane {
 
     // ---- 渲染 ----
 
+    /// 顶部两行：**地址栏一行 + 工具栏一行**（跟 Win11 Explorer 一样）。
+    ///
+    /// 为什么不是挤在一行：地址栏是"我在哪"，工具栏是"我能做什么"，
+    /// 两件事的信息密度完全不同。地址栏那一行里真正不可压缩的只有
+    /// 3 颗导航 + 刷新 + 筛选框 = 328 px；工具栏那一行 4 颗操作 + 更多 +
+    /// 3 颗视图 + 详情开关 = 216 px。**分开摆，两行都装得下**——
+    /// 520 px 的窗口收掉侧栏之后还有 472 px，两行各自都富余。
+    ///
+    /// 挤在一行时是 908 px，比任何一档窗口都宽，于是我先砍按钮、再加
+    /// 折叠开关、还给筛选框设上限——全是给这个错误结构打的补丁。
+    /// 结构对了，那些补丁里有一半不必存在。
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .id("toolbar")
-            .h(px(52.))
-            .px_3()
-            .gap_2()
+        v_flex()
             .flex_shrink_0()
-            // 工具栏这一排的固有宽度是 908 px（实测），而窗口最窄能给到的
-            // 只有 392 px。`h_flex` 带的是 `items_center`，那种情况下
-            // flex 容器遇到超宽内容**不会重新分配**，子元素照旧按自己的
-            // 固有宽度往右排——于是筛选框钉在 x=534，右侧按钮画到窗外。
-            //
-            // `overflow_x_scroll` 让这一排变成自己的滚动容器：内容超出时
-            // 它自己滚，而不是把按钮甩到屏幕外。面包屑（`flex_1`）会先被
-            // 压掉，所以正常宽度下根本不会触发滚动。
-            .overflow_x_scroll()
             .border_b_1()
             .border_color(cx.theme().border)
+            .child(self.render_address_bar(cx))
+            .child(self.render_command_bar(cx))
+    }
+
+    /// 第一行：后退 / 前进 / 上一级 + 面包屑 + 刷新 + 筛选框。
+    fn render_address_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("address-bar")
             .test_support()
+            .h(px(40.))
+            .px_3()
+            .gap_2()
             .child(
                 Button::new("back")
                     .icon(IconName::ChevronLeft)
                     .ghost()
+                    .small()
                     .tooltip("后退")
                     .disabled(self.back.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
@@ -2127,6 +2137,7 @@ impl Pane {
                 Button::new("forward")
                     .icon(IconName::ChevronRight)
                     .ghost()
+                    .small()
                     .tooltip("前进")
                     .disabled(self.forward.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.go_forward(window, cx))),
@@ -2135,23 +2146,60 @@ impl Pane {
                 Button::new("up")
                     .icon(IconName::ArrowUp)
                     .ghost()
+                    .small()
                     .tooltip("上一级")
                     .disabled(self.listing.path().parent().is_none())
                     .on_click(cx.listener(|this, _, window, cx| this.go_up(window, cx))),
             )
+            // 面包屑吃掉这一行剩下的全部宽度：窄的时候它先被压到 18px，
+            // 再窄就只剩那条分隔线，但筛选框与刷新永远还在。
             .child(self.render_breadcrumb(cx))
             .child(
                 Button::new("refresh")
                     .icon(IconName::RefreshCw)
                     .ghost()
+                    .small()
                     .tooltip("刷新")
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
+            // 筛选框在这一行的**最右**：它是"看我眼前这些"，跟"我在哪"
+            // 是两回事，挤在导航按钮旁边会让人以为它也是导航。
+            //
+            // 宽度写在槽上而不是 `Input` 上：`Input` 是固定宽度时它自己
+            // 就是布局的硬底，槽再怎么缩也缩不动它。
+            .child(
+                div()
+                    .id("filter-slot")
+                    .test_support()
+                    .min_w(px(96.))
+                    .max_w(px(200.))
+                    .flex_shrink(1.)
+                    .child(
+                        Input::new(&self.filter)
+                            .prefix(Icon::new(IconName::Search).size_4())
+                            .cleanable(true)
+                            .min_w(px(96.))
+                            .w_full(),
+                    ),
+            )
+    }
+
+    /// 第二行：文件操作 + 「更多」+ 视图切换 + 详情板开关。
+    ///
+    /// 这一行**不做任何横向压缩**：它最宽也只有 216 px，而地址栏行已经
+    /// 把面包屑能压的都压掉了。不加 `overflow_x_scroll`——加了就是"这里
+    /// 迟早会溢出"的自我承认，而实测它在任何窗口宽度下都不溢出。
+    fn render_command_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("command-bar")
+            .test_support()
+            .h(px(40.))
+            .px_3()
+            .gap_2()
             .children(self.render_file_ops(cx))
             .child(self.render_more_menu())
+            .child(div().flex_1())
             .children(self.render_view_buttons(cx))
-            // 详情板开关放在筛选框**左边**：窄窗口下最先被挤掉的是右边的
-            // 东西，而"把详情板收起来"正是窄窗口下最该能点到的那一下。
             .child(
                 Button::new("toggle-details")
                     .icon(IconName::PanelRight)
@@ -2167,35 +2215,6 @@ impl Pane {
                         this.details_shown = !this.details_shown;
                         cx.notify();
                     })),
-            )
-            .child(
-                // 套一层 `div` 只为了有个可查的 element id：布局回归测试要量
-                // 「筛选框还在不在窗口里」，`Input` 自己不带可查的 id。
-                // `test_support()` 是 opt-in 的——不调它这个元素在观察表里
-                // 没有条目，测试会以为筛选框不存在。
-                //
-                // 宽度写在**槽**上而不是 `Input` 上：`Input` 是固定宽度时
-                // 它自己是布局的硬底，槽再怎么缩也缩不动它（实测 700 px
-                // 窗口收掉两侧边框后，筛选框仍然钉在 x=534 撑到 734）。
-                // 槽可收缩、`Input` 填满槽，窄窗口下筛选框才会真的让位。
-                div()
-                    .id("filter-slot")
-                    .test_support()
-                    .min_w(px(96.))
-                    .max_w(px(200.))
-                    .flex_shrink(1.)
-                    .child(
-                        Input::new(&self.filter)
-                            .prefix(Icon::new(IconName::Search).size_4())
-                            .cleanable(true)
-                            // `min_w` 不是装饰：工具栏里那颗「更多」是
-                            // `flex_shrink_0`，筛选框不给下限就可能被压成一条缝。
-                            // 到了连 `min_w` 都保不住的时候，宁可让工具栏自己
-                            // 横向滚动，也不能让筛选框消失——那是用户唯一能
-                            // 看见"我在筛选"的地方。
-                            .min_w(px(96.))
-                            .w_full(),
-                    ),
             )
     }
 
@@ -2233,16 +2252,16 @@ impl Pane {
 
     /// 文件操作按钮组：**常显的四颗**。
     ///
-    /// 为什么不是十二颗平铺（这是 `docs/ui-redesign.md` §0 定的方案）：
-    /// 十二颗不可收缩的按钮钉在工具栏上要 672 px（4 颗 32px 加 15 颗 24px，
-    /// 再加内边距和 20 道间隙），而侧栏与详情板各吃掉 210 / 260 px 之后，
-    /// 默认 1180 px 窗口只剩 710 px 给工具栏——筛选框被压到 44 px，
-    /// 分栏时更是直接溢出 449 px，右侧按钮画到窗格外头、点不到。
+    /// 留在外面的是**最高频**的：新建文件夹、拷贝、剪切、粘贴。粘贴紧跟
+    /// 在剪切后面，两个连着按才是「移动」这个最常见的组合。
     ///
-    /// 留下的四颗是**最高频**的：新建文件夹、拷贝、剪切、粘贴。
-    /// 粘贴紧跟在剪切后面，两个连着按才是"移动"这个最常见的组合。
-    /// 删除也高频，但它是不可逆动作，位置太显眼了反而危险——
-    /// 放进「更多」里（那里和批量重命名、压缩包这些低频操作作伴）。
+    /// 删除也高频，但它不可逆，位置太显眼反而危险——放进「更多」里，
+    /// 那里和批量重命名、压缩包这些低频操作作伴。
+    ///
+    /// **注意理由不是「放不下」**：工具栏独占一行，216 px 就够摆十几颗，
+    /// 哪儿都放得下。收进菜单是为了**少读一遍**——一排十二颗图标按钮里
+    /// 十颗用户一年按不到两次，那些图标只是在稀释那四颗真正有用的。
+    /// （`docs/ui-redesign.md` §0 定的也是「5 常显 + 1 更多」。）
     fn render_file_ops(&mut self, cx: &mut Context<Self>) -> Vec<Button> {
         let selected = self.selection.len();
         let can_write = self.error.is_none();

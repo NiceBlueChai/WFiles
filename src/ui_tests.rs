@@ -3893,29 +3893,22 @@ fn selected_names(cx: &mut TestAppContext, app: &gpui_kit::Entity<WFilesApp>) ->
         .collect()
 }
 
-/// 工具栏的筛选框不能被挤出可视范围。
+/// 顶部两行（地址栏 + 工具栏）在任何窗口宽度下都不越界。
 ///
-/// 这是一条**布局回归测试**，守的是实测过的真缺陷。修之前量到的四档：
+/// 这条守着**结构**：Win11 Explorer 是两行，地址栏一行、工具栏一行。
+/// 原来 WFiles 把两者挤在一行，那一排固有宽度 908 px，比任何一档窗口都
+/// 宽——于是我先砍按钮、再加侧栏折叠、还给筛选框设上限，全是给这个错误
+/// 结构打的补丁。
 ///
-/// | 窗口 | 侧栏 | 详情板 | 工具栏可用 | 筛选框右边缘 |
-/// |---|---|---|---|---|
-/// | 1180 | 210 | 260 | 710 | 908（贴边） |
-/// | 900 | 210 | 260 | 430 | **864 → 溢出窗口** |
-/// | 700 | 210 | 260 | 230 | 896 |
-/// | 520 | 210 | 260 | 50 | 896 |
+/// 拆开之后各行的固定部分（实测按钮宽度）：
+/// - 地址栏行：3 颗导航 96 + 刷新 32 + 筛选框 200 = 328 px
+/// - 工具栏行：4 颗操作 96 + 更多 24 + 3 颗视图 72 + 详情 24 = 216 px
 ///
-/// 筛选框在四档里 x 都钉在 664/708 —— 它压根没跟着窗口动，因为这一排
-/// 按钮全是 `flex_shrink_0`，而外层那层 `h_flex` 缺 `min_w_0`，整排于是
-/// 以 908 px 的固有宽度向右溢出，右侧那些按钮画到屏幕外，**看得见却点不到**。
-///
-/// 判据按窗口宽度分两档，因为**要求本身不一样**：
-/// - 宽到 900 px 以上：用户什么都不用做，界面就该是完整的。这是最常见的情况。
-/// - 窄于此：工具栏那一排固有宽度 908 px，物理上塞不进 520 px 的窗口——
-///   这时用户要的是"**有一条能把它救回来的路**"，而不是"本来就该装得下"。
-///   那条路就是收起侧栏（Cmd+B），下面另一条测试守着它。
+/// 所以两行在 520 px 窗口（侧栏收起后 472 px）里都装得下，**一行都不需要
+/// 裁**。判据是每行的右边缘不超过窗口右边界。
 #[gpui_kit::test]
-fn the_filter_box_stays_inside_the_window_at_normal_widths(cx: &mut TestAppContext) {
-    for width in [1180.0f32, 960.0, 900.0] {
+fn both_top_rows_stay_inside_the_window_at_every_width(cx: &mut TestAppContext) {
+    for width in [1180.0f32, 900.0, 700.0, 520.0] {
         let dir = tempfile::tempdir().expect("临时目录");
         for i in 0..30 {
             std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
@@ -3923,42 +3916,112 @@ fn the_filter_box_stays_inside_the_window_at_normal_widths(cx: &mut TestAppConte
         let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
         step(cx, handle, settle);
 
-        let bounds = step_value(cx, handle, |window, _| {
-            window
-                .try_find("filter-slot")
-                .map(|element| element.bounds())
-        })
-        .unwrap_or_else(|| panic!("窗口 {width}：工具栏上找不到筛选框（元素 id 变了？）"));
+        for row in ["address-bar", "command-bar"] {
+            let bounds = step_value(cx, handle, |window, _| {
+                window
+                    .try_find(row.to_string())
+                    .map(|element| element.bounds())
+            })
+            .unwrap_or_else(|| panic!("窗口 {width}：找不到 {row}（element id 变了？）"));
 
-        assert!(
-            bounds.size.width >= px(96.),
-            "窗口 {width}：筛选框被压到 {} px，连它自己的 min_w 都没保住",
-            bounds.size.width,
-        );
-        assert!(
-            bounds.origin.x + bounds.size.width <= px(width),
-            "窗口 {width}：筛选框右边缘在 x={} px，超出窗口右边界，\
-             用户看不见也点不到",
-            bounds.origin.x + bounds.size.width,
-        );
+            assert!(
+                bounds.origin.x + bounds.size.width <= px(width),
+                "窗口 {width}：{row} 右边缘在 x={} px（宽 {}），超出窗口——\
+                 地址栏与工具栏分两行时每一行都装得下，越界说明又挤回一行了",
+                bounds.origin.x + bounds.size.width,
+                bounds.size.width,
+            );
+        }
     }
 }
 
-/// 窗口窄到工具栏塞不下时，把两侧固定边框收掉必须真的把它救回来。
+/// 地址栏与工具栏必须是**两行**，而且地址栏在上。
 ///
-/// 这是窄窗口的**唯一出路**，所以它得管用。
-///
-/// 实测出来的三个数字决定了要收几个：工具栏那一排的固有宽度是 590 px
-/// （3 颗 32px 导航 + 18px 面包屑 + 32px 刷新 + 8 颗 24px + 200px 筛选框），
-/// 侧栏 210 px、详情板 260 px。所以：
-/// - 900 px 窗口：收侧栏就够（900 − 48 = 852 > 590）
-/// - 700 px：两个都得收（700 − 48 − 0 = 652 > 590）
-/// - 520 px：两个都收完只剩 472 px，仍然不够——这一档**装不下**，
-///   工具栏会横向滚动。这是如实记录，不是失败：520 px 窗口本身就
-///   放不下一个文件管理器的完整工具栏。
+/// 这条守的是结构本身而不是某一处的位置：把两者合并回一行是"修不动宽度"
+/// 时最容易想到的招，而它恰恰是问题的起因。用户在这两行里找的是两种
+/// 不同的东西——"我在哪"和"我能做什么"。
 #[gpui_kit::test]
-fn collapsing_the_fixed_borders_gives_the_toolbar_room_to_fit(cx: &mut TestAppContext) {
-    for width in [900.0f32, 700.0] {
+fn the_address_bar_and_the_command_bar_are_separate_rows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    for i in 0..30 {
+        std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
+    }
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 1180.);
+    step(cx, handle, settle);
+
+    let (address, command) = step_value(cx, handle, |window, _| {
+        let read = |id: &str| window.try_find(id.to_string()).map(|e| e.bounds());
+        (read("address-bar"), read("command-bar"))
+    });
+    let address = address.expect("地址栏行");
+    let command = command.expect("工具栏行");
+
+    assert_eq!(
+        address.origin.x, command.origin.x,
+        "两行左边缘应当对齐（都是内边距起头）",
+    );
+    assert_eq!(
+        address.size.width, command.size.width,
+        "两行应当一样宽——它们是同一个容器里的两个兄弟",
+    );
+    assert!(
+        address.origin.y < command.origin.y,
+        "地址栏必须在工具栏**上面**：地址栏 y={}，工具栏 y={}",
+        address.origin.y,
+        command.origin.y,
+    );
+}
+
+/// 筛选框在地址栏行的最右端，工具栏那一行不碰它。
+///
+/// 筛选框是"看我眼前这些"，跟"我在哪"是两回事。挤在导航按钮旁边会让人
+/// 以为它也是导航的一部分，于是打完字不知道该往哪看。
+#[gpui_kit::test]
+fn the_filter_box_sits_at_the_right_end_of_the_address_bar(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    for i in 0..30 {
+        std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
+    }
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 1180.);
+    step(cx, handle, settle);
+
+    let (address, filter, last_op) = step_value(cx, handle, |window, _| {
+        let read = |id: &str| window.try_find(id.to_string()).map(|e| e.bounds());
+        (read("address-bar"), read("filter-slot"), read("op-paste"))
+    });
+    let address = address.expect("地址栏行");
+    let filter = filter.expect("筛选框");
+    let last_op = last_op.expect("粘贴按钮（工具栏行最后一颗常显）");
+
+    // 两行各自独立：工具栏那颗粘贴按钮的行位置与筛选框差一整行。
+    assert!(
+        (last_op.origin.y - filter.origin.y).abs() > px(20.),
+        "粘贴按钮 y={} 与筛选框 y={} 挨得太近——它们看起来还在同一行",
+        last_op.origin.y,
+        filter.origin.y,
+    );
+    // 筛选框贴着地址栏右端。
+    let right_gap = address.origin.x + address.size.width - (filter.origin.x + filter.size.width);
+    assert!(
+        right_gap <= px(16.),
+        "筛选框离地址栏右边缘还有 {right_gap:?} px，它该贴着右端",
+    );
+    // 宽度上限还在（200 px 设计值），窄窗口下才让位。
+    assert!(
+        filter.size.width <= px(200.),
+        "筛选框宽 {} px，超出设计的 200 px 上限",
+        filter.size.width,
+    );
+}
+
+/// 侧栏折叠仍然管用——两条边框加起来 470 px，窄窗口下要还给内容区。
+///
+/// 这一条跟两行布局是配套的：拆成两行之后每一行都装得下，但
+/// 「侧栏 210 + 详情板 260 = 470 px 的固定边框」还在，520 px 的窗口里
+/// 内容区只剩 50 px。折叠是那道保险，不是拆两行的替代品。
+#[gpui_kit::test]
+fn collapsing_the_fixed_borders_gives_the_content_room(cx: &mut TestAppContext) {
+    for width in [900.0f32, 700.0, 520.0] {
         let dir = tempfile::tempdir().expect("临时目录");
         for i in 0..30 {
             std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
@@ -3978,62 +4041,24 @@ fn collapsing_the_fixed_borders_gives_the_toolbar_room_to_fit(cx: &mut TestAppCo
             window.press("cmd-alt-o", cx);
             settle(window, cx);
         });
-        let found = step_value(cx, handle, |window, _| {
-            let read = |id: &str| window.try_find(id.to_string()).map(|e| e.bounds());
-            (read("toolbar"), read("filter-slot"))
-        });
-        let toolbar = found.0.expect("工具栏");
-        let filter = found.1.expect("筛选框");
 
-        // 收起不是"没有"，是 48 px 的图标条（位置入口还得留着）。
-        // 断言的是"确实收窄了"而不是"顶到左边缘"——后者会把
-        // 「收起态画成了 0 宽的壳」这种更糟的形态判成通过。
+        let address = step_value(cx, handle, |window, _| {
+            window.try_find("address-bar").map(|e| e.bounds())
+        })
+        .expect("地址栏行");
         assert_eq!(
-            toolbar.origin.x,
+            address.origin.x,
             px(48.),
-            "窗口 {width}：收起后侧栏应当是 48 px 的图标条，工具栏从那儿开始，\
+            "窗口 {width}：侧栏收起后应当是 48 px 的图标条，地址栏从那儿开始，\
              实测 x={}",
-            toolbar.origin.x,
+            address.origin.x,
         );
-        assert!(
-            filter.origin.x + filter.size.width <= px(width),
-            "窗口 {width}：两侧都收起后筛选框右边缘仍在 x={} px，\
-             仍然超出窗口——这条路没把用户救回来",
-            filter.origin.x + filter.size.width,
+        assert_eq!(
+            address.size.width,
+            px(width - 48.),
+            "窗口 {width}：两侧收起后地址栏应当正好占满剩下的宽度",
         );
     }
-}
-
-/// 520 px 窗口装不下完整工具栏，但**不能把按钮甩到屏幕外**。
-///
-/// 这一档守的是「有路可走」：工具栏自己横向滚动（`overflow_x_scroll`），
-/// 内容超出时用户还能滚过去点到，而不是像修之前那样右半边永远在窗外。
-///
-/// 判据用「工具栏右边缘不超过窗口」而不是「筛选框在窗口内」——后者在
-/// 这一档本来就不成立，把它写成断言等于给一个做不到的要求发通行证。
-#[gpui_kit::test]
-fn the_narrowest_window_scrolls_the_toolbar_instead_of_losing_buttons(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().expect("临时目录");
-    for i in 0..30 {
-        std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
-    }
-    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 520.);
-    step(cx, handle, |window, cx| {
-        window.press("cmd-b", cx);
-        window.press("cmd-alt-o", cx);
-        settle(window, cx);
-    });
-
-    let toolbar = step_value(cx, handle, |window, _| {
-        window.try_find("toolbar").map(|e| e.bounds())
-    })
-    .expect("工具栏");
-    assert_eq!(
-        toolbar.origin.x + toolbar.size.width,
-        px(520.),
-        "工具栏自己不该越过窗口右边界——越界就说明它没被约束住，\
-         而是按 908 px 的固有宽度铺开了",
-    );
 }
 
 /// 收起侧栏之后位置入口一个都不能少，而且能点回去。
@@ -4114,4 +4139,59 @@ fn collapsing_the_details_panel_removes_it_entirely(cx: &mut TestAppContext) {
         "点了收起之后详情板还在（宽 {} px）——要么没收，要么收成了 0 宽的壳",
         hidden.map(|b| b.size.width).unwrap_or(px(0.)),
     );
+}
+
+/// 长文件名也不能把状态栏撑出窗口。
+///
+/// 撤销按钮的标签是 `describe()` 拼出来的完整描述（"重命名 X 为 Y"，
+/// 两个**完整**文件名都在里面）。而 `Button` 的根节点写死
+/// `flex_shrink_0`，在 flex 容器里不会收缩——实测两个 60 字的中文名
+/// 能把按钮撑到 1278 px，装在 1180 px 的窗口里右边缘到 1338 px，
+/// 整个状态栏被顶出屏幕。
+///
+/// 判据是**撤销按钮的右边缘不超过窗口右边界**。顺带看一眼 tooltip：
+/// 完整描述还在那儿（无障碍名同理），标签只是不再读全。
+#[gpui_kit::test]
+fn a_long_undo_label_cannot_push_the_status_bar_off_screen(cx: &mut TestAppContext) {
+    for width in [1180.0f32, 900.0, 700.0] {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let long_name = format!("{}.txt", "甲".repeat(60));
+        std::fs::write(dir.path().join(&long_name), "x").expect("造文件");
+        let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+
+        // 选中 → F2 重命名 → 回车。两次重命名才造得出"重命名 X 为 Y"。
+        step(cx, handle, |window, cx| {
+            settle(window, cx);
+            window.press("cmd-a", cx);
+            settle(window, cx);
+            window.press("f2", cx);
+            settle(window, cx);
+        });
+        step(cx, handle, |window, cx| {
+            window.input("second-name", cx);
+            window.press("enter", cx);
+            settle(window, cx);
+        });
+        step(cx, handle, |window, cx| {
+            window.press("f2", cx);
+            settle(window, cx);
+        });
+        step(cx, handle, |window, cx| {
+            window.input("third-name", cx);
+            window.press("enter", cx);
+            settle(window, cx);
+        });
+
+        let undo = step_value(cx, handle, |window, _| {
+            window.try_find("undo").map(|element| element.bounds())
+        })
+        .unwrap_or_else(|| panic!("窗口 {width}：状态栏上找不到撤销按钮"));
+        assert!(
+            undo.origin.x + undo.size.width <= px(width),
+            "窗口 {width}：撤销按钮右边缘在 x={} px（宽 {}），超出窗口——\
+             长文件名的撤销描述把状态栏顶出去了",
+            undo.origin.x + undo.size.width,
+            undo.size.width,
+        );
+    }
 }
