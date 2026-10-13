@@ -25,6 +25,7 @@ mod preview;
 mod query;
 mod remote;
 mod remotes;
+mod restore;
 mod resume;
 mod s3;
 mod search;

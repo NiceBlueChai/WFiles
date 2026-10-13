@@ -8,7 +8,7 @@ use gpui_kit::point;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Bounds, Point, TestAppContext, WindowBounds, WindowOptions};
 use gpui_kit::{base::Root, px, size};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,11 @@ fn open_app_of_width(
     width: f32,
 ) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<WFilesApp>) {
     cx.background_executor.allow_parking();
+    // 每个测试的状态目录隔开。放在这里而不是让每个测试自己记得调：
+    // 原来只有 22 / 75 个测试调了 `isolate_session`，剩下的会读写用户
+    // 真实的 `~/Library/Application Support/WFiles/`——只要用户用过一次
+    // 应用，那些测试的断言就可能被真机状态带偏（并跑时才挂，最难查）。
+    ensure_isolated();
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::app::init(cx);
@@ -88,30 +93,76 @@ fn step_value<T>(
         .expect("窗口还在")
 }
 
-/// 会话与设置隔到临时目录，免得测试动到用户真实的标签恢复状态。
+thread_local! {
+    /// 这一趟真正的隔离现场：锁 + 临时目录。
+    ///
+    /// 存起来是因为返回值装不下它（`open_app_of_width` 的调用方只要窗口和
+    /// 实体），而它必须活到测试结束——临时目录一被删，应用后续的写盘就没
+    /// 地方去了。测试跑在它自己的线程上，线程一结束 thread-local 就析构，
+    /// 于是锁也刚好在这一刻放开。
+    static OWNED: std::cell::RefCell<Option<Owned>> = const { std::cell::RefCell::new(None) };
+}
+
+struct Owned {
+    _guard: MutexGuard<'static, ()>,
+    _dir: tempfile::TempDir,
+}
+
+/// 这一趟已经隔离好的状态目录；没隔离过就现在隔离。
 ///
-/// `WFILES_SESSION_DIR` 是**进程级**的环境变量，而 `cargo test` 默认多线程跑：
-/// 两个测试同时改它，后写的那个会把前一个的目录顶掉，于是断言去读一个
-/// 从没写过的路径。所以这里配一把锁，谁拿着锁谁才独占这个变量，
-/// 拿到 `SessionIsolation` 的那一刻起一直到测试结束都是它的。
-fn isolate_session() -> SessionIsolation {
+/// **可重入**是关键：`WFILES_SESSION_DIR` 背后的锁是进程级的，
+/// 同一个线程拿第二次就是自己等自己（死锁）。而"先隔离好、写完会话，
+/// 再开窗口"是这个文件里最常见的测试写法。
+///
+/// `open_app_of_width` 里也调它，所以**没手动隔离的测试自动获得隔离**
+/// ——原来只有 22 / 75 个测试记得调 `isolate_session`，剩下的会读写用户
+/// 真实的 `~/Library/Application Support/WFiles/`。只要用户用过一次应用，
+/// 那些测试的断言就可能被真机状态带偏（并跑时才挂，最难查）。
+fn ensure_isolated() {
+    if OWNED.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
     static LOCK: Mutex<()> = Mutex::new(());
     // 上一个持锁的线程 panic 过就把锁抢回来，别把整轮测试卡死。
     let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let dir = tempfile::tempdir().expect("临时目录");
     unsafe { std::env::set_var("WFILES_SESSION_DIR", dir.path()) };
-    SessionIsolation { _guard: guard, dir }
+    OWNED.with(|slot| {
+        slot.replace(Some(Owned {
+            _guard: guard,
+            _dir: dir,
+        }))
+    });
 }
 
-/// 见 [`isolate_session`]：持锁期间独占 `WFILES_SESSION_DIR`。
+/// 隔离状态目录，并把路径交给调用方（用来往里写 session.json）。
+///
+/// 锁与临时目录只有一份、存在 thread-local 里活到测试结束，所以这里
+/// 返回的只是个记路径的轻量句柄，掉不掉都不影响隔离。**同线程可重入**：
+/// 已经在隔离里就直接给同一个路径，不去拿第二次锁。
+fn isolate_session() -> SessionIsolation {
+    ensure_isolated();
+    let path = OWNED.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .expect("刚隔离过")
+            ._dir
+            .path()
+            .to_path_buf()
+    });
+    SessionIsolation { dir: path }
+}
+
+/// 会话与设置隔到临时目录，免得测试动到用户真实的标签恢复状态。
+///
+/// 见 [`ensure_isolated`]：这里只是它那层"顺手把路径给你"的壳。
 struct SessionIsolation {
-    _guard: MutexGuard<'static, ()>,
-    dir: tempfile::TempDir,
+    dir: PathBuf,
 }
 
 impl SessionIsolation {
     fn path(&self) -> &Path {
-        self.dir.path()
+        &self.dir
     }
 }
 
@@ -3555,4 +3606,239 @@ fn an_empty_machine_shows_no_volumes_section(cx: &mut TestAppContext) {
     });
 
     crate::volumes::clear_override();
+}
+
+/// 崩溃恢复的核心承诺：重启后看到的不是"那个目录"，
+/// 而是"那个目录里我正处理着的那批文件"。
+///
+/// 一次测试里连开两次应用：第二趟只有隔离与恢复文件还在，
+/// 会话照样指向同一个目录——这跟崩溃后重开是等价的，
+/// 而且省掉"关掉窗口再开"那种 GPUI 测试里做不到的收尾。
+#[gpui_kit::test]
+fn a_selection_survives_a_restart(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.path().join(name), name).unwrap();
+    }
+    // 全程只隔离一次：隔离里含一把进程级锁，第二次调用会死锁。
+    let isolation = isolate_session();
+    write_session(isolation.path(), dir.path());
+
+    // 第一趟：选中 a 和 b——这就是"用户当时在做的事"。
+    let (handle, app) = open_app_of_width(cx, 1180.);
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // Shift 连选第二行：这是崩溃恢复最该扛住的用法——
+        // 用户正准备拷一批，不是一两个。
+        window.press("shift-down", cx);
+    });
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["a.txt", "b.txt"],
+        "先确认选中确实建立了"
+    );
+
+    // 第二趟：重新启动。什么都不用带——恢复文件自己就在那儿。
+    let (_handle, app) = open_app_of_width(cx, 1180.);
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["a.txt", "b.txt"],
+        "重开之后当时选中的那批文件该还在——不然用户得在列表里再点一遍"
+    );
+}
+
+/// 目录里的东西变了：被删掉的那个不该被"恢复"成选中。
+///
+/// `Cmd+C` 去拷一个不存在的路径是明确的错误操作，比"少恢复一个"坏得多。
+#[gpui_kit::test]
+fn a_file_deleted_before_the_restart_is_not_selected_again(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt"] {
+        std::fs::write(dir.path().join(name), name).unwrap();
+    }
+    let isolation = isolate_session();
+    write_session(isolation.path(), dir.path());
+
+    let (handle, app) = open_app_of_width(cx, 1180.);
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("shift-down", cx);
+    });
+    assert_eq!(selected_names(cx, &app), vec!["a.txt", "b.txt"]);
+
+    // 崩了、还没重开，这期间 b.txt 被删了。
+    std::fs::remove_file(dir.path().join("b.txt")).unwrap();
+
+    let (_handle, app) = open_app_of_width(cx, 1180.);
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["a.txt"],
+        "没了的文件不该被恢复成选中"
+    );
+}
+
+/// 取消了选择之后重启：不该凭空恢复出一批选中项。
+#[gpui_kit::test]
+fn clearing_the_selection_means_nothing_to_restore(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+    let isolation = isolate_session();
+    write_session(isolation.path(), dir.path());
+
+    let (handle, app) = open_app_of_width(cx, 1180.);
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    // Esc 清掉选择：用户明说了"不要了"。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("escape", cx);
+    });
+    assert!(selected_names(cx, &app).is_empty(), "Esc 该把选择清空");
+
+    let (_handle, app) = open_app_of_width(cx, 1180.);
+    assert!(
+        selected_names(cx, &app).is_empty(),
+        "用户自己清掉的就别恢复回来"
+    );
+}
+
+/// 关掉的标签，它的恢复现场就该立刻从盘上消失。
+///
+/// 不等到下次启动才清：那份文件是每次选择变化都写的，用户开着应用
+/// 连关十个标签，那十个目录的现场就会一直躺着——而只要碰巧再打开
+/// 同一个目录，就会冒出一批用户早就忘了的选中项。
+#[gpui_kit::test]
+fn closing_a_tab_forgets_what_would_have_been_restored(cx: &mut TestAppContext) {
+    let one = tempfile::tempdir().unwrap();
+    let two = tempfile::tempdir().unwrap();
+    for dir in [one.path(), two.path()] {
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+    }
+    let isolation = isolate_session();
+    // 两个标签各自在自己的目录里。
+    crate::session::Session {
+        tabs: vec![one.path().to_path_buf(), two.path().to_path_buf()],
+        active: 1,
+        split: None,
+        focus_on_left: true,
+        sync: false,
+    }
+    .save_to(&isolation.path().join("session.json"))
+    .expect("写测试会话");
+
+    let (handle, app) = open_app_of_width(cx, 1180.);
+    // 两个目录都要有现场，否则"没牵连"那条断言本身就无从谈起——
+    // 一个从没被选中过的目录，本来就没东西可清。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 切标签是 ctrl-tab（cmd-1/2 是列表↔网格，别搞混）。
+        window.press("ctrl-tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("ctrl-tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["a.txt"],
+        "第二栏该选中它那一份"
+    );
+    // 比对要用窗格实际认到的路径，不是 `tempdir` 给的那串：
+    // macOS 上 `/var` 是指向 `/private/var` 的符号链接，两串指向同一个目录，
+    // 但字符串不等——按原样比对会看成"功能坏了"。
+    let live = cx.update(|cx| app.read(cx).tab_paths(cx));
+    let set = crate::restore::RestoreSet::load();
+    assert!(
+        live.iter().all(|dir| set.at(dir).is_some()),
+        "两栏都该有现场，实际是{live:?}，现场在 {:?}",
+        set.items.iter().map(|it| &it.dir).collect::<Vec<_>>()
+    );
+
+    // 关掉当前这一个标签（活动的是 1，也就是 two）。
+    let before = cx.update(|cx| app.read(cx).tab_paths(cx));
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-w", cx);
+    });
+    step(cx, handle, settle);
+
+    // 关掉的是哪个，靠前后差集算出来，而不是猜"活动的一定是 two"：
+    // 猜错的话断言会变成"另一个目录的现场没清掉"，
+    // 报错信息指向的方向完全是反的。
+    let after = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert_eq!(after.len(), before.len() - 1, "该正好关掉一个标签");
+    let set = crate::restore::RestoreSet::load();
+    for gone in before
+        .iter()
+        .filter(|dir| !after.iter().any(|kept| same_dir(kept, dir)))
+    {
+        assert!(
+            set.at(gone).is_none(),
+            "标签都关了（{gone:?}），现场还留在盘上，下次打开这个目录会冒出一批旧选中项"
+        );
+    }
+    for kept in &after {
+        assert!(
+            set.at(kept).is_some(),
+            "还开着的那个目录不该被牵连（{kept:?}）"
+        );
+    }
+}
+
+/// 两个路径是不是同一个目录（可以是不同的路径字符串）。
+fn same_dir(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// 写一份"打开这个目录"的会话。
+fn write_session(state_dir: &Path, dir: &Path) {
+    crate::session::Session {
+        tabs: vec![dir.to_path_buf()],
+        active: 0,
+        split: None,
+        focus_on_left: true,
+        sync: false,
+    }
+    .save_to(&state_dir.join("session.json"))
+    .expect("写测试会话");
+}
+
+/// 当前那一栏选中了哪些文件的文件名（按列表顺序）。
+///
+/// 从实体读而不是从界面读：选中标记画在 `ListItem` 上，而那个元素不可观察，
+/// 界面上根本没有"这一行被选中了"这个事实可查。
+fn selected_names(cx: &mut TestAppContext, app: &gpui_kit::Entity<WFilesApp>) -> Vec<String> {
+    cx.update(|cx| app.read(cx).selected_in_active_pane(cx))
+        .iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+        })
+        .collect()
 }

@@ -156,7 +156,10 @@ mod tests {
     fn missing_file_yields_default() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(Session::load_from(&root.path().join("nope.json")), None);
-        assert_eq!(Session::load(), Session::default());
+        // `Session::load()` 走真机状态目录，**不能在这里断言**：
+        // 用户只要用过一次应用，那个文件就在，这个测试必挂。
+        // 之前一直"通过"只是因为这台机器上恰好还没有 session.json。
+        let _ = Session::load();
     }
 
     #[test]

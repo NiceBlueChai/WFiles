@@ -339,6 +339,9 @@ impl WFilesApp {
             |this, _, event: &RemotesEvent, window, cx| this.on_remotes_event(event, window, cx),
         ));
         app.saved_session = app.snapshot(cx);
+        // 会话恢复了哪几个标签，就只留那几个目录的恢复现场。
+        // 这条要在 `saved_session` 之后：清扫要用 `self.tabs`，那已经是最终形态。
+        app.sweep_restore(cx);
 
         // 退出前再存一次，覆盖“最后一次导航还没来得及落盘”的窗口。
         app.quit_subscription = Some(cx.on_app_quit(|this, cx| {
@@ -348,6 +351,33 @@ impl WFilesApp {
         }));
 
         app
+    }
+
+    /// 当前焦点那一栏选中了哪些文件（按列表顺序）。
+    ///
+    /// 面板类实体该有的读取口：崩溃恢复的集成测试要断言"重开之后
+    /// 那批选中还在"，而界面上读不到选中状态（选中标在不可观察的
+    /// `ListItem` 上）。
+    #[cfg(test)]
+    pub fn selected_in_active_pane(&self, cx: &gpui_kit::App) -> Vec<PathBuf> {
+        self.tabs
+            .get(self.active)
+            .map(|tab| tab.read(cx).selected_paths())
+            .unwrap_or_default()
+    }
+
+    /// 开着的那几个目录，按窗格实际认到的形式（不是传进来的原样字符串）。
+    ///
+    /// 测试用：`tempfile` 在 macOS 上给的是 `/var/folders/...`，而窗格
+    /// 那边可能是 `/private/var/folders/...`（前者是符号链接）。
+    /// 拿原样路径去比对，断言会因为"路径字符串不一样"而失败，
+    /// 看起来像功能坏了，其实是两个字符串指向同一个目录。
+    #[cfg(test)]
+    pub fn tab_paths(&self, cx: &gpui_kit::App) -> Vec<PathBuf> {
+        self.tabs
+            .iter()
+            .map(|tab| tab.read(cx).path().to_path_buf())
+            .collect()
     }
 
     /// 记下窗口现在的位置与尺寸。
@@ -815,6 +845,12 @@ impl WFilesApp {
             cx.notify();
             return;
         }
+
+        // 先记住要关掉的是哪个目录：标签一删就问不出来了，而恢复文件
+        // 里那条现场得跟着一起走——留着的话下次碰巧打开同一个目录，
+        // 会冒出一批用户早就忘了的选中项。
+        let closed = self.tabs[index].read(cx).path().to_path_buf();
+        self.forget_restore(&closed);
 
         self.tabs.remove(index);
         // 两个下标都要跟着挪；另一栏正好被关掉就退回单栏。
@@ -1382,6 +1418,37 @@ impl WFilesApp {
             eprintln!("保存会话失败：{error}");
         }
         self.saved_session = snapshot;
+    }
+
+    /// 把某一栏的恢复现场从盘上删掉（标签被关时用）。
+    fn forget_restore(&self, dir: &std::path::Path) {
+        let mut set = crate::restore::RestoreSet::load();
+        set.forget(dir);
+        if let Err(error) = set.save() {
+            eprintln!("清理恢复现场失败：{error}");
+        }
+    }
+
+    /// 启动时给恢复文件清一遍：剔掉已经关掉的标签和已经不在的文件。
+    ///
+    /// 跟 [`Self::forget_restore`] 一起用，不是替代：那边管"用户刚关的"，
+    /// 这边兜住"上次崩的时候开着、这次没开"——比如崩之前那批标签对应的
+    /// 目录这次没被恢复回来（会话文件也坏了一类的情形）。
+    fn sweep_restore(&self, cx: &Context<Self>) {
+        let live: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .map(|tab| tab.read(cx).path().to_path_buf())
+            .collect();
+        let mut set = crate::restore::RestoreSet::load();
+        let before = set.items.len();
+        set.sanitized(&live);
+        if set.items.len() == before {
+            return;
+        }
+        if let Err(error) = set.save() {
+            eprintln!("清理恢复现场失败：{error}");
+        }
     }
 
     // ---- 文件操作事件 ----

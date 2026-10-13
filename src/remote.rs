@@ -946,8 +946,41 @@ const FILESTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 
 /// 一个够大的文件：断点续传要真的传过半截才验得出来，
 /// 而 `notes.txt` 只有 9 个字节，一个数据块都没满就传完了。
+///
+/// **必须够大，大到"停在一半"离末尾还有好几块。** 一个 20 KB 的文件
+/// 只有两块多，"停在一半"距末尾不到一块，于是会撞上"叫停落在最后一个
+/// 字节上算完成"那条判定（见 `ops::download_entry` 的 `done >= info.size`）：
+/// 判定**正确**地触发，第一趟直接落地而不是中止，"第一趟应该中止"这个
+/// 前提不成立——测试就成了薛定谔的。
+///
+/// 1 MB 配 8 KB 一块就是一百多块，停在哪都不可能贴着末尾。
+/// 分块边界本身也别指望 socket：见 [`write_chunked`]。
 #[cfg(test)]
-const BIG_LEN: usize = 20_000;
+const BIG_LEN: usize = 1024 * 1024;
+
+/// 假服务器分块写正文时每块多大。
+///
+/// **块大小必须由服务器决定，不能指望 socket 缓冲。** 客户端一次
+/// `read` 拿到多少，取决于 `std::io::copy` 的 8 KB 缓冲、内核 socket
+/// 缓冲与调度——同一份代码在这台机器上分 3 块、在 CI 上可能一次读完。
+///
+/// 得比 `io::copy` 的缓冲**大**才有意义：分块 4 KB 的话，客户端读满自己
+/// 8 KB 的缓冲照样把两块一起拿走，等于什么都没做。16 KB 才是真的把边界
+/// 按在这儿定的——实测每块降到 4096 字节。
+#[cfg(test)]
+const CHUNK: usize = 16 * 1024;
+
+/// 写 HTTP 正文：按 [`CHUNK`] 分块写，每块之间 `flush` 一次。
+///
+/// 每块都 flush 是关键。不 flush 的话这几块会一起进内核缓冲，
+/// 客户端照样一次全读完——那就等于什么都没做。
+#[cfg(test)]
+fn write_chunked(stream: &mut impl std::io::Write, payload: &[u8]) {
+    for piece in payload.chunks(CHUNK) {
+        let _ = stream.write_all(piece);
+        let _ = stream.flush();
+    }
+}
 
 /// `big.bin` 的内容：按序号取模，第 i 个字节就是 `(i % 251)`。
 /// 断点接错地方（比如漏了几个字节）对得上对不上，一比就知道。
@@ -1188,7 +1221,12 @@ pub(crate) mod fake {
             payload.len()
         );
         let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(&payload);
+        // 大文件分块写：块大小由这边定，不靠 socket 缓冲（见 `CHUNK`）。
+        if payload.len() > super::CHUNK {
+            super::write_chunked(&mut stream, &payload);
+        } else {
+            let _ = stream.write_all(&payload);
+        }
         let _ = stream.flush();
     }
 

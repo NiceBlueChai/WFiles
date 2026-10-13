@@ -2738,6 +2738,15 @@ mod tests {
         assert_eq!(started_at, Some(COPY_CHUNK as u64), "这一趟是整份重拷");
     }
 
+    /// `std::io::copy` 一次读多少的下界，用来判断"断点是不是已经下完了"。
+    ///
+    /// 实测这个假服务器上每块是 8091 / 8333 字节这样——**不是整数 8K**，
+    /// 因为块边界由 socket 缓冲和调度决定。取 8 KB 是拿它的量级，
+    /// 不是断言它就是 8192。
+    fn io_copy_buffer() -> u64 {
+        8 * 1024
+    }
+
     #[test]
     fn an_aborted_download_resumes_with_a_range_request() {
         let (client, server) = remote_client();
@@ -2772,13 +2781,27 @@ mod tests {
         // 跟断点不是一回事。猜出来的数偶尔正好等于断点，偶尔不等，
         // 于是这个测试就成了薛定谔的。
         let staging = resume::journal().staging(&resume::key(
-            &format!("remote://t1/big.bin"),
+            "remote://t1/big.bin",
             &dest.join("big.bin").to_string_lossy(),
         ));
         let resumed_at = fs::metadata(&staging).map(|it| it.len()).unwrap_or(0);
         assert!(
             resumed_at > 0 && resumed_at < crate::remote::big_bytes().len() as u64,
             "该停在半路上：{resumed_at}"
+        );
+        // 断点必须离末尾还剩至少一块——否则会撞上"叫停落在最后一个字节上
+        // 算完成"那条判定（`download_entry` 里 `done >= info.size`），
+        // 第一趟本该直接落地而不是中止，整个测试就成了薛定谔的。
+        //
+        // 块大小是 `std::io::copy` 的默认缓冲（实测 8091/8333…，不是整数 8K），
+        // 留一整个缓冲的余量：这个判断不依赖精确块大小，块边界怎么挪都够。
+        let total = crate::remote::big_bytes().len() as u64;
+        assert!(
+            total - resumed_at >= io_copy_buffer(),
+            "断点离末尾太近（剩{}字节，不足一个读取缓冲{}），\
+             这一趟其实等于下完了",
+            total - resumed_at,
+            io_copy_buffer()
         );
 
         // 第二趟：服务器该收到一个带 Range 的请求，位置正是上次停下那儿。

@@ -402,6 +402,23 @@ impl Selection {
         self.paths.insert(path);
     }
 
+    /// 一次把整批选中项装回去（崩溃恢复用）。
+    ///
+    /// 不能拿 [`Selection::select`] 循环——那个每次都 `clear()`，
+    /// 循环 N 次就只剩最后一个了。
+    ///
+    /// 光标与锚点落在 `cursor` 上：有就落在它（键盘接着从那儿走），
+    /// 没有就落在最后一个（列表最靠下的那一项，按方向键往上走最自然）。
+    pub fn select_many(&mut self, paths: Vec<PathBuf>, cursor: Option<PathBuf>) {
+        self.paths.clear();
+        self.paths.extend(paths.iter().cloned());
+        let cursor = cursor
+            .filter(|path| self.paths.contains(path))
+            .or_else(|| paths.last().cloned());
+        self.cursor = cursor.clone();
+        self.anchor = cursor;
+    }
+
     /// 按住 Command 点击：加进来或拿出去。
     pub fn toggle(&mut self, path: PathBuf) {
         self.cursor = Some(path.clone());

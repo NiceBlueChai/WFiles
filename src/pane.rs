@@ -673,11 +673,68 @@ impl Pane {
         // 先套用记住的视图：网格的一"行"是好几项，行高和行数都跟着变。
         pane.apply_remembered_view(cx);
         pane.sync_row_sizes();
+        // 崩溃恢复：把上次选中的那些接上（行高定下来了才能往那儿滚）。
+        pane.restore_selection(cx);
         pane.update_status();
         pane.start_watching(cx);
         // 一打开就能用方向键，不需要先点一下列表。
         pane.focus.focus(window, cx);
         pane
+    }
+
+    /// 把崩溃前选中的文件接回来。
+    ///
+    /// **只恢复本地目录**：远程那一栏的列表是后台列出来的（`Listed` 事件
+    /// 回来时才有条目），构造这一刻 `listing` 里一个条目都没有，恢复什么
+    /// 都是空的。要接也得在 `fill_remote` 之后，那条路留到 P5后面的迭代。
+    fn restore_selection(&mut self, cx: &mut Context<Self>) {
+        let dir = self.listing.path().to_path_buf();
+        if remote::parse_location(&dir).is_some() {
+            return;
+        }
+        let Some(item) = crate::restore::RestoreSet::load().at(&dir).cloned() else {
+            return;
+        };
+        // 只接住**这个目录里还在的**条目：`sanitized()` 已经滤过一遍
+        // 磁盘上还在不在，这里再挡一道——同一个目录在两次启动之间
+        // 又被改过也说不准。
+        let selected: Vec<PathBuf> = item
+            .selected
+            .iter()
+            .filter(|path| self.listing.entry(path).is_some())
+            .cloned()
+            .collect();
+        let cursor = item
+            .cursor
+            .filter(|path| self.listing.entry(path).is_some());
+        self.selection.select_many(selected, cursor);
+        let cursor = self.selection.cursor().map(Path::to_path_buf);
+        if let Some(cursor) = cursor
+            && let Some(position) = self.listing.position_of(&cursor)
+        {
+            self.scroll.scroll_to_item(position, ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    /// 记下这一栏的现场（选中项 + 光标），供崩溃后恢复。
+    ///
+    /// 什么时候记：选择变了就记。不是每次按键都记——那是一次写盘，
+    /// 而按住 Shift 连选一串的时候一次按键能触发几十次。
+    pub fn note_restore(&self) {
+        let dir = self.listing.path().to_path_buf();
+        if remote::parse_location(&dir).is_some() {
+            // 远程的选中项记了也没地方恢复（见 `restore_selection`），
+            // 写一份永远用不上的数据只是白白攒文件。
+            return;
+        }
+        let selected = self.selection.ordered(&self.listing);
+        let cursor = self.selection.cursor().map(Path::to_path_buf);
+        let mut set = crate::restore::RestoreSet::load();
+        set.note(dir, selected, cursor);
+        if let Err(error) = set.save() {
+            eprintln!("保存恢复现场失败：{error}");
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -857,6 +914,11 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 离开之前把这一栏的现场记下来：`selection.clear()` 就在下面，
+        // 走了就再也补不回来了。
+        if path != self.listing.path() {
+            self.note_restore();
+        }
         // 远程位置（dav://…）：本地那一套读不了，走后台那一支。
         if remote::parse_location(&path).is_some() {
             self.go_remote(path, remember, take_focus, window, cx);
@@ -1120,6 +1182,7 @@ impl Pane {
         }
 
         self.selection.select_all(&self.listing);
+        self.note_restore();
         self.update_status();
         cx.notify();
     }
@@ -1130,6 +1193,7 @@ impl Pane {
         }
 
         self.selection.clear();
+        self.note_restore();
         self.update_status();
         cx.notify();
     }
@@ -1189,6 +1253,7 @@ impl Pane {
         }
         self.scroll
             .scroll_to_item(self.row_of(position), ScrollStrategy::Nearest);
+        self.note_restore();
         self.update_status();
         cx.notify();
     }
@@ -1202,6 +1267,7 @@ impl Pane {
         } else {
             self.selection.select(path);
         }
+        self.note_restore();
     }
 
     // ---- 文件操作请求 ----
@@ -1743,6 +1809,7 @@ impl Pane {
             .unwrap_or_else(|| path.clone());
         self.navigate_to(parent, true, window, cx);
         self.selection.select(path);
+        self.note_restore();
         // 结果可能在列表很下面，把它滚回视野。
         if let Some(position) = self.selection.focus_position(&self.listing) {
             let row = self.row_of(position);
