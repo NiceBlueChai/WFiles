@@ -18,12 +18,13 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     list::ListItem,
+    menu::{DropdownMenu as _, PopupMenuItem},
     scroll::{ScrollableElement as _, ScrollbarAxis},
     v_virtual_list, *,
 };
 // component::Size 是控件尺寸档位，这里要的是 gpui 的几何尺寸。
 use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::{AsyncApp, Size, Task, WeakEntity, *};
+use gpui_kit::{AsyncApp, Size, Task, TestSupportExt as _, WeakEntity, *};
 
 use crate::analyze_entity::{AnalyzeEvent, AnalyzeMode, AnalyzePanel};
 use crate::archive;
@@ -434,7 +435,31 @@ struct QuickLookState {
     content: Preview,
 }
 
+/// 菜单项回调的动作落回窗格自己。
+///
+/// [`WeakEntity::update`] 在窗格已经不在的时候返回 `Err`——标签被关掉、
+/// 窗格被换掉都会这样。那不算错误：菜单能被点到说明点下去的那一帧窗格还在，
+/// 真执行时没了就没有可执行的窗格，安静跳过是对的，不该往错误通道里报。
+fn run_on_pane(
+    me: &WeakEntity<Pane>,
+    cx: &mut App,
+    act: impl FnOnce(&mut Pane, &mut Context<Pane>),
+) {
+    let _ = me.update(cx, act);
+}
+
 pub struct Pane {
+    /// 指向自己。
+    ///
+    /// 「更多」菜单里的每一项都得回头操作这一栏，而菜单项的回调签名
+    /// 只有 `(&ClickEvent, &mut Window, &mut App)`——拿不到 `Context<Pane>`。
+    /// 靠这个弱引用换回来：回调里 `update` 一下就行，而且弱引用不会
+    /// 让这一栏在菜单开着的时候活不过来（强引用会）。
+    /// 外面套一层 `Rc`：菜单项的 `on_click` 闭包要求 `'static`，
+    /// 而 `WeakEntity` 不是 `Copy`——按引用捕获过不了生命周期，
+    /// 按值捕获又会被外层那个 `Fn` 闭包吃掉。`Rc` 一次克隆就够，
+    /// 里面只是复制一个弱引用指针，很便宜。
+    me: Rc<WeakEntity<Self>>,
     ops: Entity<Ops>,
     /// 缩略图缓存由应用持有、所有标签共用：同一个文件不用每个标签各解一遍。
     thumbs: Entity<Thumbnails>,
@@ -503,6 +528,12 @@ pub struct Pane {
     capturing: Option<PaneCommand>,
     /// 录按键浮层的焦点；录的时候焦点必须在这上面才收得到键。
     capture_focus: FocusHandle,
+    /// 详情板（右侧那列预览）是否显示。
+    ///
+    /// 默认**显示**，但宽度可以收：这一列写死 260px 不可收缩，而工具栏
+    /// 上一排按钮要 908px。窗口窄的时候两侧固定边框就把内容挤没了，
+    /// 而详情板上的东西（预览、大小、EXIF）在快速浏览时并不是非看不可。
+    pub(crate) details_shown: bool,
     subscriptions: Vec<Subscription>,
 }
 
@@ -523,6 +554,7 @@ impl Pane {
         };
 
         let mut pane = Self {
+            me: Rc::new(cx.weak_entity()),
             ops,
             thumbs,
             meta,
@@ -556,6 +588,7 @@ impl Pane {
             archive_busy: None,
             capturing: None,
             capture_focus: cx.focus_handle(),
+            details_shown: true,
             subscriptions: Vec::new(),
         };
 
@@ -2065,12 +2098,23 @@ impl Pane {
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
+            .id("toolbar")
             .h(px(52.))
             .px_3()
             .gap_2()
             .flex_shrink_0()
+            // 工具栏这一排的固有宽度是 908 px（实测），而窗口最窄能给到的
+            // 只有 392 px。`h_flex` 带的是 `items_center`，那种情况下
+            // flex 容器遇到超宽内容**不会重新分配**，子元素照旧按自己的
+            // 固有宽度往右排——于是筛选框钉在 x=534，右侧按钮画到窗外。
+            //
+            // `overflow_x_scroll` 让这一排变成自己的滚动容器：内容超出时
+            // 它自己滚，而不是把按钮甩到屏幕外。面包屑（`flex_1`）会先被
+            // 压掉，所以正常宽度下根本不会触发滚动。
+            .overflow_x_scroll()
             .border_b_1()
             .border_color(cx.theme().border)
+            .test_support()
             .child(
                 Button::new("back")
                     .icon(IconName::ChevronLeft)
@@ -2104,12 +2148,54 @@ impl Pane {
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .children(self.render_file_ops(cx))
+            .child(self.render_more_menu())
             .children(self.render_view_buttons(cx))
+            // 详情板开关放在筛选框**左边**：窄窗口下最先被挤掉的是右边的
+            // 东西，而"把详情板收起来"正是窄窗口下最该能点到的那一下。
             .child(
-                Input::new(&self.filter)
-                    .prefix(Icon::new(IconName::Search).size_4())
-                    .cleanable(true)
-                    .w(px(200.)),
+                Button::new("toggle-details")
+                    .icon(IconName::PanelRight)
+                    .ghost()
+                    .small()
+                    .selected(self.details_shown)
+                    .tooltip(if self.details_shown {
+                        "收起详情板（Cmd+Alt+O）"
+                    } else {
+                        "展开详情板（Cmd+Alt+O）"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.details_shown = !this.details_shown;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                // 套一层 `div` 只为了有个可查的 element id：布局回归测试要量
+                // 「筛选框还在不在窗口里」，`Input` 自己不带可查的 id。
+                // `test_support()` 是 opt-in 的——不调它这个元素在观察表里
+                // 没有条目，测试会以为筛选框不存在。
+                //
+                // 宽度写在**槽**上而不是 `Input` 上：`Input` 是固定宽度时
+                // 它自己是布局的硬底，槽再怎么缩也缩不动它（实测 700 px
+                // 窗口收掉两侧边框后，筛选框仍然钉在 x=534 撑到 734）。
+                // 槽可收缩、`Input` 填满槽，窄窗口下筛选框才会真的让位。
+                div()
+                    .id("filter-slot")
+                    .test_support()
+                    .min_w(px(96.))
+                    .max_w(px(200.))
+                    .flex_shrink(1.)
+                    .child(
+                        Input::new(&self.filter)
+                            .prefix(Icon::new(IconName::Search).size_4())
+                            .cleanable(true)
+                            // `min_w` 不是装饰：工具栏里那颗「更多」是
+                            // `flex_shrink_0`，筛选框不给下限就可能被压成一条缝。
+                            // 到了连 `min_w` 都保不住的时候，宁可让工具栏自己
+                            // 横向滚动，也不能让筛选框消失——那是用户唯一能
+                            // 看见"我在筛选"的地方。
+                            .min_w(px(96.))
+                            .w_full(),
+                    ),
             )
     }
 
@@ -2145,7 +2231,18 @@ impl Pane {
         }
     }
 
-    /// 文件操作按钮组：选中状态决定哪些能按。
+    /// 文件操作按钮组：**常显的四颗**。
+    ///
+    /// 为什么不是十二颗平铺（这是 `docs/ui-redesign.md` §0 定的方案）：
+    /// 十二颗不可收缩的按钮钉在工具栏上要 672 px（4 颗 32px 加 15 颗 24px，
+    /// 再加内边距和 20 道间隙），而侧栏与详情板各吃掉 210 / 260 px 之后，
+    /// 默认 1180 px 窗口只剩 710 px 给工具栏——筛选框被压到 44 px，
+    /// 分栏时更是直接溢出 449 px，右侧按钮画到窗格外头、点不到。
+    ///
+    /// 留下的四颗是**最高频**的：新建文件夹、拷贝、剪切、粘贴。
+    /// 粘贴紧跟在剪切后面，两个连着按才是"移动"这个最常见的组合。
+    /// 删除也高频，但它是不可逆动作，位置太显眼了反而危险——
+    /// 放进「更多」里（那里和批量重命名、压缩包这些低频操作作伴）。
     fn render_file_ops(&mut self, cx: &mut Context<Self>) -> Vec<Button> {
         let selected = self.selection.len();
         let can_write = self.error.is_none();
@@ -2159,27 +2256,6 @@ impl Pane {
                 .tooltip("新建文件夹（Cmd+Shift+N）")
                 .disabled(!can_write)
                 .on_click(cx.listener(|this, _, _, cx| this.request_new_folder(cx))),
-            Button::new("op-rename")
-                .icon(IconName::SquarePen)
-                .ghost()
-                .small()
-                .tooltip("重命名（F2）")
-                .disabled(selected != 1)
-                .on_click(cx.listener(|this, _, _, cx| this.request_rename(cx))),
-            Button::new("op-bulk-rename")
-                .icon(IconName::TextCursorInput)
-                .ghost()
-                .small()
-                .tooltip("批量重命名（Cmd+Shift+R）")
-                .disabled(selected < 2)
-                .on_click(cx.listener(|this, _, _, cx| this.request_bulk_rename(cx))),
-            Button::new("op-trash")
-                .icon(IconName::Trash)
-                .ghost()
-                .small()
-                .tooltip("移到回收站（Cmd+Backspace）")
-                .disabled(selected == 0)
-                .on_click(cx.listener(|this, _, _, cx| this.request_trash(cx))),
             Button::new("op-copy")
                 .icon(IconName::Copy)
                 .ghost()
@@ -2194,20 +2270,6 @@ impl Pane {
                 .tooltip("剪切（Cmd+X）")
                 .disabled(selected == 0)
                 .on_click(cx.listener(|this, _, _, cx| this.request_cut(cx))),
-            Button::new("op-copy-path")
-                .icon(IconName::Link)
-                .ghost()
-                .small()
-                .tooltip("复制路径（Cmd+Alt+C）")
-                .disabled(selected == 0)
-                .on_click(cx.listener(|this, _, _, cx| this.copy_paths(cx))),
-            Button::new("op-copy-name")
-                .icon(IconName::Signature)
-                .ghost()
-                .small()
-                .tooltip("复制文件名（Cmd+Shift+C）")
-                .disabled(selected == 0)
-                .on_click(cx.listener(|this, _, _, cx| this.copy_file_names(cx))),
             Button::new("op-paste")
                 .icon(IconName::ClipboardPaste)
                 .ghost()
@@ -2215,38 +2277,118 @@ impl Pane {
                 .tooltip("粘贴（Cmd+V）")
                 .disabled(!can_paste)
                 .on_click(cx.listener(|this, _, _, cx| this.request_paste(cx))),
-            Button::new("op-terminal")
-                .icon(IconName::Terminal)
-                .ghost()
-                .small()
-                .tooltip("在这里打开终端（Cmd+Alt+T）")
-                // 换终端在命令面板里做：工具栏保持“按下去就打开”的单一职责。
-                .on_click(cx.listener(|this, _, _, cx| this.open_terminal(cx))),
-            Button::new("op-quick-look")
-                .icon(IconName::Eye)
-                .ghost()
-                .small()
-                .tooltip("快速查看（空格）")
-                .disabled(self.quick_look_target().is_none())
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_quick_look(cx))),
-            Button::new("op-archive")
-                .icon(IconName::FileArchive)
-                .ghost()
-                .small()
-                .tooltip(if self.archive_target().is_some() {
-                    "查看压缩包内容"
-                } else {
-                    "打包成 Zip"
-                })
-                .disabled(selected == 0)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.archive_target().is_some() {
-                        this.toggle_archive(cx);
-                    } else {
-                        this.create_archive(cx);
-                    }
-                })),
         ]
+    }
+
+    /// 「更多」下拉：剩下那些低频但必要的文件操作。
+    ///
+    /// 收进来的依据是**使用频率**，不是重要性：重命名一年按不到几次，
+    /// 而它占着工具栏上跟「拷贝」同等显眼的位置。搬进菜单不损失可达性——
+    /// 每一条的命令面板条目和快捷键都还在（快捷键往往还是最快的入口）。
+    ///
+    /// 置灰状态跟着选中数走：进得去、看到「当前不能按」比干脆不显示有用。
+    fn render_more_menu(&mut self) -> impl IntoElement {
+        let selected = self.selection.len();
+        let quick_look = self.quick_look_target().is_some();
+        let archive_is_zip = self.archive_target().is_some();
+        let me = self.me.clone();
+
+        Button::new("op-more")
+            .icon(IconName::Ellipsis)
+            .ghost()
+            .small()
+            .tooltip("更多操作")
+            // 下面这个闭包是 `Fn` 而不是 `FnOnce`——`dropdown_menu` 每帧
+            // 渲染都会调它一次（菜单实体关掉再开还要重建）。所以 `Rc` 的
+            // clone 必须发生在**闭包体内**：写在外面就成了「每次调用都要
+            // move 一次同一个 `me`」，第一帧就编译不过（E0507）。
+            .dropdown_menu(move |menu, _window, _cx| {
+                let me_rename = me.clone();
+                let me_bulk = me.clone();
+                let me_trash = me.clone();
+                let me_copy_path = me.clone();
+                let me_copy_name = me.clone();
+                let me_look = me.clone();
+                let me_term = me.clone();
+                let me_archive = me.clone();
+
+                menu.item(
+                    PopupMenuItem::new("重命名")
+                        .icon(IconName::SquarePen)
+                        .disabled(selected != 1)
+                        .on_click(move |_, _, cx| {
+                            run_on_pane(&me_rename, cx, |pane, cx| pane.request_rename(cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("批量重命名")
+                        .icon(IconName::TextCursorInput)
+                        .disabled(selected < 2)
+                        .on_click(move |_, _, cx| {
+                            run_on_pane(&me_bulk, cx, |pane, cx| pane.request_bulk_rename(cx));
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("移到回收站")
+                        .icon(IconName::Trash)
+                        .disabled(selected == 0)
+                        .on_click(move |_, _, cx| {
+                            run_on_pane(&me_trash, cx, |pane, cx| pane.request_trash(cx));
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("复制路径")
+                        .icon(IconName::Link)
+                        .disabled(selected == 0)
+                        .on_click(move |_, _, cx| {
+                            run_on_pane(&me_copy_path, cx, |pane, cx| pane.copy_paths(cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("复制文件名")
+                        .icon(IconName::Signature)
+                        .disabled(selected == 0)
+                        .on_click(move |_, _, cx| {
+                            run_on_pane(&me_copy_name, cx, |pane, cx| pane.copy_file_names(cx));
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("快速查看")
+                        .icon(IconName::Eye)
+                        .disabled(!quick_look)
+                        .on_click(move |_, _, cx| {
+                            run_on_pane(&me_look, cx, |pane, cx| pane.toggle_quick_look(cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("在这里打开终端")
+                        .icon(IconName::Terminal)
+                        .on_click(move |_, _, cx| {
+                            run_on_pane(&me_term, cx, |pane, cx| pane.open_terminal(cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(if archive_is_zip {
+                        "查看压缩包内容"
+                    } else {
+                        "打包成 Zip"
+                    })
+                    .icon(IconName::FileArchive)
+                    .disabled(selected == 0)
+                    .on_click(move |_, _, cx| {
+                        run_on_pane(&me_archive, cx, |pane, cx| {
+                            if pane.archive_target().is_some() {
+                                pane.toggle_archive(cx)
+                            } else {
+                                pane.create_archive(cx)
+                            }
+                        });
+                    }),
+                )
+            })
     }
 
     /// 面包屑：每一段都能点，段数太多时从左边裁掉，保证当前目录一直看得见。
@@ -2314,6 +2456,8 @@ impl Pane {
             });
 
         div()
+            .id("breadcrumb")
+            .test_support()
             .h(px(32.))
             .flex_1()
             .min_w_0()
@@ -3523,6 +3667,8 @@ impl Pane {
         };
 
         v_flex()
+            .id("details-panel")
+            .test_support()
             .w(px(260.))
             .h_full()
             .flex_shrink_0()
@@ -4169,8 +4315,12 @@ impl Render for Pane {
                     .min_w_0()
                     .child(self.render_toolbar(cx))
                     .child(self.render_body(cx)),
-            )
-            .child(self.render_details(cx));
+            );
+        // 详情板收起来时**整块不画**，而不是画成 0 宽：留着一条
+        // 0 宽的分隔线和一个看不见的边框，看起来像"界面坏了"。
+        if self.details_shown {
+            root = root.child(self.render_details(cx));
+        }
 
         if self.quick_look.is_some() {
             root = root.child(self.render_quick_look(cx));

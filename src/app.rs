@@ -37,6 +37,15 @@ use crate::term_entity::{TOGGLE_KEY, Terminal, TerminalEvent};
 use crate::terminal;
 use crate::thumbnails::Thumbnails;
 
+/// 侧栏展开时的宽度。
+///
+/// 210 px 是量出来的下限，不是随手取的整数：里面要放下「位置」四条的
+/// 图标（16）+ 间隙（12）+ 文字（最长"个人文件夹"5 字 ≈ 70 px）+ 内边距，
+/// 少于 210 文字就得截断。
+const SIDEBAR_WIDTH: f32 = 210.;
+/// 侧栏收起时那条图标条的宽度：内边距 8 + 按钮 32。
+const SIDEBAR_COLLAPSED_WIDTH: f32 = 48.;
+
 gpui_kit::actions!(
     wfiles,
     [
@@ -50,6 +59,8 @@ gpui_kit::actions!(
         CopyToOther,
         MoveToOther,
         ToggleTerminal,
+        ToggleSidebar,
+        ToggleDetails,
         Compare,
         Diff,
     ]
@@ -80,6 +91,10 @@ enum AppCommand {
     ToggleSync,
     CopyToOther,
     MoveToOther,
+    /// 收起 / 展开侧栏。
+    ToggleSidebar,
+    /// 显示 / 隐藏详情板。
+    ToggleDetails,
     /// 比较两栏（或选中的两个目录）差在哪，并可选同步。
     Compare,
     /// 并排看两个文件的内容差在哪。
@@ -184,6 +199,14 @@ pub fn init(cx: &mut App) {
         // 内嵌终端面板。Ctrl+Alt+T 是 Linux 桌面上"打开终端"的老键位，
         // 换成 Ctrl 也和"打开系统终端"的 Cmd+Alt+T 区分得开。
         KeyBinding::new(TOGGLE_KEY, ToggleTerminal, None),
+        // 侧栏 / 详情板显隐。Cmd+B 是编辑器与文件管理器的老键位
+        // （VS Code 的侧栏、Finder 的检查器都占它）。
+        //
+        // 详情板用 Cmd+Alt+O：Cmd+Alt+I 已经是「分析面板」、
+        // Cmd+Alt+E 是「编辑远程文件」。两个功能都是"换个面板看看"，
+        // 抢键会让其中一个永远按不出来，而且谁都不会去查另一处绑在哪。
+        KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new("cmd-alt-o", ToggleDetails, None),
         // 比较：双栏时比两栏，单栏时比选中的两个目录。
         KeyBinding::new("cmd-alt-b", Compare, None),
         // 文件内容比较：同上，只是对象换成两个文件。带 Shift 是顺着
@@ -235,8 +258,14 @@ pub struct WFilesApp {
     connect: Option<ConnectState>,
     /// 侧栏里哪条连接的“删除”被按下了一次（两步确认的第一步）。
     forget_armed: Option<String>,
-    /// 最近一次连上后，密码到底落在哪——必须让用户看得见，
-    /// 否则“密码明文躺在设置里”这种事没人会知道。
+    /// 侧栏收成图标条。展开 210px、收起 48px。
+    ///
+    /// 这不是可有可无的装饰：侧栏原本写死 210px 不可收缩，而工具栏上
+    /// 一排按钮要 908px。窗口窄到 900px 时内容区只剩 430px，工具栏右半边
+    /// （筛选框、视图切换）整个画到屏幕外——看得见却点不到。给用户一个
+    /// 收起侧栏的开关，是让窄窗口可用最省事的一步。
+    sidebar_collapsed: bool,
+    /// 最近一次连上后，密码到底落在哪——必须让用户看得见，    /// 否则“密码明文躺在设置里”这种事没人会知道。
     secret_note: Option<String>,
 }
 
@@ -309,6 +338,7 @@ impl WFilesApp {
             remotes,
             connect: None,
             forget_armed: None,
+            sidebar_collapsed: false,
             secret_note: None,
         };
 
@@ -479,7 +509,10 @@ impl WFilesApp {
         self.tabs[self.active].update(cx, |pane, cx| pane.navigate_to(path, true, window, cx));
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.sidebar_collapsed {
+            return self.render_sidebar_collapsed(cx);
+        }
         let current = self.tabs[self.active].read(cx).path().to_path_buf();
         let items = Self::places()
             .into_iter()
@@ -512,7 +545,7 @@ impl WFilesApp {
             .collect::<Vec<_>>();
 
         v_flex()
-            .w(px(210.))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_shrink_0()
             .border_r_1()
@@ -544,6 +577,18 @@ impl WFilesApp {
                                 .text_color(cx.theme().muted_foreground)
                                 .child("快速、清楚、可撤销"),
                         ),
+                    )
+                    .child(
+                        Button::new("sidebar-expand")
+                            .icon(IconName::PanelLeftClose)
+                            .ghost()
+                            .small()
+                            .ml_auto()
+                            .tooltip("收起侧栏（Cmd+B）")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_collapsed = true;
+                                cx.notify();
+                            })),
                     ),
             )
             .child(
@@ -576,6 +621,60 @@ impl WFilesApp {
                     .child(Icon::new(IconName::HardDrive).size_4())
                     .child("本地文件系统"),
             )
+            .into_any_element()
+    }
+
+    /// 侧栏收起来之后的样子：一条 48px 的图标条。
+    ///
+    /// 收起时**位置入口一个都不少**——只留一颗展开按钮的话，用户收起之后
+    /// 就找不到"个人文件夹/桌面/下载"了，等于把侧栏废掉。这些图标条上的
+    /// 每一项都还能点回去，标签写不进就靠 tooltip 与无障碍名。
+    fn render_sidebar_collapsed(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.tabs[self.active].read(cx).path().to_path_buf();
+        let places: Vec<AnyElement> = Self::places()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, icon, path))| {
+                let target = path.clone();
+                Button::new(("collapsed-place", index))
+                    .icon(icon)
+                    .ghost()
+                    .small()
+                    .selected(current == path)
+                    .tooltip(label)
+                    .accessibility_label(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.navigate_active_tab(target.clone(), window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .w(px(SIDEBAR_COLLAPSED_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .items_center()
+            .gap_1()
+            .py_2()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(
+                Button::new("sidebar-collapse")
+                    .icon(IconName::PanelLeftOpen)
+                    .ghost()
+                    .small()
+                    .tooltip("展开侧栏（Cmd+B）")
+                    .accessibility_label("展开侧栏")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_collapsed = false;
+                        cx.notify();
+                    })),
+            )
+            .child(div().h(px(4.)))
+            .children(places)
+            .into_any_element()
     }
 
     /// 侧栏的「磁盘」区：本机挂着的卷（外接盘、U 盘、网络共享）一条一行。
@@ -890,6 +989,36 @@ impl WFilesApp {
         self.active = next;
         self.sync_session(cx);
         cx.notify();
+    }
+
+    // ---- 面板显隐 ----
+
+    /// 收起 / 展开侧栏。
+    ///
+    /// 不存进设置：这不是偏好，是"这块屏幕现在有多宽"的应对。
+    /// 下次开在一个大屏上还给用户一条 48px 的图标条，等于替他们做了
+    /// 一个他们没要求的决定。
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        cx.notify();
+    }
+
+    /// 显示 / 隐藏详情板。
+    ///
+    /// 只动**当前显示的那几栏**：双栏时两栏可能看的是不同的东西，
+    /// 一条命令把两边一起收掉会让另一栏的预览莫名其妙地消失。
+    fn toggle_details(&mut self, cx: &mut Context<Self>) {
+        for index in self.visible() {
+            self.tabs[index].update(cx, |pane, cx| {
+                pane.details_shown = !pane.details_shown;
+                cx.notify();
+            });
+        }
+    }
+
+    /// 焦点那一栏此刻有没有详情板——命令面板要拿它决定条目写"收起"还是"展开"。
+    fn details_shown_in_active(&self, cx: &Context<Self>) -> bool {
+        self.tabs[self.active].read(cx).details_shown
     }
 
     // ---- 双栏 ----
@@ -1747,6 +1876,8 @@ impl WFilesApp {
                 AppCommand::ToggleSync => self.toggle_sync(window, cx),
                 AppCommand::CopyToOther => self.transfer_to_other(false, cx),
                 AppCommand::MoveToOther => self.transfer_to_other(true, cx),
+                AppCommand::ToggleSidebar => self.toggle_sidebar(cx),
+                AppCommand::ToggleDetails => self.toggle_details(cx),
                 AppCommand::Compare => self.toggle_compare(window, cx),
                 AppCommand::Diff => self.open_diff(window, cx),
             },
@@ -2011,6 +2142,34 @@ impl WFilesApp {
                     action: PaletteAction::App(AppCommand::MoveToOther),
                 });
             }
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    "app:toggle-sidebar",
+                    if self.sidebar_collapsed {
+                        "展开侧栏"
+                    } else {
+                        "收起侧栏"
+                    },
+                    "Cmd+B",
+                    "窗口",
+                    "sidebar 侧栏 收起 展开 折叠 窄",
+                ),
+                action: PaletteAction::App(AppCommand::ToggleSidebar),
+            });
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    "app:toggle-details",
+                    if self.details_shown_in_active(cx) {
+                        "收起详情板"
+                    } else {
+                        "展开详情板"
+                    },
+                    "Cmd+Alt+O",
+                    "窗口",
+                    "details 详情 预览 信息 收起 展开 检查器",
+                ),
+                action: PaletteAction::App(AppCommand::ToggleDetails),
+            });
         }
 
         items.push(PaletteItem {
@@ -2209,7 +2368,7 @@ impl WFilesApp {
             ),
             PaneCommand::EditRemote => (
                 "编辑远程文件",
-                "Cmd+Alt+E",
+                "Cmd+Alt+O",
                 "文件",
                 "edit 编辑 remote 远程 回传 上传 upload",
             ),
@@ -3359,6 +3518,12 @@ impl Render for WFilesApp {
                 h_flex()
                     .flex_1()
                     .min_h_0()
+                    // `min_w_0` 不是可选的：flex 容器的最小宽度默认是
+                    // `auto`，也就是内容有多宽这一栏就要有多宽。工具栏上钉着
+                    // 十几颗不可收缩的按钮（实测 710px），少了这一行，
+                    // 窗口缩到多窄这一栏都不肯缩——侧栏与详情板被挤出屏幕，
+                    // 而工具栏上一排按钮还在屏幕右边点不到。
+                    .min_w_0()
                     .child(self.render_sidebar(cx))
                     .child(self.render_panes(cx)),
             );
@@ -3393,6 +3558,8 @@ impl Render for WFilesApp {
                     this.toggle_terminal(window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleDetails, _, cx| this.toggle_details(cx)))
             .on_action(cx.listener(|this, _: &Compare, window, cx| this.toggle_compare(window, cx)))
             .on_action(cx.listener(|this, _: &Diff, window, cx| this.open_diff(window, cx)));
 

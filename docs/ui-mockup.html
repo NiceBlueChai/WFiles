@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>WFiles 界面重设计 · 预览稿</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#171717; --muted-bg:#f5f5f5; --muted-fg:#737373; --border:#e5e5e5;
+  --sidebar-bg:#fafafa; --sidebar-accent:#e5e5e5; --tabbar-bg:#f5f5f5; --title-bg:#f8f8f8;
+  --row-hover:#f5f5f5; --row-active-bg:rgba(191,219,254,.22); --row-active-border:#60a5fa;
+  --head-bg:#fafafa; --primary:#171717; --primary-fg:#fafafa;
+  --danger:#ef4444; --warning:#eab308; --success:#22c55e; --info:#06b6d4;
+  --red:#ef4444; --yellow:#eab308; --green:#22c55e; --cyan:#06b6d4; --blue:#3b82f6; --magenta:#d946ef;
+  --drop:#3b82f640; --radius:6px; --radius-lg:8px; --thumb:#a3a3a3e6;
+  --ui:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --mono:"SF Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:#f2f2f2;font-family:var(--ui);color:var(--fg);
+  -webkit-font-smoothing:antialiased;padding:32px 40px 80px;}
+.page{max-width:1240px;margin:0 auto}
+h1{font-size:22px;font-weight:700;margin:0 0 4px}
+h1 .tag{font-size:12px;font-weight:500;color:var(--muted-fg);border:1px solid var(--border);
+  background:#fff;border-radius:99px;padding:2px 10px;vertical-align:3px;margin-left:10px}
+.lede{color:var(--muted-fg);font-size:13px;line-height:1.7;margin:0 0 28px}
+h2{font-size:15px;font-weight:600;margin:44px 0 6px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+h2 small{font-weight:400;color:var(--muted-fg);font-size:12px;margin-left:8px}
+.hint{font-size:12px;color:var(--muted-fg);margin:8px 0 14px;line-height:1.7}
+.i{width:16px;height:16px;flex:none;display:block}
+.i12{width:12px;height:12px}.i14{width:14px;height:14px}.i20{width:20px;height:20px}
+.i32{width:32px;height:32px}.i48{width:48px;height:48px}
+
+/* ---------- 窗口 ---------- */
+.win{background:var(--bg);border:1px solid var(--border);border-radius:12px;overflow:hidden;
+  box-shadow:0 12px 34px rgba(0,0,0,.10),0 2px 6px rgba(0,0,0,.05);font-size:13px}
+.titlebar{height:34px;display:flex;align-items:center;gap:10px;padding:0 10px;
+  background:var(--title-bg);border-bottom:1px solid var(--border)}
+.lights{display:flex;gap:6px;flex:none}
+.lights i{width:11px;height:11px;border-radius:50%;background:#d4d4d4;display:block}
+.lights i:nth-child(1){background:#ff5f57}.lights i:nth-child(2){background:#febc2e}.lights i:nth-child(3){background:#28c840}
+.tabs{display:flex;align-items:center;gap:4px;background:var(--tabbar-bg);border-radius:8px;padding:3px;flex:none}
+.tab{display:flex;align-items:center;gap:6px;height:26px;padding:0 8px;border-radius:6px;font-size:12.5px;
+  color:#404040;max-width:200px;white-space:nowrap}
+.tab.active{background:var(--bg);color:var(--fg);font-weight:500;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.tab .x{display:flex;opacity:.55}
+.tab.add{padding:0 6px}
+.tb-right{margin-left:auto;display:flex;align-items:center;gap:2px}
+.tbtn{display:flex;align-items:center;justify-content:center;gap:6px;height:26px;padding:0 7px;border-radius:var(--radius);
+  color:var(--fg)}
+.tbtn.on{background:var(--sidebar-accent)}
+.body{display:flex;align-items:stretch;min-height:470px}
+
+/* ---------- 侧栏 ---------- */
+.sidebar{width:255px;flex:none;background:var(--sidebar-bg);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;padding-bottom:8px}
+.sb-head{height:44px;display:flex;align-items:center;gap:9px;padding:0 12px;border-bottom:1px solid var(--border)}
+.sb-logo{width:22px;height:22px;border-radius:6px;background:var(--primary);color:var(--primary-fg);
+  display:flex;align-items:center;justify-content:center}
+.grp{padding:8px 8px 0}
+.grp-t{font-size:11px;color:var(--muted-fg);font-weight:500;padding:6px 8px 4px;letter-spacing:.02em}
+.row{display:flex;align-items:center;gap:8px;height:28px;padding:0 8px;border-radius:var(--radius);color:var(--fg)}
+.row.on{background:var(--sidebar-accent);font-weight:500}
+.row .cnt{margin-left:auto;font-size:11px;color:var(--muted-fg)}
+.dot{width:7px;height:7px;border-radius:50%;flex:none;margin-left:auto}
+.dot.ok{background:var(--success)}.dot.off{background:#d4d4d4}.dot.warn{background:var(--warning)}
+.bar{height:3px;border-radius:2px;background:var(--border);margin:3px 8px 0;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--muted-fg);opacity:.55}
+.sb-foot{margin:auto 8px 0;padding:8px 10px;border-radius:var(--radius);background:var(--sidebar-accent);
+  font-size:11.5px;color:var(--muted-fg);line-height:1.55}
+
+/* ---------- 窗格 ---------- */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.toolbar{height:40px;flex:none;display:flex;align-items:center;gap:2px;padding:0 8px;border-bottom:1px solid var(--border)}
+.sep{width:1px;height:18px;background:var(--border);margin:0 6px}
+.crumbs{display:flex;align-items:center;gap:1px;font-size:13px;min-width:0;overflow:hidden}
+.crumb{display:flex;align-items:center;gap:4px;padding:3px 6px;border-radius:4px;color:var(--muted-fg);white-space:nowrap}
+.crumb.cur{color:var(--fg);font-weight:500}
+.tool-spacer{flex:1}
+.seg{display:flex;align-items:center;background:var(--muted-bg);border-radius:var(--radius);padding:2px;gap:2px}
+.seg .s{display:flex;align-items:center;justify-content:center;height:22px;padding:0 7px;border-radius:4px;color:var(--muted-fg)}
+.seg .s.on{background:var(--bg);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.field{display:flex;align-items:center;gap:6px;height:26px;width:200px;padding:0 8px;border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--muted-fg);background:#fff}
+.field span{font-size:12.5px}
+
+.thead{height:30px;flex:none;display:flex;align-items:center;gap:0;padding:0 8px;background:var(--head-bg);
+  border-bottom:1px solid var(--border);font-size:12px;color:var(--muted-fg)}
+.thead .h{display:flex;align-items:center;gap:4px}
+.rows{flex:1;min-height:0;overflow:hidden}
+.r{display:flex;align-items:center;height:34px;padding:0 8px;position:relative;border-bottom:1px solid transparent}
+.r:hover{background:var(--row-hover)}
+.r.on{background:var(--row-active-bg)}
+.r.on::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--row-active-border)}
+.r .mk{width:8px;height:8px;border-radius:50%;flex:none}
+.gcol{flex:none;font-size:12px;color:var(--muted-fg)}
+.c-name{flex:1;min-width:0;display:flex;align-items:center;gap:8px;overflow:hidden}
+.nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gbadge{display:inline-flex;align-items:center;gap:3px;font-size:11px;color:var(--muted-fg);
+  background:var(--muted-bg);border-radius:4px;padding:1px 5px;flex:none}
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;height:18px;padding:0 6px;border-radius:4px;
+  background:var(--muted-bg);color:var(--muted-fg);flex:none}
+.badge.info{background:rgba(6,182,212,.12);color:#0e7490}
+.badge.warn{background:rgba(234,179,8,.16);color:#a16207}
+.badge.ok{background:rgba(34,197,94,.14);color:#15803d}
+.badge.danger{background:rgba(239,68,68,.12);color:#b91c1c}
+.thumb{width:20px;height:20px;border-radius:4px;background:var(--muted-bg);display:flex;align-items:center;
+  justify-content:center;color:var(--muted-fg);flex:none}
+.w-name{width:auto}.w-meta{width:96px;text-align:right}.w-size{width:88px;text-align:right}
+.w-time{width:130px;text-align:right}.w-kind{width:92px;text-align:right}
+
+/* ---------- 详情板 ---------- */
+.details{width:280px;flex:none;border-left:1px solid var(--border);display:flex;flex-direction:column}
+.d-head{height:40px;display:flex;align-items:center;gap:8px;padding:0 10px;border-bottom:1px solid var(--border);
+  font-size:13px;font-weight:500}
+.d-head .i{margin-left:auto;color:var(--muted-fg)}
+.d-prev{margin:12px;height:120px;border-radius:var(--radius-lg);background:var(--muted-bg);
+  display:flex;align-items:center;justify-content:center;color:#a3a3a3;position:relative}
+.d-prev .badge{position:absolute;left:8px;top:8px}
+.dl{padding:0 12px;font-size:12.5px}
+.dl .dr{display:flex;gap:10px;padding:5px 0;border-bottom:1px solid #f5f5f5}
+.dl .k{width:64px;flex:none;color:var(--muted-fg)}
+.dl .v{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dl .v.path{color:var(--muted-fg);font-size:12px}
+.tags{display:flex;gap:6px;align-items:center}
+
+/* ---------- 终端 ---------- */
+.handle{height:6px;background:var(--muted-bg);display:flex;align-items:center;justify-content:center;
+  color:#a3a3a3;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+.term{height:132px;background:#181818;color:#d4d4d4;font-family:var(--mono);font-size:13px;line-height:1.55;
+  padding:8px 12px;overflow:hidden}
+.term .p{color:#7ee787}.term .c{color:#79c0ff}.term .d{color:#8b949e}
+
+/* ---------- 状态栏 ---------- */
+.statusbar{height:28px;display:flex;align-items:center;gap:10px;padding:0 10px;background:var(--title-bg);
+  border-top:1px solid var(--border);font-size:11.5px;color:var(--muted-fg)}
+.prog{flex:none;width:130px;height:4px;border-radius:2px;background:var(--muted-bg);overflow:hidden}
+.prog i{display:block;height:100%;width:34%;background:var(--primary)}
+.sb-right{margin-left:auto;display:flex;align-items:center;gap:8px}
+.sbtn{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:4px;color:var(--fg);
+  background:#fff;border:1px solid var(--border)}
+.sbtn.dis{color:#a3a3a3;background:transparent;border-color:transparent}
+
+/* ---------- 网格 ---------- */
+.grid{display:grid;grid-template-columns:repeat(7,112px);gap:12px;padding:14px}
+.tile{height:124px;border-radius:var(--radius);display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:7px;padding:8px;text-align:center}
+.tile:hover{background:var(--row-hover)}
+.tile.on{background:var(--row-active-bg);box-shadow:inset 0 0 0 1px var(--row-active-border)}
+.tile .box{width:64px;height:64px;border-radius:var(--radius);background:var(--muted-bg);display:flex;
+  align-items:center;justify-content:center;color:var(--muted-fg)}
+.tile .n{font-size:12px;line-height:1.3;max-width:100%;overflow:hidden;text-overflow:ellipsis;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.tile .m{font-size:11px;color:var(--muted-fg)}
+
+/* ---------- 浮层 ---------- */
+.stage{position:relative;background:#ededed;border:1px solid var(--border);border-radius:12px;padding:22px;
+  display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start}
+.card{background:var(--bg);border:1px solid var(--border);border-radius:10px;overflow:hidden;
+  box-shadow:0 14px 40px rgba(0,0,0,.13),0 2px 8px rgba(0,0,0,.06)}
+.card .ttl{height:46px;display:flex;align-items:center;gap:9px;padding:0 14px;border-bottom:1px solid var(--border);
+  font-size:13.5px;font-weight:600}
+.card .ttl .i{color:var(--muted-fg)}
+.card .ttl .x{margin-left:auto;color:var(--muted-fg)}
+.card .ft{height:30px;display:flex;align-items:center;gap:10px;padding:0 14px;border-top:1px solid var(--border);
+  font-size:11.5px;color:var(--muted-fg)}
+.cmd-in{height:46px;display:flex;align-items:center;gap:9px;padding:0 14px;border-bottom:1px solid var(--border);
+  color:var(--muted-fg)}
+.cmd-in .txt{color:var(--fg);font-size:13.5px}
+.grp-l{font-size:11px;color:var(--muted-fg);padding:9px 14px 4px;font-weight:500}
+.ci{display:flex;align-items:center;gap:10px;height:32px;padding:0 14px;font-size:13px}
+.ci.on{background:var(--muted-bg)}
+.ci .ver{margin-left:auto;display:flex;gap:3px}
+kbd{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 4px;
+  font-family:var(--ui);font-size:11px;color:var(--muted-fg);background:var(--muted-bg);
+  border:1px solid var(--border);border-radius:4px}
+.alert{padding:16px 16px 8px}
+.alert .al-t{display:flex;gap:10px;align-items:center;font-size:14px;font-weight:600;margin-bottom:8px}
+.alert .al-t .i{color:var(--warning)}
+.cf{border:1px solid var(--border);border-radius:var(--radius);padding:9px 10px;margin:8px 0;font-size:12.5px}
+.cf .r1{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.cf .grid2{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;color:var(--muted-fg);font-size:12px}
+.cf .col{background:var(--muted-bg);border-radius:4px;padding:6px 8px;color:var(--fg)}
+.btns{display:flex;gap:8px;justify-content:flex-end;padding:12px 16px 16px}
+.btn{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;border-radius:var(--radius);
+  font-size:12.5px;border:1px solid transparent}
+.btn.pri{background:var(--primary);color:var(--primary-fg)}
+.btn.sec{background:var(--muted-bg);border-color:var(--border)}
+.btn.gho{border-color:var(--border)}
+.btn.dan{background:var(--danger);color:#fff}
+.switch{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted-fg)}
+.sw{width:30px;height:17px;border-radius:99px;background:#d4d4d4;position:relative;flex:none}
+.sw i{position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#fff;display:block}
+.note{width:382px;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:12px 14px;
+  display:flex;gap:11px;box-shadow:0 8px 26px rgba(0,0,0,.11)}
+.note .i20{margin-top:1px}
+.note.ok .i20{color:var(--success)}.note.err .i20{color:var(--danger)}
+.note .nt{font-size:13px;font-weight:600;margin-bottom:2px}
+.note .nb{font-size:12.5px;color:var(--muted-fg);line-height:1.6}
+.note .act{margin-left:auto;align-self:center}
+
+/* ---------- 令牌 / 图标 ---------- */
+.sw-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.sw{background:#fff;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.sw .c{height:38px}
+.sw .t{padding:7px 9px;font-size:11.5px;line-height:1.5;border-top:1px solid var(--border)}
+.sw .t b{display:block;font-weight:500;font-size:12px}
+.sw .t span{color:var(--muted-fg);font-family:var(--mono);font-size:11px}
+.igrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));gap:8px}
+.ic{background:#fff;border:1px solid var(--border);border-radius:8px;padding:10px 8px;text-align:center}
+.ic .nm2{font-family:var(--mono);font-size:10.5px;color:var(--muted-fg);margin-top:7px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ic .row{justify-content:center;gap:10px;height:auto;padding:0}
+.miss{outline:1px dashed var(--danger);outline-offset:-1px}
+.miss .nm2{color:var(--danger)}
+.legend{display:flex;gap:18px;font-size:12px;color:var(--muted-fg);margin:6px 0 14px}
+.legend b{color:var(--fg);font-weight:500}
+table.spec{width:100%;border-collapse:collapse;font-size:12.5px;background:#fff;
+  border:1px solid var(--border);border-radius:8px;overflow:hidden}
+table.spec th{text-align:left;font-weight:500;color:var(--muted-fg);background:var(--head-bg);
+  padding:8px 10px;border-bottom:1px solid var(--border);font-size:12px}
+table.spec td{padding:8px 10px;border-bottom:1px solid #f5f5f5;vertical-align:top}
+table.spec tr:last-child td{border-bottom:0}
+code{font-family:var(--mono);font-size:11.5px;background:var(--muted-bg);padding:1px 5px;border-radius:4px}
+</style></head><body><div class="page">
+
+<h1>WFiles 界面重设计<span class="tag">预览稿 · 浅色 · 1:1 px</span></h1>
+<p class="lede">用 <b>真实的 gpui-kit 图标</b>（Lucide，内联自 <code>assets/icons</code>）与 <b>真实主题令牌色值</b>（<code>default-theme.json</code> 的 Default Light）绘制。
+尺寸按 §2.2 几何令牌的标准密度：标题栏 34 / 工具栏 40 / 行 34 / 状态栏 28 / 侧栏 255 / 详情板 280。完整规格见 <code>docs/ui-redesign.md</code>。</p>
+
+<h2>1 · 主窗口（列表视图）<small>标题栏合并标签 · 侧栏分组 · 工具栏收纳为 5+1 · 选中态左竖条 · 可拖详情板 · 可拖终端</small></h2>
+<div class="win">
+  <div class="titlebar">
+    <div class="lights"><i></i><i></i><i></i></div>
+    <nav class="tabs">
+      <div class="tab active"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg> 文稿 <span class="x"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /> <path d="m6 6 12 12" /></svg></span></div>
+      <div class="tab"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg> 下载 <span class="x"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /> <path d="m6 6 12 12" /></svg></span></div>
+      <div class="tab add"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14" /> <path d="M12 5v14" /></svg></div>
+    </nav>
+    <div class="tb-right">
+      <div class="tbtn on"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M12 3v18" /></svg></div>
+      <div class="tbtn on"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4" /> <path d="M4 7h16" /> <path d="m16 21 4-4-4-4" /> <path d="M20 17H4" /></svg></div>
+      <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /> <circle cx="11" cy="11" r="8" /></svg></div>
+      <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3" /></svg></div>
+    </div>
+  </div>
+
+  <div class="body">
+    <aside class="sidebar">
+      <div class="sb-head">
+        <div class="sb-logo"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" /></svg></div>
+        <div style="line-height:1.25">
+          <div style="font-size:12.5px;font-weight:600">WFiles</div>
+          <div style="font-size:11px;color:var(--muted-fg)">快速 · 清楚 · 可撤销</div>
+        </div>
+      </div>
+      <div class="grp"><div class="grp-t">位置</div>
+        <div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" /></svg> 个人文件夹</div>
+        <div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8" /> <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg> 桌面</div>
+        <div class="row on"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 9H8" /> <path d="M16 13H8" /> <path d="M16 17H8" /></svg> 文稿</div>
+        <div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3" /> <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /> <path d="m7 10 5 5 5-5" /></svg> 下载</div>
+      </div>
+      <div class="grp"><div class="grp-t">磁盘</div>
+        <div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 16h.01" /> <path d="M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /> <path d="M21.946 12.013H2.054" /> <path d="M6 16h.01" /></svg> Macintosh HD <span class="cnt">245/512 GB</span></div>
+        <div class="bar"><i style="width:48%"></i></div>
+        <div class="row" style="margin-top:4px"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="7" r="1" /> <circle cx="4" cy="20" r="1" /> <path d="M4.7 19.3 19 5" /> <path d="m21 3-3 1 2 2Z" /> <path d="M9.26 7.68 5 12l2 5" /> <path d="m10 14 5 2 3.5-3.5" /> <path d="m18 12 1-1 1 1-1 1Z" /></svg> USB 优盘 <span class="cnt">18/32 GB</span></div>
+      </div>
+      <div class="grp"><div class="grp-t">云盘</div>
+        <div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" /></svg> iCloud 云盘 <span class="dot ok"></span></div>
+      </div>
+      <div class="grp"><div class="grp-t">远程</div>
+        <div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" /></svg> 坚果园 <span class="dot ok"></span></div>
+        <div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2" ry="2" /> <rect width="20" height="8" x="2" y="14" rx="2" ry="2" /> <line x1="6" x2="6.01" y1="6" y2="6" /> <line x1="6" x2="6.01" y1="18" y2="18" /></svg> vps-01 <span class="badge info">编辑中</span></div>
+        <div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5" /> <path d="M15 8V2" /> <path d="M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z" /> <path d="M9 8V2" /></svg> 连接服务器…</div>
+      </div>
+      <div class="sb-foot">本地文件系统<br>删除进回收站，可放回原处</div>
+    </aside>
+
+    <div class="main">
+      <div class="toolbar">
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6" /></svg></div>
+        <div class="tbtn" style="color:#a3a3a3"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg></div>
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 7-7 7 7" /> <path d="M12 19V5" /></svg></div>
+        <div class="sep"></div>
+        <div class="crumbs">
+          <div class="crumb">Macintosh HD</div><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg>
+          <div class="crumb">用户</div><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg>
+          <div class="crumb cur">文稿</div>
+        </div>
+        <div class="tool-spacer"></div>
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10v6" /> <path d="M9 13h6" /> <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg></div>
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /> <path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z" /></svg></div>
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 11v6" /> <path d="M14 11v6" /> <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /> <path d="M3 6h18" /> <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg></div>
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /></svg></div>
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 14h10" /> <path d="M16 4h2a2 2 0 0 1 2 2v1.344" /> <path d="m17 18 4-4-4-4" /> <path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 1.793-1.113" /> <rect x="8" y="2" width="8" height="4" rx="1" /></svg></div>
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1" /> <circle cx="19" cy="12" r="1" /> <circle cx="5" cy="12" r="1" /></svg></div>
+        <div class="sep"></div>
+        <div class="seg">
+          <div class="s on"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01" /> <path d="M3 12h.01" /> <path d="M3 19h.01" /> <path d="M8 5h13" /> <path d="M8 12h13" /> <path d="M8 19h13" /></svg></div>
+          <div class="s"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1" /> <rect width="7" height="7" x="14" y="3" rx="1" /> <rect width="7" height="7" x="14" y="14" rx="1" /> <rect width="7" height="7" x="3" y="14" rx="1" /></svg></div>
+          <div class="s"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M9 3v18" /> <path d="M15 3v18" /></svg></div>
+        </div>
+        <div class="sep"></div>
+        <div class="field"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5h20" /> <path d="M6 12h12" /> <path d="M9 19h6" /></svg> <span>筛选…</span></div>
+      </div>
+
+      <div class="thead">
+        <div class="h" style="flex:1">名称 <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg></div>
+        <div class="h w-meta" style="justify-content:flex-end">Git</div>
+        <div class="h w-size" style="justify-content:flex-end">大小 <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg></div>
+        <div class="h w-time" style="justify-content:flex-end">修改时间</div>
+        <div class="h w-kind" style="justify-content:flex-end">类型</div>
+      </div>
+
+      <div class="rows">
+        <div class="r"><div class="c-name"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg> <span class="nm">项目</span></div><div class="gcol w-meta"></div><div class="gcol w-size">—</div><div class="gcol w-time">今天 09:41</div><div class="gcol w-kind">文件夹</div></div>
+        <div class="r"><div class="c-name"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 9H8" /> <path d="M16 13H8" /> <path d="M16 17H8" /></svg> <span class="nm">设计稿.md</span><span class="mk" style="background:var(--red)"></span><span class="gbadge"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6a9 9 0 0 0-9 9V3" /> <circle cx="18" cy="6" r="3" /> <circle cx="6" cy="18" r="3" /></svg> main</span></div><div class="gcol w-meta"><span class="badge info">M</span></div><div class="gcol w-size">12 KB</div><div class="gcol w-time">昨天 17:02</div><div class="gcol w-kind">Markdown</div></div>
+        <div class="r"><div class="c-name"><div class="thumb"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg></div><span class="nm">封面.png</span></div><div class="gcol w-meta"></div><div class="gcol w-size">820 KB</div><div class="gcol w-time">10-11 14:20</div><div class="gcol w-kind">PNG 图像</div></div>
+        <div class="r"><div class="c-name"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg> <span class="nm">assets</span></div><div class="gcol w-meta"></div><div class="gcol w-size">—</div><div class="gcol w-time">10-09 11:03</div><div class="gcol w-kind">文件夹</div></div>
+        <div class="r"><div class="c-name"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg> <span class="nm">src</span><span class="gbadge"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6a9 9 0 0 0-9 9V3" /> <circle cx="18" cy="6" r="3" /> <circle cx="6" cy="18" r="3" /></svg> main</span></div><div class="gcol w-meta"></div><div class="gcol w-size">—</div><div class="gcol w-time">今天 10:12</div><div class="gcol w-kind">文件夹</div></div>
+        <div class="r"><div class="c-name"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.659 22H18a2 2 0 0 0 2-2V8a2.4 2.4 0 0 0-.706-1.706l-3.588-3.588A2.4 2.4 0 0 0 14 2H6a2 2 0 0 0-2 2v11.5" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M8 12v-1" /> <path d="M8 18v-2" /> <path d="M8 7V6" /> <circle cx="8" cy="20" r="2" /></svg> <span class="nm">备份-2026-10.tar.gz</span></div><div class="gcol w-meta"></div><div class="gcol w-size">1.2 GB</div><div class="gcol w-time">10-01 03:00</div><div class="gcol w-kind">压缩包</div></div>
+        <div class="r"><div class="c-name"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 9H8" /> <path d="M16 13H8" /> <path d="M16 17H8" /></svg> <span class="nm">会议记录.docx</span><span class="mk" style="background:var(--yellow)"></span></div><div class="gcol w-meta"></div><div class="gcol w-size">48 KB</div><div class="gcol w-time">昨天 09:31</div><div class="gcol w-kind">Word</div></div>
+        <div class="r on"><div class="c-name"><div class="thumb"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 12.5 8 15l2 2.5" /> <path d="m14 12.5 2 2.5-2 2.5" /></svg></div><span class="nm">build.log</span><span class="badge" style="color:var(--info)"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /></svg> 已复制</span></div><div class="gcol w-meta"></div><div class="gcol w-size">6.4 MB</div><div class="gcol w-time">今天 10:44</div><div class="gcol w-kind">日志</div></div>
+        <div class="r"><div class="c-name"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 9H8" /> <path d="M16 13H8" /> <path d="M16 17H8" /></svg> <span class="nm">报表.csv</span></div><div class="gcol w-meta"></div><div class="gcol w-size">310 KB</div><div class="gcol w-time">10-12 16:08</div><div class="gcol w-kind">CSV</div></div>
+        <div class="r"><div class="c-name"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg> <span class="nm">归档</span><span class="mk" style="background:var(--green)"></span></div><div class="gcol w-meta"></div><div class="gcol w-size">—</div><div class="gcol w-time">09-28 08:15</div><div class="gcol w-kind">文件夹</div></div>
+      </div>
+    </div>
+
+    <aside class="details">
+      <div class="d-head">详细信息 <svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M15 3v18" /></svg></div>
+      <div class="d-prev"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 12.5 8 15l2 2.5" /> <path d="m14 12.5 2 2.5-2 2.5" /></svg> <span class="badge">6.4 MB</span></div>
+      <div class="dl">
+        <div class="dr"><div class="k">类型</div><div class="v">纯文本日志</div></div>
+        <div class="dr"><div class="k">大小</div><div class="v">6.4 MB（142,301 行）</div></div>
+        <div class="dr"><div class="k">修改</div><div class="v">今天 10:44</div></div>
+        <div class="dr"><div class="k">创建</div><div class="v">10-09 11:03</div></div>
+        <div class="dr"><div class="k">Git</div><div class="v"><span class="gbadge"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6a9 9 0 0 0-9 9V3" /> <circle cx="18" cy="6" r="3" /> <circle cx="6" cy="18" r="3" /></svg> main · 未跟踪</span></div></div>
+        <div class="dr"><div class="k">云盘</div><div class="v" style="color:var(--info)">已同步</div></div>
+        <div class="dr"><div class="k">标记</div><div class="v tags"><span class="mk" style="background:var(--blue)"></span> 进行中</div></div>
+        <div class="dr"><div class="k">位置</div><div class="v path">Macintosh HD/用户/文稿</div></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="handle"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="12" r="1" /> <circle cx="9" cy="5" r="1" /> <circle cx="9" cy="19" r="1" /> <circle cx="15" cy="12" r="1" /> <circle cx="15" cy="5" r="1" /> <circle cx="15" cy="19" r="1" /></svg></div>
+  <div class="term">
+    <div><span class="p">wfiles</span> <span class="c">文稿</span> <span class="d">$</span> cargo test --all</div>
+    <div><span class="d">   Compiling wfiles v0.1.0 (/Volumes/Ventoy/projects/WFiles)</span></div>
+    <div><span class="p">    Finished</span> <span class="d">test [unoptimized] target(s) in 42.31s</span></div>
+    <div><span class="d">     Running unittests src/main.rs (target/debug/deps/wfiles-8f2a1c)</span></div>
+    <div><span class="p">test result: ok.</span> <span class="d">318 passed; 0 failed; 0 ignored</span></div>
+  </div>
+
+  <div class="statusbar">
+    <span>复制 3 项 · 42.7 MB / 128 MB · 8.2 MB/s · 剩 12 秒</span>
+    <div class="prog"><i></i></div>
+    <span class="sbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="14" y="3" width="5" height="18" rx="1" /> <rect x="5" y="3" width="5" height="18" rx="1" /></svg> 暂停</span>
+    <span class="sbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /> <path d="m6 6 12 12" /></svg> 取消</span>
+    <div class="sb-right">
+      <span>限速 不限</span>
+      <span>2 个远程文件编辑中</span>
+      <span class="sbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5" /> <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11" /></svg> 撤销：移动 3 项</span>
+    </div>
+  </div>
+</div>
+<p class="hint">状态栏左段是「有任务」态：进度条 4px（<code>Progress</code> XSmall，与现状尺寸一致），暂停时速度与剩余时间会隐藏（避免「还剩 3 分」僵死）。右上角不弹通知以免噪音——完成时才弹，并带「撤销」。</p>
+
+<h2>2 · 网格视图 · 详情板 · 传输中心<small>格子 112×124 · 缩略图 64 · 传输中心用 Sheet（右侧滑出）</small></h2>
+<div class="win">
+  <div class="titlebar">
+    <div class="lights"><i></i><i></i><i></i></div>
+    <nav class="tabs"><div class="tab active"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg> 图片 <span class="x"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /> <path d="m6 6 12 12" /></svg></span></div><div class="tab add"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14" /> <path d="M12 5v14" /></svg></div></nav>
+    <div class="tb-right"><div class="tbtn on"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M12 3v18" /></svg></div><div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /> <circle cx="11" cy="11" r="8" /></svg></div><div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3" /></svg></div></div>
+  </div>
+  <div class="body" style="min-height:330px">
+    <aside class="sidebar" style="width:48px;padding:8px 0">
+      <div class="row" style="justify-content:center;padding:0"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M9 3v18" /></svg></div>
+      <div class="row" style="justify-content:center;padding:0"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" /></svg></div>
+      <div class="row" style="justify-content:center;padding:0"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8" /> <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg></div>
+      <div class="row on" style="justify-content:center;padding:0"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg></div>
+      <div class="row" style="justify-content:center;padding:0"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" /></svg></div>
+      <div class="row" style="justify-content:center;padding:0"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2" ry="2" /> <rect width="20" height="8" x="2" y="14" rx="2" ry="2" /> <line x1="6" x2="6.01" y1="6" y2="6" /> <line x1="6" x2="6.01" y1="18" y2="18" /></svg></div>
+    </aside>
+    <div class="main">
+      <div class="toolbar">
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6" /></svg></div><div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 7-7 7 7" /> <path d="M12 19V5" /></svg></div>
+        <div class="sep"></div>
+        <div class="crumbs"><div class="crumb">文稿</div><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg><div class="crumb cur">图片</div></div>
+        <div class="tool-spacer"></div>
+        <div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10v6" /> <path d="M9 13h6" /> <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg></div><div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 11v6" /> <path d="M14 11v6" /> <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /> <path d="M3 6h18" /> <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg></div><div class="tbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1" /> <circle cx="19" cy="12" r="1" /> <circle cx="5" cy="12" r="1" /></svg></div>
+        <div class="sep"></div>
+        <div class="seg"><div class="s"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01" /> <path d="M3 12h.01" /> <path d="M3 19h.01" /> <path d="M8 5h13" /> <path d="M8 12h13" /> <path d="M8 19h13" /></svg></div><div class="s on"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1" /> <rect width="7" height="7" x="14" y="3" rx="1" /> <rect width="7" height="7" x="14" y="14" rx="1" /> <rect width="7" height="7" x="3" y="14" rx="1" /></svg></div><div class="s"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M9 3v18" /> <path d="M15 3v18" /></svg></div></div>
+      </div>
+      <div class="grid">
+        <div class="tile on"><div class="box"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg></div><div class="n">封面.png</div><div class="m">820 KB</div></div>
+        <div class="tile"><div class="box"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg></div><div class="n">截图 2026-10-13 10.44.12.png</div><div class="m">1.1 MB</div></div>
+        <div class="tile"><div class="box"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg></div><div class="n">banner-2x.png</div><div class="m">2.4 MB</div></div>
+        <div class="tile"><div class="box"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg></div><div class="n">原图-raw.dng</div><div class="m">正在生成预览</div></div>
+        <div class="tile"><div class="box"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg></div><div class="n">icon-set.png</div><div class="m">64 KB</div></div>
+        <div class="tile"><div class="box"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg></div><div class="n">2025 归档</div><div class="m">文件夹</div></div>
+        <div class="tile"><div class="box"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M7 3v18" /> <path d="M3 7.5h4" /> <path d="M3 12h18" /> <path d="M3 16.5h4" /> <path d="M17 3v18" /> <path d="M17 7.5h4" /> <path d="M17 16.5h4" /></svg></div><div class="n">演示录屏.mp4</div><div class="m">48 MB</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="statusbar"><span>7 项 · 已选 1 项 · 封面.png</span><div class="sb-right"><span>标准密度</span></div></div>
+</div>
+
+<div class="stage" style="margin-top:14px">
+  <div class="card" style="width:420px">
+    <div class="ttl"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M3 15h18" /></svg> 传输中心 <span class="x"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /> <path d="m6 6 12 12" /></svg></span></div>
+    <div style="padding:6px 0">
+      <div class="ci"><span style="font-size:12.5px;width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">复制 · 3 项 → 归档</span><div class="prog" style="flex:1;width:auto"><i style="width:34%"></i></div><span style="font-size:11.5px;color:var(--muted-fg);width:88px;text-align:right">8.2 MB/s</span><span class="sbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="14" y="3" width="5" height="18" rx="1" /> <rect x="5" y="3" width="5" height="18" rx="1" /></svg></span></div>
+      <div class="ci"><span style="font-size:12.5px;width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">上传 · 演示录屏.mp4</span><div class="prog" style="flex:1;width:auto"><i style="width:71%"></i></div><span style="font-size:11.5px;color:var(--muted-fg);width:88px;text-align:right">2.1 MB/s</span><span class="sbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="14" y="3" width="5" height="18" rx="1" /> <rect x="5" y="3" width="5" height="18" rx="1" /></svg></span></div>
+      <div class="ci"><span style="font-size:12.5px;width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">下载 · backup.tar</span><div class="prog" style="flex:1;width:auto;position:relative"><i style="width:0"></i></div><span class="badge warn" style="width:88px;justify-content:center">已暂停</span><span class="sbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z" /></svg></span></div>
+      <div class="ci"><span style="font-size:12.5px;width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">复制 · 报表.csv</span><div class="prog" style="flex:1;width:auto"><i style="width:100%;background:var(--success)"></i></div><span class="badge ok" style="width:88px;justify-content:center">完成</span><span class="sbtn dis"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5" /> <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11" /></svg></span></div>
+      <div class="ci" style="background:rgba(239,68,68,.05)"><span style="font-size:12.5px;width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--danger)">上传 · 大文件.iso</span><span style="font-size:11.5px;color:var(--danger);flex:1">网络中断（第 3 次）</span><span class="sbtn"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /> <path d="M21 3v5h-5" /> <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /> <path d="M8 16H3v5" /></svg> 重试</span></div>
+    </div>
+    <div class="ft">多个任务时状态栏只露一条 + 「还有 N 个任务」，点它开这张面板</div>
+  </div>
+
+  <div class="card" style="width:382px;box-shadow:none;background:transparent;border:0">
+    <div style="font-size:12px;color:var(--muted-fg);margin-bottom:8px">通知（右上角，完成时才弹）</div>
+    <div class="note ok" style="margin-bottom:10px"><span><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /> <path d="m16 9-5.5 5.5L8 12" /></svg></span>
+      <div><div class="nt">已复制 3 项到「归档」</div><div class="nb">42.7 MB · 用时 15 秒</div></div>
+      <div class="act"><span class="sbtn">撤销</span></div></div>
+    <div class="note err"><span><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /> <path d="M12 9v4" /> <path d="M12 17h.01" /></svg></span>
+      <div><div class="nt">上传失败：网络中断</div><div class="nb">大文件.iso · 已传 61%，可续传</div></div>
+      <div class="act"><span class="sbtn">重试</span></div></div>
+    <div class="hint" style="margin-top:12px">「撤销」出现在通知里，而不是只藏在状态栏右端——「可撤销」是这款产品的卖点，得让人看得见。</div>
+  </div>
+</div>
+
+<h2>3 · 浮层<small>命令面板（Dialog + Command，快捷键徽标自动渲染）· 冲突对话框（AlertDialog）· 空态</small></h2>
+<div class="stage">
+  <div class="card" style="width:600px">
+    <div class="cmd-in"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /> <circle cx="11" cy="11" r="8" /></svg> <span class="txt">复制</span></div>
+    <div style="padding:4px 0 10px">
+      <div class="grp-l">文件操作</div>
+      <div class="ci on"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /></svg> 复制<span class="ver"><kbd>⌘</kbd><kbd>C</kbd></span></div>
+      <div class="ci"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 14h10" /> <path d="M16 4h2a2 2 0 0 1 2 2v1.344" /> <path d="m17 18 4-4-4-4" /> <path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 1.793-1.113" /> <rect x="8" y="2" width="8" height="4" rx="1" /></svg> 粘贴到「归档」<span class="ver"><kbd>⌘</kbd><kbd>V</kbd></span></div>
+      <div class="ci"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="15" x2="15" y1="12" y2="18" /> <line x1="12" x2="18" y1="15" y2="15" /> <rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /></svg> 复制路径<span class="ver"><kbd>⌘</kbd><kbd>⌥</kbd><kbd>C</kbd></span></div>
+      <div class="grp-l">视图</div>
+      <div class="ci"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01" /> <path d="M3 12h.01" /> <path d="M3 19h.01" /> <path d="M8 5h13" /> <path d="M8 12h13" /> <path d="M8 19h13" /></svg> 列表视图<span class="ver"><kbd>⌘</kbd><kbd>1</kbd></span></div>
+      <div class="grp-l">传输</div>
+      <div class="ci"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4" /> <path d="M3.34 19a10 10 0 1 1 17.32 0" /></svg> 限速：不限<span class="ver"><kbd>⌘</kbd><kbd>⌥</kbd><kbd>L</kbd></span></div>
+    </div>
+    <div class="ft">↑↓ 选择 · Enter 执行 · Esc 关闭</div>
+  </div>
+
+  <div class="card" style="width:560px">
+    <div class="ttl"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /> <path d="M12 9v4" /> <path d="M12 17h.01" /></svg> 已有 3 个同名项目</div>
+    <div class="alert">
+      <div class="nb" style="font-size:12.5px;color:var(--muted-fg);line-height:1.6;margin-bottom:4px">选择会应用到本次操作的剩余全部项目。</div>
+      <div class="cf">
+        <div class="r1"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 9H8" /> <path d="M16 13H8" /> <path d="M16 17H8" /></svg> <b style="font-size:12.5px">设计稿.md</b><span class="badge warn">大小不同</span></div>
+        <div class="grid2">
+          <div class="col"><b style="font-weight:500">来源</b><br>12 KB · 昨天 17:02</div>
+          <div>→</div>
+          <div class="col"><b style="font-weight:500">目标</b><br>8 KB · 10-09 11:03</div>
+        </div>
+      </div>
+      <div class="switch"><span class="sw"><i></i></span> 应用到剩余全部项目</div>
+    </div>
+    <div class="btns">
+      <span class="btn gho">取消</span><span class="btn sec">跳过</span><span class="btn dan">替换</span><span class="btn pri">保留两者</span>
+    </div>
+    <div class="ft">默认焦点在「保留两者」（安全默认）；覆盖与永久删除前展示来源/大小/时间差异</div>
+  </div>
+
+  <div class="card" style="width:420px">
+    <div style="height:290px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:24px;text-align:center">
+      <span style="color:#a3a3a3"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m13.5 8.5-5 5" /> <path d="m8.5 8.5 5 5" /> <circle cx="11" cy="11" r="8" /> <path d="m21 21-4.3-4.3" /></svg></span>
+      <div style="font-size:17px;font-weight:600">没有匹配的文件</div>
+      <div style="font-size:12.5px;color:var(--muted-fg);line-height:1.7;max-width:280px">试试放宽条件，或勾选「含子目录」<br><code>ext:png date:7d</code></div>
+      <span class="btn sec">含子目录</span>
+    </div>
+    <div class="ft">空态统一用 <code>Empty</code>：32px 图标 + 标题 + 一句建议 + 一个主操作</div>
+  </div>
+</div>
+
+<h2>4 · 令牌与图标<small>颜色全部落在主题已有的 99 个令牌上，不新增色值</small></h2>
+<div class="sw-grid">
+  <div class="sw"><div class="c" style="background:#ffffff;border-bottom:1px solid #eee"></div><div class="t"><b>background</b><span>#ffffff</span></div></div>
+  <div class="sw"><div class="c" style="background:#fafafa;border-bottom:1px solid #eee"></div><div class="t"><b>sidebar.background</b><span>#fafafa</span></div></div>
+  <div class="sw"><div class="c" style="background:#f5f5f5"></div><div class="t"><b>tab_bar.background</b><span>#f5f5f5</span></div></div>
+  <div class="sw"><div class="c" style="background:#e5e5e5"></div><div class="t"><b>sidebar.border / border</b><span>#e5e5e5</span></div></div>
+  <div class="sw"><div class="c" style="background:rgba(191,219,254,.22)"></div><div class="t"><b>list.active.background</b><span>#bfdbfe33</span></div></div>
+  <div class="sw"><div class="c" style="background:#60a5fa"></div><div class="t"><b>list.active.border</b><span>#60a5fa</span></div></div>
+  <div class="sw"><div class="c" style="background:#171717"></div><div class="t"><b>primary.background</b><span>#171717</span></div></div>
+  <div class="sw"><div class="c" style="background:rgba(59,130,246,.25);border:1px solid #3b82f6"></div><div class="t"><b>drop_target + drag_border</b><span>#3b82f640</span></div></div>
+  <div class="sw"><div class="c" style="background:#ef4444"></div><div class="t"><b>danger.background</b><span>#ef4444</span></div></div>
+  <div class="sw"><div class="c" style="background:#eab308"></div><div class="t"><b>warning.background</b><span>#eab308</span></div></div>
+  <div class="sw"><div class="c" style="background:#22c55e"></div><div class="t"><b>success.background</b><span>#22c55e</span></div></div>
+  <div class="sw"><div class="c" style="background:#06b6d4"></div><div class="t"><b>info.background</b><span>#06b6d4</span></div></div>
+</div>
+<p class="hint" style="margin-top:16px">文件标记：硬编码 7 色 → <b>6 个语义令牌</b>，深浅色自适应。旧 id 有迁移映射（orange→yellow，teal→cyan，purple→magenta）。</p>
+<div class="sw-grid" style="grid-template-columns:repeat(6,1fr)">
+  <div class="sw"><div class="c" style="background:#ef4444"></div><div class="t"><b>红 · 重要</b><span>base.red</span></div></div>
+  <div class="sw"><div class="c" style="background:#eab308"></div><div class="t"><b>黄 · 待确认</b><span>base.yellow</span></div></div>
+  <div class="sw"><div class="c" style="background:#22c55e"></div><div class="t"><b>绿 · 已归档</b><span>base.green</span></div></div>
+  <div class="sw"><div class="c" style="background:#06b6d4"></div><div class="t"><b>青 · 参考</b><span>base.cyan</span></div></div>
+  <div class="sw"><div class="c" style="background:#3b82f6"></div><div class="t"><b>蓝 · 进行中</b><span>base.blue</span></div></div>
+  <div class="sw"><div class="c" style="background:#d946ef"></div><div class="t"><b>紫 · 个人</b><span>base.magenta</span></div></div>
+</div>
+
+<h2 style="margin-top:44px">图标规范<small>来源只有一处：<code>assets/icons</code> 的 Lucide 集；下图是内联的真实图标</small></h2>
+<div class="legend">
+  <span><b>尺寸</b> 12 徽标 / 16 默认 / 20 工具栏主操作 / 32 空态 / 48 预览占位</span>
+  <span><b>颜色</b> 继承文字色，禁止硬编码（标记色点除外）</span>
+  <span style="color:var(--danger)"><b style="color:var(--danger)">红框</b> = 用了但没打进二进制（当前渲染空白，必须补）</span>
+</div>
+<div class="igrid">
+  <div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg></div><div class="nm2">IconName::Folder</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" /></svg></div><div class="nm2">IconName::FolderOpen</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10v6" /> <path d="M9 13h6" /> <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg></div><div class="nm2">IconName::FolderPlus</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /></svg></div><div class="nm2">IconName::File</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 9H8" /> <path d="M16 13H8" /> <path d="M16 17H8" /></svg></div><div class="nm2">IconName::FileText</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 12.5 8 15l2 2.5" /> <path d="m14 12.5 2 2.5-2 2.5" /></svg></div><div class="nm2">IconName::FileCode</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg></div><div class="nm2">IconName::Image</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.659 22H18a2 2 0 0 0 2-2V8a2.4 2.4 0 0 0-.706-1.706l-3.588-3.588A2.4 2.4 0 0 0 14 2H6a2 2 0 0 0-2 2v11.5" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M8 12v-1" /> <path d="M8 18v-2" /> <path d="M8 7V6" /> <circle cx="8" cy="20" r="2" /></svg></div><div class="nm2">IconName::FileArchive</div></div>
+</div>
+<div class="igrid" style="margin-top:8px">
+  <div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6" /></svg></div><div class="nm2">IconName::ChevronLeft</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg></div><div class="nm2">IconName::ChevronRight</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 7-7 7 7" /> <path d="M12 19V5" /></svg></div><div class="nm2">IconName::ArrowUp</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4" /> <path d="M4 7h16" /> <path d="m16 21 4-4-4-4" /> <path d="M20 17H4" /></svg></div><div class="nm2">IconName::ArrowLeftRight</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /> <path d="M21 3v5h-5" /> <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /> <path d="M8 16H3v5" /></svg></div><div class="nm2">IconName::RefreshCw</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8" /> <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg></div><div class="nm2">IconName::House</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01" /> <path d="M3 12h.01" /> <path d="M3 19h.01" /> <path d="M8 5h13" /> <path d="M8 12h13" /> <path d="M8 19h13" /></svg></div><div class="nm2">IconName::List</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1" /> <rect width="7" height="7" x="14" y="3" rx="1" /> <rect width="7" height="7" x="14" y="14" rx="1" /> <rect width="7" height="7" x="3" y="14" rx="1" /></svg></div><div class="nm2">IconName::LayoutGrid</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M9 3v18" /> <path d="M15 3v18" /></svg></div><div class="nm2">IconName::Columns3</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M12 3v18" /></svg></div><div class="nm2">IconName::Columns2</div></div>
+</div>
+<div class="igrid" style="margin-top:8px">
+  <div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /></svg></div><div class="nm2">IconName::Copy</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3" /> <path d="M8.12 8.12 12 12" /> <path d="M20 4 8.12 15.88" /> <circle cx="6" cy="18" r="3" /> <path d="M14.8 14.8 20 20" /></svg></div><div class="nm2">IconName::Scissors</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 14h10" /> <path d="M16 4h2a2 2 0 0 1 2 2v1.344" /> <path d="m17 18 4-4-4-4" /> <path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 1.793-1.113" /> <rect x="8" y="2" width="8" height="4" rx="1" /></svg></div><div class="nm2">IconName::ClipboardPaste</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /> <path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z" /></svg></div><div class="nm2">IconName::SquarePen</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 11v6" /> <path d="M14 11v6" /> <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /> <path d="M3 6h18" /> <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg></div><div class="nm2">IconName::Trash</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h-1a2 2 0 0 1-2-2 2 2 0 0 1-2 2H6" /> <path d="M13 8h7a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-7" /> <path d="M5 16H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h1" /> <path d="M6 4h1a2 2 0 0 1 2 2 2 2 0 0 1 2-2h1" /> <path d="M9 6v12" /></svg></div><div class="nm2">IconName::TextCursorInput</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-9" /> <path d="M15.17 2.21a1.67 1.67 0 0 1 1.63 0L21 4.57a1.93 1.93 0 0 1 0 3.36L8.82 14.79a1.655 1.655 0 0 1-1.64 0L3 12.43a1.93 1.93 0 0 1 0-3.36z" /> <path d="M20 13v3.87a2.06 2.06 0 0 1-1.11 1.83l-6 3.08a1.93 1.93 0 0 1-1.78 0l-6-3.08A2.06 2.06 0 0 1 4 16.87V13" /> <path d="M21 12.43a1.93 1.93 0 0 0 0-3.36L8.83 2.2a1.64 1.64 0 0 0-1.63 0L3 4.57a1.93 1.93 0 0 0 0 3.36l12.18 6.86a1.636 1.636 0 0 0 1.63 0z" /></svg></div><div class="nm2">IconName::PackageOpen</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 11 2-2-2-2" /> <path d="M11 13h4" /> <rect width="18" height="18" x="3" y="3" rx="2" ry="2" /></svg></div><div class="nm2">IconName::SquareTerminal</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" /> <circle cx="12" cy="12" r="3" /></svg></div><div class="nm2">IconName::Eye</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.172 2a2 2 0 0 1 1.414.586l6.71 6.71a2.4 2.4 0 0 1 0 3.408l-4.592 4.592a2.4 2.4 0 0 1-3.408 0l-6.71-6.71A2 2 0 0 1 6 9.172V3a1 1 0 0 1 1-1z" /> <path d="M2 7v6.172a2 2 0 0 0 .586 1.414l6.71 6.71a2.4 2.4 0 0 0 3.191.193" /> <circle cx="10.5" cy="6.5" r=".5" fill="currentColor" /></svg></div><div class="nm2">IconName::Tags</div></div>
+</div>
+<div class="igrid" style="margin-top:8px">
+  <div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1" /> <circle cx="19" cy="12" r="1" /> <circle cx="5" cy="12" r="1" /></svg></div><div class="nm2">IconName::Ellipsis</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1" /> <circle cx="12" cy="5" r="1" /> <circle cx="12" cy="19" r="1" /></svg></div><div class="nm2">IconName::EllipsisVertical</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5h20" /> <path d="M6 12h12" /> <path d="M9 19h6" /></svg></div><div class="nm2">IconName::ListFilter</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /> <circle cx="11" cy="11" r="8" /></svg></div><div class="nm2">IconName::Search</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m13.5 8.5-5 5" /> <path d="m8.5 8.5 5 5" /> <circle cx="11" cy="11" r="8" /> <path d="m21 21-4.3-4.3" /></svg></div><div class="nm2">IconName::SearchX</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /> <path d="m6 6 12 12" /></svg></div><div class="nm2">IconName::X</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3" /></svg></div><div class="nm2">IconName::Command</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5" /> <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11" /></svg></div><div class="nm2">IconName::Undo2</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5" /> <path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13" /></svg></div><div class="nm2">IconName::Redo2</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /> <path d="m16 9-5.5 5.5L8 12" /></svg></div><div class="nm2">IconName::CircleCheck</div></div>
+</div>
+<div class="igrid" style="margin-top:8px">
+  <div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /> <path d="M12 9v4" /> <path d="M12 17h.01" /></svg></div><div class="nm2">IconName::TriangleAlert</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /> <path d="M12 16v-4" /> <path d="M12 8h.01" /></svg></div><div class="nm2">IconName::Info</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg></div><div class="nm2">IconName::LoaderCircle</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="14" y="3" width="5" height="18" rx="1" /> <rect x="5" y="3" width="5" height="18" rx="1" /></svg></div><div class="nm2">IconName::Pause</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z" /></svg></div><div class="nm2">IconName::Play</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3" /> <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /> <path d="m7 10 5 5 5-5" /></svg></div><div class="nm2">IconName::Download</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12" /> <path d="m17 8-5-5-5 5" /> <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /></svg></div><div class="nm2">IconName::Upload</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4" /> <path d="M3.34 19a10 10 0 1 1 17.32 0" /></svg></div><div class="nm2">IconName::Gauge</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="12" r="1" /> <circle cx="9" cy="5" r="1" /> <circle cx="9" cy="19" r="1" /> <circle cx="15" cy="12" r="1" /> <circle cx="15" cy="5" r="1" /> <circle cx="15" cy="19" r="1" /></svg></div><div class="nm2">IconName::GripVertical</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M15 3v18" /></svg></div><div class="nm2">IconName::PanelRight</div></div>
+</div>
+<div class="igrid" style="margin-top:8px">
+  <div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 16h.01" /> <path d="M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /> <path d="M21.946 12.013H2.054" /> <path d="M6 16h.01" /></svg></div><div class="nm2">IconName::HardDrive</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="7" r="1" /> <circle cx="4" cy="20" r="1" /> <path d="M4.7 19.3 19 5" /> <path d="m21 3-3 1 2 2Z" /> <path d="M9.26 7.68 5 12l2 5" /> <path d="m10 14 5 2 3.5-3.5" /> <path d="m18 12 1-1 1 1-1 1Z" /></svg></div><div class="nm2">IconName::Usb</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /> <circle cx="12" cy="12" r="2" /></svg></div><div class="nm2">IconName::Disc</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" /></svg></div><div class="nm2">IconName::Cloud</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.94 5.274A7 7 0 0 1 15.71 10h1.79a4.5 4.5 0 0 1 4.222 6.057" /> <path d="M18.796 18.81A4.5 4.5 0 0 1 17.5 19H9A7 7 0 0 1 5.79 5.78" /> <path d="m2 2 20 20" /></svg></div><div class="nm2">IconName::CloudOff</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2" ry="2" /> <rect width="20" height="8" x="2" y="14" rx="2" ry="2" /> <line x1="6" x2="6.01" y1="6" y2="6" /> <line x1="6" x2="6.01" y1="18" y2="18" /></svg></div><div class="nm2">IconName::Server</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5" /> <path d="M15 8V2" /> <path d="M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z" /> <path d="M9 8V2" /></svg></div><div class="nm2">IconName::Plug</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2" /> <path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg></div><div class="nm2">IconName::Lock</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6a9 9 0 0 0-9 9V3" /> <circle cx="18" cy="6" r="3" /> <circle cx="6" cy="18" r="3" /></svg></div><div class="nm2">IconName::GitBranch</div></div><div class="ic"><div class="row"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12c.552 0 1.005-.449.95-.998a10 10 0 0 0-8.953-8.951c-.55-.055-.998.398-.998.95v8a1 1 0 0 0 1 1z" /> <path d="M21.21 15.89A10 10 0 1 1 8 2.83" /></svg></div><div class="nm2">IconName::ChartPie</div></div>
+</div>
+
+<h2 style="margin-top:40px">尺寸与用法</h2>
+<table class="spec">
+  <tr><th style="width:90px">尺寸</th><th style="width:150px">示例</th><th>用在哪</th></tr>
+  <tr><td>12</td><td><span style="display:flex;gap:14px;align-items:center"><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3" /> <path d="M8.12 8.12 12 12" /> <path d="M20 4 8.12 15.88" /> <circle cx="6" cy="18" r="3" /> <path d="M14.8 14.8 20 20" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6a9 9 0 0 0-9 9V3" /> <circle cx="18" cy="6" r="3" /> <circle cx="6" cy="18" r="3" /></svg></span></span></td><td>列表行的状态徽标（已复制/已剪切）、表头排序箭头、状态栏、Kbd 旁</td></tr>
+  <tr><td>16（默认）</td><td><span style="display:flex;gap:14px;align-items:center"><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 11v6" /> <path d="M14 11v6" /> <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /> <path d="M3 6h18" /> <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.172 2a2 2 0 0 1 1.414.586l6.71 6.71a2.4 2.4 0 0 1 0 3.408l-4.592 4.592a2.4 2.4 0 0 1-3.408 0l-6.71-6.71A2 2 0 0 1 6 9.172V3a1 1 0 0 1 1-1z" /> <path d="M2 7v6.172a2 2 0 0 0 .586 1.414l6.71 6.71a2.4 2.4 0 0 0 3.191.193" /> <circle cx="10.5" cy="6.5" r=".5" fill="currentColor" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" /> <circle cx="12" cy="12" r="3" /></svg></span></span></td><td>工具栏、侧栏条目、列表类型图标、菜单项、对话框按钮</td></tr>
+  <tr><td>20</td><td><span style="display:flex;gap:14px;align-items:center;color:var(--fg)"><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10v6" /> <path d="M9 13h6" /> <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /> <path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3" /></svg></span></span></td><td>工具栏主操作、详情板标题、通知图标</td></tr>
+  <tr><td>32</td><td><span style="display:flex;gap:14px;align-items:center;color:#a3a3a3"><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m13.5 8.5-5 5" /> <path d="m8.5 8.5 5 5" /> <circle cx="11" cy="11" r="8" /> <path d="m21 21-4.3-4.3" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" /></svg></span></span></td><td>空态（<code>Empty</code> 的 media）</td></tr>
+  <tr><td>48</td><td><span style="display:flex;gap:14px;align-items:center;color:#a3a3a3"><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg></span><span style="display:flex;gap:14px;align-items:center"><svg class="i20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.659 22H18a2 2 0 0 0 2-2V8a2.4 2.4 0 0 0-.706-1.706l-3.588-3.588A2.4 2.4 0 0 0 14 2H6a2 2 0 0 0-2 2v11.5" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M8 12v-1" /> <path d="M8 18v-2" /> <path d="M8 7V6" /> <circle cx="8" cy="20" r="2" /></svg></span></span></td><td>快速查看/详情板的预览占位</td></tr>
+</table>
+
+<h2 style="margin-top:40px">图标 → 界面映射（核对用）</h2>
+<table class="spec">
+  <tr><th style="width:150px">区域</th><th>使用的图标</th></tr>
+  <tr><td>导航</td><td>ChevronLeft 后退 · ChevronRight 前进/分隔 · ArrowUp 上一级 · House 主目录 · RefreshCw 刷新 · ArrowLeftRight 双栏同步浏览</td></tr>
+  <tr><td>工具栏常显</td><td>FolderPlus 新建 · SquarePen 重命名 · Trash 回收站 · Copy 复制 · ClipboardPaste 粘贴 · Ellipsis 更多</td></tr>
+  <tr><td>「更多」下拉</td><td>Scissors 剪切 · TextCursorInput 批量重命名 · PackageOpen 压缩包 · Tags 标记 · SquareTerminal 打开终端 · ChartPie 分析 · Undo2 撤销</td></tr>
+  <tr><td>视图</td><td>List 列表 · LayoutGrid 网格 · Columns3 分列 · Columns2 目录比较 · FileDiff 内容比较</td></tr>
+  <tr><td>侧栏</td><td>FolderOpen 个人文件夹 · House 桌面 · FileText 文稿 · Download 下载 · HardDrive 磁盘 · Usb 可移动 · Cloud 云盘/远程 · Server 服务器 · Plug 连接服务器</td></tr>
+  <tr><td>状态与反馈</td><td>CircleCheck 完成 · TriangleAlert 失败/冲突 · Info 提示 · LoaderCircle 进行中 · Pause/Play 暂停继续 · Gauge 限速 · Undo2/Redo2 撤销重做</td></tr>
+  <tr><td>元数据列</td><td>GitBranch · Ruler 尺寸 · Timer 时长 · Clock 时间 · FileType 类型 · Hash 校验和</td></tr>
+  <tr><td>面板与窗口</td><td>PanelRight 收起详情 · PanelBottom 传输中心 · GripVertical 拖拽把手 · Settings 设置 · Keyboard 快捷键 · SunMoon 外观</td></tr>
+</table>
+<p class="hint">图标名一律 <code>IconName</code> 的 PascalCase 变体（<code>folder-open.svg</code> → <code>IconName::FolderOpen</code>）。落到代码前核对文件存在；新增图标必须同时进打包清单，并由一条测试守住（见 <code>docs/ui-redesign.md</code> §6.5）。</p>
+
+</div></body></html>

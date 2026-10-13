@@ -218,6 +218,30 @@ fn open_in(
     )
 }
 
+/// [`open_in`] 但指定窗口宽度：布局相关的测试必须走这个。
+///
+/// 布局测试一定要用这个而不是 `open_in`——`open_in` 内部调的是
+/// `open_app`，那里宽度写死 1180。拿它去"测四种宽度"的话，四次量到的
+/// 是同一个窗口，测试全绿而缺陷照旧。
+fn open_in_at_width(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    width: f32,
+) -> (SessionIsolation, gpui_kit::WindowHandle<Root>) {
+    let isolation = isolate_session();
+    Session {
+        tabs: vec![dir.to_path_buf()],
+        active: 0,
+        split: None,
+        focus_on_left: true,
+        sync: false,
+    }
+    .save_to(&isolation.path().join("session.json"))
+    .expect("写测试会话");
+    let handle = open_app_of_width(cx, width).0;
+    (isolation, handle)
+}
+
 /// 按给定的会话启动应用；双栏、同步这些状态只能这么带进去。
 fn open_session(
     cx: &mut TestAppContext,
@@ -244,6 +268,20 @@ fn row_names_in(window: &mut gpui_kit::Window, slot: usize) -> Vec<String> {
         }
     }
     names
+}
+
+/// 弹出菜单里第 `index` 项的标签文字；菜单没开或没有这一项返回空串。
+///
+/// 菜单项的 element id 就是序号（`Integer(index)`），没有按文字查的接口。
+/// 而序号会随菜单内容漂移——加一项、去掉一个分隔符，后面全部错位。
+/// 所以测试里要**先读出这一项叫什么、确认是自己要找的那条，再点它**，
+/// 别直接拿一个写死的序号去点。
+fn menu_item_label(window: &mut gpui_kit::Window, index: usize) -> String {
+    window
+        .within("popup-menu")
+        .try_find(index)
+        .and_then(|item| item.label().map(|label| label.to_string()))
+        .unwrap_or_default()
 }
 
 /// 某一栏标的是"焦点栏"还是"另一栏"。
@@ -1974,8 +2012,20 @@ fn packing_the_selection_makes_a_zip_next_to_it(cx: &mut TestAppContext) {
         settle(window, cx);
         window.press("cmd-a", cx);
     });
+    // 压缩包搬进「更多」菜单了（工具栏只留四颗高频的），所以先开菜单。
     step(cx, handle, |window, cx| {
-        window.click("op-archive", cx);
+        window.click("op-more", cx);
+        settle(window, cx);
+    });
+    // 菜单项按序号定位，而序号会随菜单内容漂移——先找出「打包成 Zip」
+    // 在第几项，确认真的是它，再点。
+    let archive = step_value(cx, handle, |window, _| {
+        (0usize..16)
+            .find(|&index| menu_item_label(window, index) == "打包成 Zip")
+            .expect("「更多」菜单里该有「打包成 Zip」这一项")
+    });
+    step(cx, handle, |window, cx| {
+        window.click(archive, cx);
     });
 
     let stem = dir
@@ -3841,4 +3891,227 @@ fn selected_names(cx: &mut TestAppContext, app: &gpui_kit::Entity<WFilesApp>) ->
                 .map(|name| name.to_string())
         })
         .collect()
+}
+
+/// 工具栏的筛选框不能被挤出可视范围。
+///
+/// 这是一条**布局回归测试**，守的是实测过的真缺陷。修之前量到的四档：
+///
+/// | 窗口 | 侧栏 | 详情板 | 工具栏可用 | 筛选框右边缘 |
+/// |---|---|---|---|---|
+/// | 1180 | 210 | 260 | 710 | 908（贴边） |
+/// | 900 | 210 | 260 | 430 | **864 → 溢出窗口** |
+/// | 700 | 210 | 260 | 230 | 896 |
+/// | 520 | 210 | 260 | 50 | 896 |
+///
+/// 筛选框在四档里 x 都钉在 664/708 —— 它压根没跟着窗口动，因为这一排
+/// 按钮全是 `flex_shrink_0`，而外层那层 `h_flex` 缺 `min_w_0`，整排于是
+/// 以 908 px 的固有宽度向右溢出，右侧那些按钮画到屏幕外，**看得见却点不到**。
+///
+/// 判据按窗口宽度分两档，因为**要求本身不一样**：
+/// - 宽到 900 px 以上：用户什么都不用做，界面就该是完整的。这是最常见的情况。
+/// - 窄于此：工具栏那一排固有宽度 908 px，物理上塞不进 520 px 的窗口——
+///   这时用户要的是"**有一条能把它救回来的路**"，而不是"本来就该装得下"。
+///   那条路就是收起侧栏（Cmd+B），下面另一条测试守着它。
+#[gpui_kit::test]
+fn the_filter_box_stays_inside_the_window_at_normal_widths(cx: &mut TestAppContext) {
+    for width in [1180.0f32, 960.0, 900.0] {
+        let dir = tempfile::tempdir().expect("临时目录");
+        for i in 0..30 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
+        }
+        let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+        step(cx, handle, settle);
+
+        let bounds = step_value(cx, handle, |window, _| {
+            window
+                .try_find("filter-slot")
+                .map(|element| element.bounds())
+        })
+        .unwrap_or_else(|| panic!("窗口 {width}：工具栏上找不到筛选框（元素 id 变了？）"));
+
+        assert!(
+            bounds.size.width >= px(96.),
+            "窗口 {width}：筛选框被压到 {} px，连它自己的 min_w 都没保住",
+            bounds.size.width,
+        );
+        assert!(
+            bounds.origin.x + bounds.size.width <= px(width),
+            "窗口 {width}：筛选框右边缘在 x={} px，超出窗口右边界，\
+             用户看不见也点不到",
+            bounds.origin.x + bounds.size.width,
+        );
+    }
+}
+
+/// 窗口窄到工具栏塞不下时，把两侧固定边框收掉必须真的把它救回来。
+///
+/// 这是窄窗口的**唯一出路**，所以它得管用。
+///
+/// 实测出来的三个数字决定了要收几个：工具栏那一排的固有宽度是 590 px
+/// （3 颗 32px 导航 + 18px 面包屑 + 32px 刷新 + 8 颗 24px + 200px 筛选框），
+/// 侧栏 210 px、详情板 260 px。所以：
+/// - 900 px 窗口：收侧栏就够（900 − 48 = 852 > 590）
+/// - 700 px：两个都得收（700 − 48 − 0 = 652 > 590）
+/// - 520 px：两个都收完只剩 472 px，仍然不够——这一档**装不下**，
+///   工具栏会横向滚动。这是如实记录，不是失败：520 px 窗口本身就
+///   放不下一个文件管理器的完整工具栏。
+#[gpui_kit::test]
+fn collapsing_the_fixed_borders_gives_the_toolbar_room_to_fit(cx: &mut TestAppContext) {
+    for width in [900.0f32, 700.0] {
+        let dir = tempfile::tempdir().expect("临时目录");
+        for i in 0..30 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
+        }
+        let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+
+        // 两侧都收：侧栏 Cmd+B，详情板 Cmd+Alt+O。
+        //
+        // **必须分两步**：同一个 `step` 里连按两个键，第一个触发的
+        // `cx.notify()` 会重画，第二个键就落在新的焦点上了——实测
+        // 详情板那一下被吞掉，界面上还亮着。
+        step(cx, handle, |window, cx| {
+            window.press("cmd-b", cx);
+            settle(window, cx);
+        });
+        step(cx, handle, |window, cx| {
+            window.press("cmd-alt-o", cx);
+            settle(window, cx);
+        });
+        let found = step_value(cx, handle, |window, _| {
+            let read = |id: &str| window.try_find(id.to_string()).map(|e| e.bounds());
+            (read("toolbar"), read("filter-slot"))
+        });
+        let toolbar = found.0.expect("工具栏");
+        let filter = found.1.expect("筛选框");
+
+        // 收起不是"没有"，是 48 px 的图标条（位置入口还得留着）。
+        // 断言的是"确实收窄了"而不是"顶到左边缘"——后者会把
+        // 「收起态画成了 0 宽的壳」这种更糟的形态判成通过。
+        assert_eq!(
+            toolbar.origin.x,
+            px(48.),
+            "窗口 {width}：收起后侧栏应当是 48 px 的图标条，工具栏从那儿开始，\
+             实测 x={}",
+            toolbar.origin.x,
+        );
+        assert!(
+            filter.origin.x + filter.size.width <= px(width),
+            "窗口 {width}：两侧都收起后筛选框右边缘仍在 x={} px，\
+             仍然超出窗口——这条路没把用户救回来",
+            filter.origin.x + filter.size.width,
+        );
+    }
+}
+
+/// 520 px 窗口装不下完整工具栏，但**不能把按钮甩到屏幕外**。
+///
+/// 这一档守的是「有路可走」：工具栏自己横向滚动（`overflow_x_scroll`），
+/// 内容超出时用户还能滚过去点到，而不是像修之前那样右半边永远在窗外。
+///
+/// 判据用「工具栏右边缘不超过窗口」而不是「筛选框在窗口内」——后者在
+/// 这一档本来就不成立，把它写成断言等于给一个做不到的要求发通行证。
+#[gpui_kit::test]
+fn the_narrowest_window_scrolls_the_toolbar_instead_of_losing_buttons(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    for i in 0..30 {
+        std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
+    }
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 520.);
+    step(cx, handle, |window, cx| {
+        window.press("cmd-b", cx);
+        window.press("cmd-alt-o", cx);
+        settle(window, cx);
+    });
+
+    let toolbar = step_value(cx, handle, |window, _| {
+        window.try_find("toolbar").map(|e| e.bounds())
+    })
+    .expect("工具栏");
+    assert_eq!(
+        toolbar.origin.x + toolbar.size.width,
+        px(520.),
+        "工具栏自己不该越过窗口右边界——越界就说明它没被约束住，\
+         而是按 908 px 的固有宽度铺开了",
+    );
+}
+
+/// 收起侧栏之后位置入口一个都不能少，而且能点回去。
+///
+/// 只留一颗展开按钮的话，用户收起侧栏就等于把侧栏废掉了——找不到个人
+/// 文件夹、桌面、下载。
+#[gpui_kit::test]
+fn a_collapsed_sidebar_keeps_its_places(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+
+    let (_isolation, handle) = open_in(cx, dir.path());
+    step(cx, handle, |window, cx| {
+        window.press("cmd-b", cx);
+        settle(window, cx);
+    });
+
+    // 收起之后「位置」那几条还在。带序号查——收起态里每一条的
+    // element id 是 `("collapsed-place", 序号)`，用裸字符串查不到。
+    let collapsed_places = step_value(cx, handle, |window, _| {
+        (0usize..4)
+            .filter(|&index| {
+                window
+                    .try_find(("collapsed-place", index))
+                    .map(|e| e.bounds().size.width > px(0.))
+                    .unwrap_or(false)
+            })
+            .count()
+    });
+    assert!(
+        collapsed_places > 0,
+        "侧栏收起后「位置」那几条不见了——收起了就等于废掉了",
+    );
+
+    // 点那颗展开按钮能回去，展开按钮自己也在。
+    step(cx, handle, |window, cx| {
+        window.click("sidebar-collapse", cx);
+        settle(window, cx);
+    });
+    assert!(
+        step_value(cx, handle, |window, _| {
+            window.try_find("sidebar-expand").map(|e| e.bounds())
+        })
+        .is_some(),
+        "收起态里那颗展开按钮不见了，用户再也回不去",
+    );
+}
+
+/// 详情板收起来要**整块不画**，不是画成 0 宽。
+///
+/// 判据是元素在观察表里彻底不见了：留着 0 宽的分隔线和不可见的边框，
+/// 看起来像"界面坏了"。
+#[gpui_kit::test]
+fn collapsing_the_details_panel_removes_it_entirely(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+
+    let (_isolation, handle) = open_in(cx, dir.path());
+    step(cx, handle, settle);
+
+    assert!(
+        step_value(cx, handle, |window, _| {
+            window.try_find("details-panel").map(|e| e.bounds())
+        })
+        .is_some(),
+        "详情板默认就该在（这是这条测试的前提）",
+    );
+
+    step(cx, handle, |window, cx| {
+        window.click("toggle-details", cx);
+        settle(window, cx);
+    });
+    let hidden = step_value(cx, handle, |window, _| {
+        window.try_find("details-panel").map(|e| e.bounds())
+    });
+    assert!(
+        hidden.is_none(),
+        "点了收起之后详情板还在（宽 {} px）——要么没收，要么收成了 0 宽的壳",
+        hidden.map(|b| b.size.width).unwrap_or(px(0.)),
+    );
 }
