@@ -11,6 +11,7 @@ mod diff;
 mod diff_entity;
 mod drag;
 mod format;
+mod ftp;
 mod keymap;
 mod marks;
 mod meta;
@@ -21,19 +22,19 @@ mod palette;
 mod pane;
 mod preview;
 mod query;
-mod ftp;
 mod remote;
 mod remotes;
+mod resume;
 mod s3;
-mod sftp;
 mod search;
 mod search_entity;
 mod session;
 mod settings;
+mod sftp;
 mod term;
 mod term_entity;
-mod throttle;
 mod terminal;
+mod throttle;
 mod thumbnails;
 mod watch;
 
@@ -74,9 +75,15 @@ fn main() {
         app::init(cx);
         pane::init(cx);
 
+        // 上次异常退出（断电、崩溃）留下的续传暂存没人收：开机扫一遍。
+        // 这一趟在开窗之前，慢慢扫也不占界面线程。
+        resume::journal().sweep();
+
         // 上次退出时的窗口位置尺寸还记得就用上；记不得或者那份已经不可用了
         // （换了显示器、手改坏了配置）就居中开一个默认大小。
-        let restored = settings::Settings::load().layout.filter(settings::Layout::usable);
+        let restored = settings::Settings::load()
+            .layout
+            .filter(settings::Layout::usable);
         let window_bounds = match restored {
             Some(layout) => WindowBounds::Windowed(Bounds {
                 origin: Point::new(px(layout.x), px(layout.y)),

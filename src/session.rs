@@ -82,8 +82,10 @@ impl Session {
     pub fn sanitized(mut self) -> Self {
         // 远程路径（`dav://…`）在磁盘上不存在，但它是合法的目录位置，
         // 不能因为 `is_dir()` 为假就把标签丢掉——否则重启后远程标签全没了。
-        self.tabs
-            .retain(|path| (path.is_dir() || crate::remote::parse_location(path).is_some()) && path.parent().is_some());
+        self.tabs.retain(|path| {
+            (path.is_dir() || crate::remote::parse_location(path).is_some())
+                && path.parent().is_some()
+        });
         if self.tabs.is_empty() {
             self.active = 0;
             self.split = None;
@@ -119,7 +121,10 @@ pub fn state_dir() -> Option<PathBuf> {
 }
 
 /// 读取会话目录覆盖；空字符串视为没设置。
-fn session_dir_override() -> Option<PathBuf> {
+///
+/// 对同 crate 公开：续传暂存也要认这个覆盖（测试隔离靠它），
+/// 但它在没有覆盖时走的是缓存目录，不是这里。
+pub fn session_dir_override() -> Option<PathBuf> {
     let raw = std::env::var("WFILES_SESSION_DIR").ok()?;
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))

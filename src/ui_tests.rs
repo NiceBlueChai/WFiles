@@ -4,10 +4,10 @@
 //! 放在 `#[cfg(test)]` 模块里而不是 `tests/` 目录：本项目是二进制 crate，
 //! 集成测试目录链接不到 `WFilesApp`。
 
+use gpui_kit::point;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Bounds, Point, TestAppContext, WindowBounds, WindowOptions};
 use gpui_kit::{base::Root, px, size};
-use gpui_kit::point;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -332,8 +332,8 @@ fn command_palette_sets_and_persists_the_default_terminal(cx: &mut TestAppContex
         );
     });
 
-    let saved = Settings::load_from(&session.path().join("settings.json"))
-        .expect("设置应该已经落盘");
+    let saved =
+        Settings::load_from(&session.path().join("settings.json")).expect("设置应该已经落盘");
     assert_eq!(saved.terminal, expected);
 }
 
@@ -362,7 +362,11 @@ fn a_folder_keeps_its_sort_between_visits(cx: &mut TestAppContext) {
 
     step(cx, handle, |window, cx| {
         settle(window, cx);
-        assert_eq!(row_names(window), ["a.txt", "b.txt", "c.txt"], "默认是按名字");
+        assert_eq!(
+            row_names(window),
+            ["a.txt", "b.txt", "c.txt"],
+            "默认是按名字"
+        );
     });
 
     // 点"大小"表头，改成按大小升序。
@@ -626,13 +630,19 @@ const FILE_SIZE: u64 = 4096;
 fn many_files(dir: &Path) -> u64 {
     std::fs::create_dir_all(dir).unwrap();
     for ix in 0..FILE_COUNT {
-        std::fs::write(dir.join(format!("f{ix}.bin")), vec![ix as u8; FILE_SIZE as usize]).unwrap();
+        std::fs::write(
+            dir.join(format!("f{ix}.bin")),
+            vec![ix as u8; FILE_SIZE as usize],
+        )
+        .unwrap();
     }
     FILE_COUNT as u64 * FILE_SIZE
 }
 
 fn file_count(dir: &Path) -> usize {
-    std::fs::read_dir(dir).map(|entries| entries.count()).unwrap_or(0)
+    std::fs::read_dir(dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0)
 }
 
 fn new_ops(cx: &mut TestAppContext) -> gpui_kit::Entity<Ops> {
@@ -655,7 +665,11 @@ fn wait_for_bytes(cx: &mut TestAppContext, ops: &gpui_kit::Entity<Ops>, at_least
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         cx.run_until_parked();
-        let done = cx.update(|cx| ops.read(cx).running().map_or(0, |running| running.bytes_done));
+        let done = cx.update(|cx| {
+            ops.read(cx)
+                .running()
+                .map_or(0, |running| running.bytes_done)
+        });
         if done >= at_least || Instant::now() > deadline {
             return done;
         }
@@ -666,7 +680,11 @@ fn wait_for_bytes(cx: &mut TestAppContext, ops: &gpui_kit::Entity<Ops>, at_least
 /// 此刻的已拷贝字节数（顺手把已就绪的消息推一次）。
 fn bytes_now(cx: &mut TestAppContext, ops: &gpui_kit::Entity<Ops>) -> u64 {
     cx.run_until_parked();
-    cx.update(|cx| ops.read(cx).running().map_or(0, |running| running.bytes_done))
+    cx.update(|cx| {
+        ops.read(cx)
+            .running()
+            .map_or(0, |running| running.bytes_done)
+    })
 }
 
 /// 等队列彻底排空：没在跑的，也没有排着的。
@@ -857,7 +875,12 @@ fn a_failed_item_can_be_retried(cx: &mut TestAppContext) {
 ///
 /// 后台任务的结论要经执行器推进实体、再画帧才看得见，
 /// 所以每一轮都要 `run_until_parked` + `settle`。
-fn wait_for_row(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>, slot: usize, name: &str) -> bool {
+fn wait_for_row(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    slot: usize,
+    name: &str,
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         cx.run_until_parked();
@@ -979,7 +1002,10 @@ fn the_status_bar_drives_a_running_transfer(cx: &mut TestAppContext) {
     });
     wait_until_gone(cx, handle, "status-detail");
 
-    assert_eq!(file_count(&root.path().join("dest").join("src")), FILE_COUNT);
+    assert_eq!(
+        file_count(&root.path().join("dest").join("src")),
+        FILE_COUNT
+    );
 }
 
 // ---- 双栏 ----
@@ -1151,11 +1177,7 @@ fn synced_panes_follow_each_other(cx: &mut TestAppContext) {
     step(cx, handle, |window, cx| {
         settle(window, cx);
         assert_eq!(row_names_in(window, 0), vec!["only.txt"], "左栏进去了");
-        assert_eq!(
-            row_names_in(window, 1),
-            vec!["only.txt"],
-            "右栏该跟着进去"
-        );
+        assert_eq!(row_names_in(window, 1), vec!["only.txt"], "右栏该跟着进去");
     });
 
     // 关掉同步之后，右栏自己走自己的。
@@ -1243,8 +1265,7 @@ fn switching_to_the_grid_shows_the_same_files(cx: &mut TestAppContext) {
         settle(window, cx);
         assert_eq!(view_of(window), "列表");
         assert!(
-            window.try_find("header").is_none()
-                && window.try_find(("header", 0usize)).is_some(),
+            window.try_find("header").is_none() && window.try_find(("header", 0usize)).is_some(),
             "回到列表该有表头"
         );
     });
@@ -1303,7 +1324,10 @@ fn the_grid_packs_several_tiles_into_one_row(cx: &mut TestAppContext) {
         // 12 项装不进一行：最后一项必须落在更下面的一行。
         let first = window.find(("tile", 0usize)).bounds().origin;
         let last = window.find(("tile", 11usize)).bounds().origin;
-        assert!(last.y > first.y, "第 12 项该换行到下面去：{first:?} {last:?}");
+        assert!(
+            last.y > first.y,
+            "第 12 项该换行到下面去：{first:?} {last:?}"
+        );
     });
 }
 
@@ -1464,7 +1488,11 @@ fn clicking_a_folder_in_an_earlier_column_navigates_there(cx: &mut TestAppContex
     // 点"临时目录"那一列里的 one：整条链在这里截断，one 成为当前目录。
     step(cx, handle, |window, cx| {
         let parent = last - 2;
-        assert_eq!(column_rows(window, parent), vec!["one"], "临时目录里只有 one");
+        assert_eq!(
+            column_rows(window, parent),
+            vec!["one"],
+            "临时目录里只有 one"
+        );
         window
             .within(("column", parent))
             .click(("column-row", 0usize), cx);
@@ -1548,11 +1576,7 @@ fn a_remembered_view_is_applied_when_the_folder_opens(cx: &mut TestAppContext) {
 
     step(cx, handle, |window, cx| {
         settle(window, cx);
-        assert_eq!(
-            view_of(window),
-            "网格",
-            "打开这个目录时该套用记住的视图"
-        );
+        assert_eq!(view_of(window), "网格", "打开这个目录时该套用记住的视图");
     });
 }
 
@@ -1814,12 +1838,8 @@ fn make_bundle(dir: &Path) -> std::path::PathBuf {
         std::fs::write(dir.join(name), "hello").unwrap();
     }
     let zip = dir.join("bundle.zip");
-    crate::archive::create(
-        &zip,
-        dir,
-        &[dir.join("a.txt"), dir.join("b.txt")],
-    )
-    .expect("造测试用的压缩包");
+    crate::archive::create(&zip, dir, &[dir.join("a.txt"), dir.join("b.txt")])
+        .expect("造测试用的压缩包");
     zip
 }
 
@@ -1959,10 +1979,7 @@ fn a_key_binding_can_be_changed_from_the_palette(cx: &mut TestAppContext) {
     });
     step(cx, handle, |window, cx| {
         settle(window, cx);
-        assert!(
-            window.try_find("key-capture").is_none(),
-            "录完就该收起浮层"
-        );
+        assert!(window.try_find("key-capture").is_none(), "录完就该收起浮层");
     });
 
     let saved = Settings::load_from(&session.path().join("settings.json")).expect("设置该落盘");
@@ -2127,12 +2144,18 @@ fn the_terminal_panel_can_be_closed_from_its_own_button(cx: &mut TestAppContext)
     });
     step(cx, handle, |window, cx| {
         settle(window, cx);
-        assert!(window.try_find("term-close").is_some(), "面板上要有关闭按钮");
+        assert!(
+            window.try_find("term-close").is_some(),
+            "面板上要有关闭按钮"
+        );
         window.click("term-close", cx);
     });
     step(cx, handle, |window, cx| {
         settle(window, cx);
-        assert!(window.try_find("terminal").is_none(), "关闭按钮应该收起面板");
+        assert!(
+            window.try_find("terminal").is_none(),
+            "关闭按钮应该收起面板"
+        );
     });
 }
 
@@ -2412,7 +2435,10 @@ fn choosing_a_hit_jumps_to_its_folder_and_selects_it(cx: &mut TestAppContext) {
     step(cx, handle, |window, cx| {
         settle(window, cx);
         assert!(window.try_find("search").is_none(), "跳过去之后面板该收起");
-        assert!(row_names(window).contains(&"inner.rs".to_string()), "该在它所在的目录里");
+        assert!(
+            row_names(window).contains(&"inner.rs".to_string()),
+            "该在它所在的目录里"
+        );
         let name = window
             .try_find("detail-name")
             .and_then(|it| it.label().map(|text| text.to_string()))
@@ -2560,7 +2586,10 @@ fn marking_a_file_sticks_and_the_mark_can_be_searched_for(cx: &mut TestAppContex
         window.input("color:red", cx);
     });
     let listed = wait_for_results(cx, handle, "note.txt");
-    assert!(listed.contains("note.txt"), "标成红色的该能被搜到：{listed}");
+    assert!(
+        listed.contains("note.txt"),
+        "标成红色的该能被搜到：{listed}"
+    );
 
     step(cx, handle, |window, cx| {
         window.press("escape", cx);
@@ -2919,7 +2948,10 @@ fn comparing_two_files_shows_which_line_changed(cx: &mut TestAppContext) {
     // 三行都在（上下文留着才好对照），中间那行标"改"。
     let changed = wait_for_diff_row(cx, handle, 1).expect("该比出差异行");
     assert!(changed.starts_with("改"), "中间那行该标成改过：{changed}");
-    assert!(changed.contains("改过的第二行"), "该显示右边的新内容：{changed}");
+    assert!(
+        changed.contains("改过的第二行"),
+        "该显示右边的新内容：{changed}"
+    );
 
     let status = step_value(cx, handle, |window, _| {
         window
@@ -3006,9 +3038,7 @@ fn wait_for_meta_row(
                     .map(|row| row.label().unwrap_or_default().to_string())
             })
             .expect("窗口还在");
-        if found.as_ref().is_some_and(|label| !label.is_empty())
-            || Instant::now() > deadline
-        {
+        if found.as_ref().is_some_and(|label| !label.is_empty()) || Instant::now() > deadline {
             return found;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -3137,10 +3167,7 @@ fn the_connect_dialog_refuses_an_empty_address(cx: &mut TestAppContext) {
     // 而不是弹一个"连接失败"让人去猜。
     step(cx, handle, |window, cx| {
         settle(window, cx);
-        assert!(
-            window.try_find("connect-ok").is_some(),
-            "该弹出连接对话框"
-        );
+        assert!(window.try_find("connect-ok").is_some(), "该弹出连接对话框");
         window.click("connect-ok", cx);
     });
     let error = step_value(cx, handle, |window, cx| {
@@ -3240,7 +3267,8 @@ fn pasting_into_a_remote_folder_uploads_over_http(cx: &mut TestAppContext) {
 
     let seen = server.seen.lock().unwrap().clone();
     assert!(
-        seen.iter().any(|it| it.starts_with("PUT /dav/folder/a.txt")),
+        seen.iter()
+            .any(|it| it.starts_with("PUT /dav/folder/a.txt")),
         "该真的上传了一次：{seen:?}"
     );
 }
@@ -3436,7 +3464,10 @@ fn a_speed_limit_slows_the_transfer_down(cx: &mut TestAppContext) {
     // 撤掉限速之后立刻按不限速跑：不用等重启。
     cx.update(|cx| Settings::update(cx, |settings| settings.speed_limit = 0));
     let again = run_one_copy(cx, &ops, &from, &root.path().join("fast"));
-    assert!(again < Duration::from_millis(800), "撤销限速该立刻生效：{again:?}");
+    assert!(
+        again < Duration::from_millis(800),
+        "撤销限速该立刻生效：{again:?}"
+    );
 }
 
 /// 拷同一个文件到一个新目录，返回花了多久。

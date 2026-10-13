@@ -670,7 +670,8 @@ impl Ops {
         match ops::create_folder_named(&parent, &name) {
             Ok(path) => {
                 self.prompt = None;
-                self.history.push(ops::HistoryEntry::Created { path: path.clone() });
+                self.history
+                    .push(ops::HistoryEntry::Created { path: path.clone() });
                 self.last_message = Some(format!("已创建“{}”", display_name(&path)));
                 self.last_message_is_error = false;
                 cx.emit(OpsEvent::PromptChanged { open: false });
@@ -691,11 +692,10 @@ impl Ops {
                 // 先把更早的记录指向新路径，再压入本次记录，避免改到自己头上。
                 self.history.note_renamed(&path, &renamed);
                 self.prompt = None;
-                self.history
-                    .push(ops::HistoryEntry::Renamed {
-                        from: path.clone(),
-                        to: renamed.clone(),
-                    });
+                self.history.push(ops::HistoryEntry::Renamed {
+                    from: path.clone(),
+                    to: renamed.clone(),
+                });
                 self.last_message = Some(format!("已重命名为“{}”", display_name(&renamed)));
                 self.last_message_is_error = false;
                 cx.emit(OpsEvent::PromptChanged { open: false });
@@ -787,12 +787,7 @@ impl Ops {
     }
 
     /// 一次搬运两端的客户端；两端都在本地时两个都是 `None`。
-    fn remote_sides(
-        &self,
-        sources: &[PathBuf],
-        dest: &Path,
-        cx: &mut App,
-    ) -> RemoteSides {
+    fn remote_sides(&self, sources: &[PathBuf], dest: &Path, cx: &mut App) -> RemoteSides {
         RemoteSides {
             source: sources.first().and_then(|path| self.client_for(path, cx)),
             dest: self.client_for(dest, cx),
@@ -855,9 +850,9 @@ impl Ops {
                     let collisions = checking
                         .iter()
                         .filter(|source| {
-                            source
-                                .file_name()
-                                .is_some_and(|name| ops::remote_exists(client.as_ref(), &into.join(name)))
+                            source.file_name().is_some_and(|name| {
+                                ops::remote_exists(client.as_ref(), &into.join(name))
+                            })
                         })
                         .count();
                     let _ = tx.try_send(WorkerMessage::Done(JobResult::Preflight {
@@ -938,7 +933,9 @@ impl Ops {
                         // 限速：上报的是累计字节，要记的是这一趟新添的那些。
                         let fresh = progress.bytes_done.saturating_sub(accounted);
                         accounted = progress.bytes_done;
-                        if fresh > 0 && let Ok(mut limiter) = limiter.lock() {
+                        if fresh > 0
+                            && let Ok(mut limiter) = limiter.lock()
+                        {
                             limiter.take(fresh);
                             // 一个数据块有 1 MB，欠的账一次睡不完：接着睡完，
                             // 每一小段之间都再看一眼手柄，这样"限速 100 KB/s
@@ -1080,159 +1077,147 @@ impl Ops {
         self.running = None;
         self.control = None;
         match result {
-                    JobResult::Trashed(trashed) => {
-                        if trashed.is_empty() {
-                            self.last_message = Some("没有项目能移进回收站".to_string());
-                            self.last_message_is_error = true;
-                        } else {
-                            // 删除会让更早的“新建/复制”记录失效，先清理再压栈。
-                            for (path, _) in &trashed {
-                                self.history.note_removed(path);
-                            }
-                            self.history.push(ops::HistoryEntry::Trashed {
-                                originals: trashed.clone(),
-                            });
-                            let removed: Vec<PathBuf> = trashed
-                                .iter()
-                                .map(|(path, _)| path.clone())
-                                .collect();
-                            self.last_message = Some(format!(
-                                "已移到回收站 {} 项",
-                                trashed.len()
-                            ));
-                            self.last_message_is_error = false;
-                            cx.emit(OpsEvent::Changed {
-                                removed,
-                                changed: Vec::new(),
-                                renamed_to: Vec::new(),
-                            });
-                        }
+            JobResult::Trashed(trashed) => {
+                if trashed.is_empty() {
+                    self.last_message = Some("没有项目能移进回收站".to_string());
+                    self.last_message_is_error = true;
+                } else {
+                    // 删除会让更早的“新建/复制”记录失效，先清理再压栈。
+                    for (path, _) in &trashed {
+                        self.history.note_removed(path);
                     }
-                    JobResult::BulkRenamed { renamed, failed } => {
-                        if !renamed.is_empty() {
-                            // 先把更早的记录指向新路径，再压入整批记录。
-                            for (from, to) in &renamed {
-                                self.history.note_renamed(from, to);
-                            }
-                            self.history.push(ops::HistoryEntry::BulkRenamed {
-                                moves: renamed.clone(),
-                            });
-                        }
-                        let mut message = format!("已重命名 {} 项", renamed.len());
-                        if !failed.is_empty() {
-                            message.push_str(&format!(
-                                "，{} 项失败（{}）",
-                                failed.len(),
-                                failed[0].1
-                            ));
-                        }
-                        self.last_message = Some(message);
-                        self.last_message_is_error = !failed.is_empty();
+                    self.history.push(ops::HistoryEntry::Trashed {
+                        originals: trashed.clone(),
+                    });
+                    let removed: Vec<PathBuf> =
+                        trashed.iter().map(|(path, _)| path.clone()).collect();
+                    self.last_message = Some(format!("已移到回收站 {} 项", trashed.len()));
+                    self.last_message_is_error = false;
+                    cx.emit(OpsEvent::Changed {
+                        removed,
+                        changed: Vec::new(),
+                        renamed_to: Vec::new(),
+                    });
+                }
+            }
+            JobResult::BulkRenamed { renamed, failed } => {
+                if !renamed.is_empty() {
+                    // 先把更早的记录指向新路径，再压入整批记录。
+                    for (from, to) in &renamed {
+                        self.history.note_renamed(from, to);
+                    }
+                    self.history.push(ops::HistoryEntry::BulkRenamed {
+                        moves: renamed.clone(),
+                    });
+                }
+                let mut message = format!("已重命名 {} 项", renamed.len());
+                if !failed.is_empty() {
+                    message.push_str(&format!("，{} 项失败（{}）", failed.len(), failed[0].1));
+                }
+                self.last_message = Some(message);
+                self.last_message_is_error = !failed.is_empty();
+                cx.emit(OpsEvent::Changed {
+                    removed: Vec::new(),
+                    changed: Vec::new(),
+                    renamed_to: renamed,
+                });
+            }
+            JobResult::Transferred {
+                outcome,
+                cut,
+                aborted,
+                dest,
+                policy,
+            } => {
+                // 失败项留着让人重试；被中止的不算失败，重试列表里不该出现。
+                self.retry = if outcome.failed.is_empty() {
+                    None
+                } else {
+                    Some(Retry {
+                        sources: outcome
+                            .failed
+                            .iter()
+                            .map(|(path, _)| path.clone())
+                            .collect(),
+                        dest,
+                        cut,
+                        policy,
+                    })
+                };
+
+                let removed = if cut {
+                    outcome
+                        .transfers
+                        .iter()
+                        .map(|(from, _)| from.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let renamed_to = if cut {
+                    outcome.transfers.clone()
+                } else {
+                    Vec::new()
+                };
+
+                if cut {
+                    self.history.push(ops::HistoryEntry::Moved {
+                        moves: outcome.transfers.clone(),
+                    });
+                } else if !outcome.touched.is_empty() {
+                    self.history.push(ops::HistoryEntry::Copied {
+                        created: outcome.touched.clone(),
+                    });
+                }
+
+                // 剪切成功后剪贴板里被搬走的项要清掉。
+                if cut {
+                    self.clipboard
+                        .paths
+                        .retain(|path| !outcome.transfers.iter().any(|(from, _)| from == path));
+                    if self.clipboard.paths.is_empty() {
+                        self.clipboard = Clipboard::default();
+                    }
+                    cx.emit(OpsEvent::ClipboardChanged);
+                }
+
+                self.last_message = Some(summarize(&outcome, cut, aborted));
+                self.last_message_is_error = !outcome.failed.is_empty();
+                cx.emit(OpsEvent::Changed {
+                    removed,
+                    changed: outcome.touched,
+                    renamed_to,
+                });
+            }
+            JobResult::Preflight {
+                sources,
+                dest,
+                cut,
+                collisions,
+            } => self.after_preflight(sources, dest, cut, collisions, cx),
+            JobResult::Undone {
+                history,
+                involved,
+                result,
+            } => {
+                // 栈整条先还回来：撤不动时那条记录还在里面，可以再试一次。
+                self.history = history;
+                match result {
+                    Ok(describe) => {
+                        self.last_message = Some(format!("已撤销{describe}"));
+                        self.last_message_is_error = false;
                         cx.emit(OpsEvent::Changed {
                             removed: Vec::new(),
-                            changed: Vec::new(),
-                            renamed_to: renamed,
+                            changed: involved,
+                            renamed_to: Vec::new(),
                         });
                     }
-                    JobResult::Transferred {
-                        outcome,
-                        cut,
-                        aborted,
-                        dest,
-                        policy,
-                    } => {
-                        // 失败项留着让人重试；被中止的不算失败，重试列表里不该出现。
-                        self.retry = if outcome.failed.is_empty() {
-                            None
-                        } else {
-                            Some(Retry {
-                                sources: outcome
-                                    .failed
-                                    .iter()
-                                    .map(|(path, _)| path.clone())
-                                    .collect(),
-                                dest,
-                                cut,
-                                policy,
-                            })
-                        };
-
-                        let removed = if cut {
-                            outcome
-                                .transfers
-                                .iter()
-                                .map(|(from, _)| from.clone())
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                        let renamed_to = if cut {
-                            outcome.transfers.clone()
-                        } else {
-                            Vec::new()
-                        };
-
-                        if cut {
-                            self.history.push(ops::HistoryEntry::Moved {
-                                moves: outcome.transfers.clone(),
-                            });
-                        } else if !outcome.touched.is_empty() {
-                            self.history.push(ops::HistoryEntry::Copied {
-                                created: outcome.touched.clone(),
-                            });
-                        }
-
-                        // 剪切成功后剪贴板里被搬走的项要清掉。
-                        if cut {
-                            self.clipboard.paths.retain(|path| {
-                                !outcome
-                                    .transfers
-                                    .iter()
-                                    .any(|(from, _)| from == path)
-                            });
-                            if self.clipboard.paths.is_empty() {
-                                self.clipboard = Clipboard::default();
-                            }
-                            cx.emit(OpsEvent::ClipboardChanged);
-                        }
-
-                        self.last_message = Some(summarize(&outcome, cut, aborted));
-                        self.last_message_is_error = !outcome.failed.is_empty();
-                        cx.emit(OpsEvent::Changed {
-                            removed,
-                            changed: outcome.touched,
-                            renamed_to,
-                        });
+                    Err(error) => {
+                        self.last_message = Some(format!("撤销失败：{error}"));
+                        self.last_message_is_error = true;
                     }
-                    JobResult::Preflight {
-                        sources,
-                        dest,
-                        cut,
-                        collisions,
-                    } => self.after_preflight(sources, dest, cut, collisions, cx),
-                    JobResult::Undone {
-                        history,
-                        involved,
-                        result,
-                    } => {
-                        // 栈整条先还回来：撤不动时那条记录还在里面，可以再试一次。
-                        self.history = history;
-                        match result {
-                            Ok(describe) => {
-                                self.last_message = Some(format!("已撤销{describe}"));
-                                self.last_message_is_error = false;
-                                cx.emit(OpsEvent::Changed {
-                                    removed: Vec::new(),
-                                    changed: involved,
-                                    renamed_to: Vec::new(),
-                                });
-                            }
-                            Err(error) => {
-                                self.last_message = Some(format!("撤销失败：{error}"));
-                                self.last_message_is_error = true;
-                            }
-                        }
-                    }
+                }
+            }
         }
         cx.notify();
 

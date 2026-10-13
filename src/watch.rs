@@ -17,14 +17,13 @@ pub fn watch_directory(
     path: &Path,
 ) -> Result<(notify::RecommendedWatcher, async_channel::Receiver<()>), String> {
     let (tx, rx) = async_channel::bounded(8);
-    let mut watcher =
-        notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-            // 监听失败（目录被删掉等）也当一次变化，让界面去面对新的现实。
-            if result.is_ok() {
-                let _ = tx.try_send(());
-            }
-        })
-        .map_err(|error| error.to_string())?;
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+        // 监听失败（目录被删掉等）也当一次变化，让界面去面对新的现实。
+        if result.is_ok() {
+            let _ = tx.try_send(());
+        }
+    })
+    .map_err(|error| error.to_string())?;
 
     watcher
         .watch(path, RecursiveMode::NonRecursive)

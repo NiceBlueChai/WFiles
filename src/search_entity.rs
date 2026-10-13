@@ -90,14 +90,16 @@ impl SearchPanel {
         let input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("找文件：name: ext: type: size: date: content:")
         });
-        let name_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("给这个搜索起个名字"));
-        let name_subscription =
-            cx.subscribe_in(&name_input, window, |this, _, event: &InputEvent, window, cx| {
+        let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("给这个搜索起个名字"));
+        let name_subscription = cx.subscribe_in(
+            &name_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.save_current(window, cx);
                 }
-            });
+            },
+        );
         let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
                 this.schedule(cx);
@@ -175,7 +177,8 @@ impl SearchPanel {
         self.task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DEBOUNCE).await;
             let mut cx = cx.clone();
-            this.update(&mut cx, |this, cx| this.restart(token, cx)).ok();
+            this.update(&mut cx, |this, cx| this.restart(token, cx))
+                .ok();
         }));
     }
 
@@ -283,7 +286,8 @@ impl SearchPanel {
         }
         let cursor = self.cursor as i64 + delta as i64;
         self.cursor = cursor.clamp(0, self.hits.len() as i64 - 1) as usize;
-        self.scroll.scroll_to_item(self.cursor, ScrollStrategy::Nearest);
+        self.scroll
+            .scroll_to_item(self.cursor, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -371,19 +375,8 @@ impl SearchPanel {
                     .flex_1()
                     .min_w_0()
                     .gap_0()
-                    .child(
-                        div()
-                            .text_sm()
-                            .truncate()
-                            .child(hit.name.clone())
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .truncate()
-                            .child(detail),
-                    ),
+                    .child(div().text_sm().truncate().child(hit.name.clone()))
+                    .child(div().text_xs().text_color(muted).truncate().child(detail)),
             )
             .child(
                 div()
@@ -434,14 +427,19 @@ impl Render for SearchPanel {
                 .into_any_element()
         } else {
             // 结果可能几千条，走虚拟列表：只画看得见的那几行。
-            let list = v_virtual_list(cx.entity().clone(), "hits", row_sizes, |panel, range, _, cx| {
-                range
-                    .filter_map(|index| {
-                        let hit = panel.hits.get(index)?.clone();
-                        Some(panel.render_hit(index, &hit, cx))
-                    })
-                    .collect()
-            })
+            let list = v_virtual_list(
+                cx.entity().clone(),
+                "hits",
+                row_sizes,
+                |panel, range, _, cx| {
+                    range
+                        .filter_map(|index| {
+                            let hit = panel.hits.get(index)?.clone();
+                            Some(panel.render_hit(index, &hit, cx))
+                        })
+                        .collect()
+                },
+            )
             .flex_1()
             .min_h_0();
             div()
@@ -593,9 +591,9 @@ impl Render for SearchPanel {
                                     .small()
                                     .ghost()
                                     .tooltip("关闭")
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(SearchEvent::Close)
-                                    })),
+                                    .on_click(
+                                        cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Close)),
+                                    ),
                             ),
                     )
                     .child(
@@ -608,11 +606,7 @@ impl Render for SearchPanel {
                             .gap_2()
                             .items_center()
                             .text_xs()
-                            .text_color(if has_error {
-                                cx.theme().danger
-                            } else {
-                                muted
-                            })
+                            .text_color(if has_error { cx.theme().danger } else { muted })
                             .child(status)
                             .child(
                                 div()
@@ -657,32 +651,32 @@ impl Render for SearchPanel {
                     // `Option<T>` 本身就是一个 0/1 个元素的迭代器，
                     // 所以"要不要这一行"直接交给 `children`。
                     .children(self.naming.then(|| {
-                            h_flex()
-                                .id("search-naming")
-                                .test_support()
-                                .px_3()
-                                .py_2()
-                                .gap_2()
-                                .items_center()
-                                .child(Input::new(&self.name_input).w(px(220.)))
-                                .child(
-                                    Button::new("search-save-confirm")
-                                        .label("存下")
-                                        .small()
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.save_current(window, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("search-save-cancel")
-                                        .label("取消")
-                                        .small()
-                                        .ghost()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.naming = false;
-                                            cx.notify();
-                                        })),
-                                )
+                        h_flex()
+                            .id("search-naming")
+                            .test_support()
+                            .px_3()
+                            .py_2()
+                            .gap_2()
+                            .items_center()
+                            .child(Input::new(&self.name_input).w(px(220.)))
+                            .child(
+                                Button::new("search-save-confirm")
+                                    .label("存下")
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_current(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("search-save-cancel")
+                                    .label("取消")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.naming = false;
+                                        cx.notify();
+                                    })),
+                            )
                     }))
                     .child(body)
                     .children(saved_row)

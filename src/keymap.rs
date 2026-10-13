@@ -119,13 +119,21 @@ pub fn is_usable(key: &str) -> bool {
     let parts: Vec<&str> = key.split('-').collect();
     // 最后一段是真正的键；前面每段都得是修饰键名。
     let (last, modifiers) = parts.split_last().expect("非空");
-    !last.is_empty()
-        && modifiers.iter().all(|part| is_modifier(part))
+    !last.is_empty() && modifiers.iter().all(|part| is_modifier(part))
 }
 
 fn is_modifier(part: &str) -> bool {
     [
-        "ctrl", "alt", "shift", "fn", "cmd", "super", "win", "secondary", "control", "platform",
+        "ctrl",
+        "alt",
+        "shift",
+        "fn",
+        "cmd",
+        "super",
+        "win",
+        "secondary",
+        "control",
+        "platform",
     ]
     .contains(&part.to_ascii_lowercase().as_str())
 }
@@ -190,10 +198,17 @@ mod tests {
     #[test]
     fn the_binding_table_covers_every_command_that_has_a_key() {
         let map = KeyMap::default();
-        let bound: Vec<_> = map.bindings().into_iter().map(|(command, _)| command).collect();
+        let bound: Vec<_> = map
+            .bindings()
+            .into_iter()
+            .map(|(command, _)| command)
+            .collect();
         for command in PaneCommand::ALL {
             if defaults(command).is_empty() {
-                assert!(!bound.contains(&command), "{command:?} 出厂没键，不该凭空绑一个");
+                assert!(
+                    !bound.contains(&command),
+                    "{command:?} 出厂没键，不该凭空绑一个"
+                );
             } else {
                 assert!(bound.contains(&command), "{command:?} 该绑上");
             }

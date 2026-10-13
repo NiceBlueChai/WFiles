@@ -246,8 +246,8 @@ fn mac_app_exists(name: &str) -> bool {
 /// macOS 上 `installed` 只看 .app，这个函数就只有单测在用。
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn find_program(name: &str) -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .collect();
+    let mut dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
 
     #[cfg(target_os = "macos")]
     dirs.extend([

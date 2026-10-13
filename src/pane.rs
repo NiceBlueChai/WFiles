@@ -25,9 +25,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{AsyncApp, Size, Task, WeakEntity, *};
 
-use crate::analyze_entity::{
-    AnalyzeEvent, AnalyzeMode, AnalyzePanel,
-};
+use crate::analyze_entity::{AnalyzeEvent, AnalyzeMode, AnalyzePanel};
 use crate::archive;
 use crate::clipboard;
 use crate::drag::{self, DraggedPaths};
@@ -35,11 +33,11 @@ use crate::format;
 use crate::keymap;
 use crate::marks;
 use crate::meta::{Metadata, MetadataEvent};
-use crate::remote;
-use crate::remotes::{Remotes, RemotesEvent};
 use crate::model::{FileEntry, Listing, Selection, Sort, SortKey, ViewMode};
 use crate::ops_entity::{Ops, OpsEvent};
 use crate::preview::{self, Preview};
+use crate::remote;
+use crate::remotes::{Remotes, RemotesEvent};
 use crate::search_entity::{SearchEvent, SearchPanel};
 use crate::settings::Settings;
 use crate::terminal;
@@ -584,7 +582,10 @@ impl Pane {
                 // 只在这个文件确实还看得见的时候才重画：后台任务回来的图，
                 // 用户可能早就滚过去了。
                 let visible = this.listing.entry(path).is_some()
-                    || this.quick_look.as_ref().is_some_and(|look| look.path == *path);
+                    || this
+                        .quick_look
+                        .as_ref()
+                        .is_some_and(|look| look.path == *path);
                 if visible {
                     cx.notify();
                 }
@@ -736,7 +737,10 @@ impl Pane {
         let rows = self.row_count();
         let height = self.row_height();
         let stale = self.row_sizes.len() != rows
-            || self.row_sizes.first().is_some_and(|size| size.height != height);
+            || self
+                .row_sizes
+                .first()
+                .is_some_and(|size| size.height != height);
         if stale {
             self.row_sizes = Rc::new(vec![size(px(0.), height); rows]);
         }
@@ -896,7 +900,9 @@ impl Pane {
             self.focus.focus(window, cx);
         }
 
-        let entries = self.remotes.update(cx, |remotes, cx| remotes.list(&id, &sub, cx));
+        let entries = self
+            .remotes
+            .update(cx, |remotes, cx| remotes.list(&id, &sub, cx));
         match entries {
             // 已经列过了（缓存还在）：当场填进去。
             Some(_) => {
@@ -928,9 +934,7 @@ impl Pane {
                 // 服务器给的是 Unix 秒；没有时间就当没有（那一列空着）。
                 let modified = entry
                     .modified
-                    .map(|seconds| {
-                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
-                    });
+                    .map(|seconds| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds));
                 FileEntry::remote(child, &entry.name, entry.is_dir, entry.size, modified)
             })
             .collect();
@@ -1184,8 +1188,7 @@ impl Pane {
 
     fn request_rename(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.selection.single().map(PathBuf::from) {
-            self.ops
-                .update(cx, |ops, cx| ops.request_rename(path, cx));
+            self.ops.update(cx, |ops, cx| ops.request_rename(path, cx));
         }
     }
 
@@ -1294,7 +1297,11 @@ impl Pane {
             self.close_quick_look(cx);
             return;
         };
-        if self.quick_look.as_ref().is_some_and(|look| look.path == path) {
+        if self
+            .quick_look
+            .as_ref()
+            .is_some_and(|look| look.path == path)
+        {
             self.close_quick_look(cx);
             return;
         }
@@ -1323,7 +1330,10 @@ impl Pane {
 
     /// 光标（或唯一选中项）指着的是不是一个压缩包。
     fn archive_target(&self) -> Option<PathBuf> {
-        let path = self.selection.cursor().or_else(|| self.selection.single())?;
+        let path = self
+            .selection
+            .cursor()
+            .or_else(|| self.selection.single())?;
         archive::is_archive(path).then(|| path.to_path_buf())
     }
 
@@ -1468,7 +1478,11 @@ impl Pane {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        let current = Settings::read(cx).marks.get(&path).cloned().unwrap_or_default();
+        let current = Settings::read(cx)
+            .marks
+            .get(&path)
+            .cloned()
+            .unwrap_or_default();
         let joined = current.tags.join(" ");
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("标签，空格分开"));
         input.update(cx, |input, cx| input.set_value(&joined, window, cx));
@@ -1579,70 +1593,66 @@ impl Pane {
             .cloned()
             .unwrap_or_default();
 
-        let mut card = v_flex()
-            .id("marks-card")
-            .test_support()
-            .w(px(420.))
-            .gap_3()
-            .p_5()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(border)
-            .bg(cx.theme().background)
-            .child(div().font_semibold().truncate().child(state.name.clone()))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("点一下标色，再点一下去掉"),
-            )
-            .child(
-                h_flex().gap_2().children(
-                    marks::COLORS
-                        .iter()
-                        .map(|(id, label)| {
-                            let chosen = current.color.as_deref() == Some(*id);
-                            div()
-                                .id(format!("mark-color-{id}"))
-                                .test_support()
-                                .aria_label((*label).to_string())
-                                .w(px(26.))
-                                .h(px(26.))
-                                .rounded_full()
-                                .cursor_pointer()
-                                .bg(rgb(marks::color_hex(id)))
-                                .border_2()
-                                .border_color(if chosen { foreground } else { border })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.set_mark_color(id, window, cx)
-                                }))
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-            )
-            .child(Input::new(&state.input).w_full())
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("mark-clear")
-                            .label("清除标记")
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.clear_marks(window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("mark-save")
-                            .label("完成")
-                            .small()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_marks(window, cx)
-                            })),
+        let mut card =
+            v_flex()
+                .id("marks-card")
+                .test_support()
+                .w(px(420.))
+                .gap_3()
+                .p_5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(border)
+                .bg(cx.theme().background)
+                .child(div().font_semibold().truncate().child(state.name.clone()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("点一下标色，再点一下去掉"),
+                )
+                .child(
+                    h_flex().gap_2().children(
+                        marks::COLORS
+                            .iter()
+                            .map(|(id, label)| {
+                                let chosen = current.color.as_deref() == Some(*id);
+                                div()
+                                    .id(format!("mark-color-{id}"))
+                                    .test_support()
+                                    .aria_label((*label).to_string())
+                                    .w(px(26.))
+                                    .h(px(26.))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .bg(rgb(marks::color_hex(id)))
+                                    .border_2()
+                                    .border_color(if chosen { foreground } else { border })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.set_mark_color(id, window, cx)
+                                    }))
+                            })
+                            .collect::<Vec<_>>(),
                     ),
-            );
+                )
+                .child(Input::new(&state.input).w_full())
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("mark-clear")
+                                .label("清除标记")
+                                .small()
+                                .ghost()
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.clear_marks(window, cx)),
+                                ),
+                        )
+                        .child(Button::new("mark-save").label("完成").small().on_click(
+                            cx.listener(|this, _, window, cx| this.save_marks(window, cx)),
+                        )),
+                );
         let used = Settings::read(cx).marks.all_tags();
         if !used.is_empty() {
             card = card.child(
@@ -1890,18 +1900,20 @@ impl Pane {
 
         self.watch_task = None;
         // async move 前缀形式 + 克隆 AsyncApp：future 持有所有权，跨 await 安全。
-        self.watch_task = Some(cx.spawn(async move |pane: WeakEntity<Pane>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            // watcher 活在任务里：任务被丢弃（切换目录）时监听停止。
-            let _watcher = watcher;
-            while rx.recv().await.is_ok() {
-                // 去抖：静默期内的后续事件全部读干，只刷新一次。
-                cx.background_executor().timer(WATCH_DEBOUNCE).await;
-                while rx.try_recv().is_ok() {}
-                pane.update(&mut cx, |pane, cx| pane.refresh_if_watching(&path, cx))
-                    .ok();
-            }
-        }));
+        self.watch_task = Some(
+            cx.spawn(async move |pane: WeakEntity<Pane>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                // watcher 活在任务里：任务被丢弃（切换目录）时监听停止。
+                let _watcher = watcher;
+                while rx.recv().await.is_ok() {
+                    // 去抖：静默期内的后续事件全部读干，只刷新一次。
+                    cx.background_executor().timer(WATCH_DEBOUNCE).await;
+                    while rx.try_recv().is_ok() {}
+                    pane.update(&mut cx, |pane, cx| pane.refresh_if_watching(&path, cx))
+                        .ok();
+                }
+            }),
+        );
     }
 
     /// 监听回调：确认还在看同一个目录才刷新（导航后的旧回调双保险）。
@@ -2377,7 +2389,10 @@ impl Pane {
                             }),
                     )
                     .when_some(
-                        Settings::read(cx).marks.color_of(&path).map(marks::color_hex),
+                        Settings::read(cx)
+                            .marks
+                            .color_of(&path)
+                            .map(marks::color_hex),
                         |this, hex| {
                             // 标了色的文件在名字前面带一个色点。
                             this.child(
@@ -2657,13 +2672,7 @@ impl Pane {
                     .line_clamp(2)
                     .child(name),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .truncate()
-                    .child(caption),
-            );
+            .child(div().text_xs().text_color(muted).truncate().child(caption));
 
         // 格子同样既是拖拽源也能接：拖到文件夹上就是放进去。
         let dragged = self.dragged_paths(&path);
@@ -2790,11 +2799,7 @@ impl Pane {
     /// 所以先把这一列要画的东西抄成一份能搬进闭包的小结构。
     /// 每帧都抄一遍太贵（十万项的祖先目录会拖死界面），
     /// 于是只在目录内容真的变了时才重抄。
-    fn ancestor_column(
-        &mut self,
-        path: &Path,
-        sort: Sort,
-    ) -> ColumnContent {
+    fn ancestor_column(&mut self, path: &Path, sort: Sort) -> ColumnContent {
         if let Some((version, rows, sizes)) = self.column_rows_cache.get(path)
             && *version == self.listing_version
         {
@@ -2938,15 +2943,14 @@ impl Pane {
             .rounded(cx.theme().radius)
             .when(is_active || is_selected, |row| row.bg(cx.theme().muted))
             .child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(icon_color)
-                    .child(Icon::new(if is_dir {
+                div().flex_shrink_0().text_color(icon_color).child(
+                    Icon::new(if is_dir {
                         IconName::Folder
                     } else {
                         IconName::File
                     })
-                    .size_4()),
+                    .size_4(),
+                ),
             )
             .child(div().flex_1().min_w_0().truncate().child(name))
             .on_mouse_down(
@@ -3022,9 +3026,7 @@ impl Pane {
             // 系统自己会去拷，我们不再插手。
             element = element.external_drag_payload::<DraggedPaths>(|drag, _, _| {
                 Some(ExternalDragPayload::Files(FileDragPaths::new(
-                    drag.paths
-                        .iter()
-                        .map(|path| (path.clone(), path.is_dir())),
+                    drag.paths.iter().map(|path| (path.clone(), path.is_dir())),
                 )))
             });
         }
@@ -3038,10 +3040,11 @@ impl Pane {
             element = element.on_drop(cx.listener(move |this, drag: &DraggedPaths, window, cx| {
                 this.drop_paths(drag.paths.clone(), internal.clone(), false, window, cx);
             }));
-            element = element.on_drop(cx.listener(move |this, drag: &ExternalPaths, window, cx| {
-                let paths = drag.0.iter().cloned().collect();
-                this.drop_paths(paths, destination.clone(), true, window, cx);
-            }));
+            element =
+                element.on_drop(cx.listener(move |this, drag: &ExternalPaths, window, cx| {
+                    let paths = drag.0.iter().cloned().collect();
+                    this.drop_paths(paths, destination.clone(), true, window, cx);
+                }));
         }
         element.into_any_element()
     }
@@ -3059,22 +3062,23 @@ impl Pane {
             // 不是文件夹（或本来就不接），没有"里面"可进。
             return element;
         };
-        element.on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-            if !drag::wants_to_expand(true, event.dragging() && cx.has_active_drag()) {
-                return;
-            }
-            this.schedule_spring_load(path.clone(), window, cx);
-        }))
+        element.on_mouse_move(
+            cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                if !drag::wants_to_expand(true, event.dragging() && cx.has_active_drag()) {
+                    return;
+                }
+                this.schedule_spring_load(path.clone(), window, cx);
+            }),
+        )
     }
 
     /// 预约一次"弹开"；已经停在同一个文件夹上就不重新计时。
-    fn schedule_spring_load(
-        &mut self,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.spring.as_ref().is_some_and(|spring| spring.path == path) {
+    fn schedule_spring_load(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .spring
+            .as_ref()
+            .is_some_and(|spring| spring.path == path)
+        {
             // 还停在同一个上：让它继续走完原来那段时间，别每次移动都从头计时。
             return;
         }
@@ -3287,9 +3291,7 @@ impl Pane {
                 this.run_command(PaneCommand::ViewColumns, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ViewArchive, _, cx| this.toggle_archive(cx)))
-            .on_action(cx.listener(|this, _: &CreateArchive, _, cx| {
-                this.create_archive(cx)
-            }))
+            .on_action(cx.listener(|this, _: &CreateArchive, _, cx| this.create_archive(cx)))
             .on_action(cx.listener(|this, _: &Analyze, window, cx| {
                 this.run_command(PaneCommand::Analyze, window, cx)
             }))
@@ -3469,7 +3471,12 @@ impl Pane {
     ///
     /// 焦点要挪到浮层上：GPUI 的按键事件只送到"焦点所在的那条链"，
     /// 浮层不在焦点链上就一个键也收不到。
-    pub fn start_capture(&mut self, command: PaneCommand, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn start_capture(
+        &mut self,
+        command: PaneCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.capturing = Some(command);
         self.capture_focus.focus(window, cx);
         cx.notify();
@@ -3489,11 +3496,7 @@ impl Pane {
             self.status = format!("{} 已恢复出厂按键", Self::command_title(command));
         } else {
             map.set(command, key.clone());
-            self.status = format!(
-                "{} 改为 {}，重启后生效",
-                Self::command_title(command),
-                key
-            );
+            self.status = format!("{} 改为 {}，重启后生效", Self::command_title(command), key);
         }
         map.save(cx);
         // 浮层一撤，焦点就没了着落；不还回列表，Cmd+P 这类带上下文的键会失灵。
@@ -3647,13 +3650,15 @@ impl Pane {
                 .overflow_y_scroll()
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_sm()
-                .child(v_flex().children(
-                    state
-                        .entries
-                        .iter()
-                        .enumerate()
-                        .map(|(index, entry)| self.render_archive_entry(index, entry, cx)),
-                ))
+                .child(
+                    v_flex().children(
+                        state
+                            .entries
+                            .iter()
+                            .enumerate()
+                            .map(|(index, entry)| self.render_archive_entry(index, entry, cx)),
+                    ),
+                )
                 .into_any_element(),
         };
 
@@ -3708,18 +3713,14 @@ impl Pane {
                                     .label(format!("解压到「{stem}」"))
                                     .small()
                                     .disabled(state.error.is_some() || busy)
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.extract_here(cx)),
-                                    ),
+                                    .on_click(cx.listener(|this, _, _, cx| this.extract_here(cx))),
                             )
                             .child(
                                 Button::new("archive-close")
                                     .label("关闭（Esc）")
                                     .ghost()
                                     .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_archive(cx)
-                                    })),
+                                    .on_click(cx.listener(|this, _, _, cx| this.close_archive(cx))),
                             ),
                     ),
             )
@@ -3756,12 +3757,14 @@ impl Pane {
                     } else {
                         cx.theme().muted_foreground
                     })
-                    .child(Icon::new(if entry.is_dir {
-                        IconName::Folder
-                    } else {
-                        IconName::File
-                    })
-                    .size_4()),
+                    .child(
+                        Icon::new(if entry.is_dir {
+                            IconName::Folder
+                        } else {
+                            IconName::File
+                        })
+                        .size_4(),
+                    ),
             )
             .child(div().flex_1().min_w_0().truncate().child(label))
             .child(
@@ -3796,11 +3799,9 @@ impl Pane {
             Preview::Opaque(preview::Kind::Image) => {
                 Self::render_quick_look_image(thumbnail.clone(), cx)
             }
-            Preview::Opaque(kind) => Self::render_quick_look_placeholder(
-                icon_for_kind(*kind),
-                &look.name,
-                cx,
-            ),
+            Preview::Opaque(kind) => {
+                Self::render_quick_look_placeholder(icon_for_kind(*kind), &look.name, cx)
+            }
             Preview::Directory => {
                 Self::render_quick_look_placeholder(IconName::FolderOpen, &look.name, cx)
             }
@@ -3847,31 +3848,34 @@ impl Pane {
                     )
                     .child(body)
                     .child(
-                        h_flex()
-                            .justify_end()
-                            .child(
-                                Button::new("quick-look-close")
-                                    .label("关闭（Esc）")
-                                    .ghost()
-                                    .small()
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.close_quick_look(cx)),
-                                    ),
-                            ),
+                        h_flex().justify_end().child(
+                            Button::new("quick-look-close")
+                                .label("关闭（Esc）")
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| this.close_quick_look(cx))),
+                        ),
                     ),
             )
             .into_any_element()
     }
 
     /// 卡片标题下面那一行：类型、规模，以及"这份不是全文"。
-    fn quick_look_subtitle(look: &QuickLookState, thumbnail: Option<thumbnails::Thumbnail>) -> String {
+    fn quick_look_subtitle(
+        look: &QuickLookState,
+        thumbnail: Option<thumbnails::Thumbnail>,
+    ) -> String {
         match &look.content {
             Preview::Text(text) => {
                 let language = text.language.unwrap_or("文本");
                 format!(
                     "{language} · {} 行{}",
                     text.lines,
-                    if text.truncated { "（只显示开头）" } else { "" }
+                    if text.truncated {
+                        "（只显示开头）"
+                    } else {
+                        ""
+                    }
                 )
             }
             Preview::Hex(hex) => format!(
@@ -3904,11 +3908,13 @@ impl Pane {
             .overflow_y_scroll()
             .font_family(mono)
             .text_sm()
-            .child(v_flex().children(
-                text.text
-                    .lines()
-                    .map(|line| div().whitespace_nowrap().child(line.to_string())),
-            ))
+            .child(
+                v_flex().children(
+                    text.text
+                        .lines()
+                        .map(|line| div().whitespace_nowrap().child(line.to_string())),
+                ),
+            )
             .into_any_element()
     }
 
@@ -3996,12 +4002,7 @@ impl Pane {
     }
 
     /// 这一行元数据那一格写什么。`None` = 这一列现在不显示。
-    fn meta_text(
-        &mut self,
-        path: &Path,
-        is_dir: bool,
-        cx: &mut Context<Self>,
-    ) -> Option<String> {
+    fn meta_text(&mut self, path: &Path, is_dir: bool, cx: &mut Context<Self>) -> Option<String> {
         self.meta.update(cx, |meta, cx| meta.text(path, is_dir, cx))
     }
 
@@ -4140,7 +4141,6 @@ fn detail_row(label: &str, value: String, cx: &App) -> impl IntoElement {
                 .child(value),
         )
 }
-
 
 #[cfg(test)]
 mod tests {

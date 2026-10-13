@@ -223,6 +223,47 @@ pub trait Remote: Send + Sync {
     /// `length` 必须已知——对象存储要知道一次收多少。
     fn upload(&self, path: &str, reader: &mut dyn Read, length: u64) -> Result<(), String>;
 
+    /// 下载能不能从半路接着来。
+    ///
+    /// 默认不能：续传要么靠协议里的一条指令（`REST` / `Range`），
+    /// 要么靠文件句柄能随便 seek——没有这些语义的协议，硬要"续传"
+    /// 只会把两份不一样的字节拼成一个文件。宁可明说不支持。
+    ///
+    /// 下载和上传分开问：同一种协议常常只支持一个方向
+    /// （WebDAV 能读半截却不能写半截），合成一个问题就得答"部分支持"。
+    fn resumes_download(&self) -> bool {
+        false
+    }
+
+    /// 上传能不能从半路接着来（服务器上已经有前若干字节，接着往后写）。
+    fn resumes_upload(&self) -> bool {
+        false
+    }
+
+    /// 从 `offset` 接着下载，返回这一趟写出去的字节数。
+    ///
+    /// 只在 [`Self::resumes_download`] 为真时调用；服务器要是回了整个文件
+    /// （把 `Range` 当没看见），算失败——把整个文件拼在半截后面更糟。
+    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+        let _ = (path, offset, sink);
+        Err("这条连接不支持续传".to_string())
+    }
+
+    /// 从 `offset` 接着上传：服务器上已经有前 `offset` 个字节，
+    /// `reader` 只需要把剩下的 `length - offset` 个字节交出来。
+    ///
+    /// 同样只在 [`Self::resumes_upload`] 为真时调用。
+    fn upload_from(
+        &self,
+        path: &str,
+        reader: &mut dyn Read,
+        length: u64,
+        offset: u64,
+    ) -> Result<(), String> {
+        let _ = (path, reader, length, offset);
+        Err("这条连接不支持续传".to_string())
+    }
+
     /// 建目录。父目录必须已经存在。
     fn mkdir(&self, path: &str) -> Result<(), String>;
 
@@ -363,16 +404,24 @@ impl Dav {
 
     /// 下载一个文件，写进 `sink`，返回写了多少字节。
     pub fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
+        self.get(path, None, sink)
+    }
+
+    fn get(&self, path: &str, offset: Option<u64>, sink: &mut dyn Write) -> Result<u64, String> {
         let url = self.url_of(path);
-        let response = self
+        let mut request = self
             .agent
             .request("GET", &url)
-            .set("Authorization", &self.auth)
-            .call()
-            .map_err(|error| explain("下载", error))?;
+            .set("Authorization", &self.auth);
+        if let Some(offset) = offset {
+            request = request.set("Range", &format!("bytes={offset}-"));
+        }
+        let response = request.call().map_err(|error| explain("下载", error))?;
         let status = response.status();
-        if status != 200 {
-            return Err(format!("下载：服务器回 {status}"));
+        // 206 = 真的给了半截；200 = 服务器把 Range 当耳边风。
+        let wanted = if offset.is_some() { 206 } else { 200 };
+        if status != wanted {
+            return Err(format!("下载：服务器回 {status}（要的是 {wanted}）"));
         }
         let mut reader = response.into_reader();
         // 一边收一边写：一个 2 GB 的文件不该先在内存里整个摊开。
@@ -489,6 +538,20 @@ impl Dav {
 impl Remote for Dav {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    /// 下载能续，上传不能：WebDAV 的 `PUT` 只有"整个盖掉"一种写法，
+    /// 没有"接着后面写"的指令。往上传大文件断线了只能从头再来——
+    /// 所以双栏往远程搬大文件时，优先考虑让服务器自己拷。
+    fn resumes_download(&self) -> bool {
+        true
+    }
+
+    /// 续传就靠 `Range: bytes=<offset>-` 这一个头：服务器认就回 206
+    /// 和剩下的字节，不认就回 200 和整个文件——后者算失败，
+    /// 因为把整个文件拼在半截后面比重新下一趟更糟。
+    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+        self.get(path, Some(offset), sink)
     }
 
     fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
@@ -878,9 +941,41 @@ const FILESTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   </d:response>
 </d:multistatus>"#;
 
+/// 一个够大的文件：断点续传要真的传过半截才验得出来，
+/// 而 `notes.txt` 只有 9 个字节，一个数据块都没满就传完了。
+#[cfg(test)]
+const BIG_LEN: usize = 20_000;
+
+/// `big.bin` 的内容：按序号取模，第 i 个字节就是 `(i % 251)`。
+/// 断点接错地方（比如漏了几个字节）对得上对不上，一比就知道。
+#[cfg(test)]
+pub(crate) fn big_bytes() -> Vec<u8> {
+    (0..BIG_LEN).map(|ix| (ix % 251) as u8).collect()
+}
+
+/// `big.bin` 的 PROPFIND 响应：大小必须跟 [`big_bytes`] 一致，
+/// 不然续传账本会以为源变了。
+#[cfg(test)]
+fn big_status() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/dav/big.bin</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>big.bin</d:displayname>
+      <d:getcontentlength>{BIG_LEN}</d:getcontentlength>
+      <d:getlastmodified>Wed, 21 Oct 2015 07:28:00 GMT</d:getlastmodified>
+      <d:resourcetype/>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod fake {
-    use super::{FILESTATUS, MULTISTATUS};
+    use super::{FILESTATUS, MULTISTATUS, big_bytes, big_status};
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -924,20 +1019,36 @@ pub(crate) mod fake {
         let method = parts.next().unwrap_or_default().to_string();
         let target = parts.next().unwrap_or_default().to_string();
         let mut length = 0usize;
+        let mut range: Option<u64> = None;
         loop {
             line.clear();
             if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                length = value.trim().parse().unwrap_or(0);
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim();
+                let value = value.trim();
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.parse().unwrap_or(0);
+                }
+                // `Range: bytes=123-`：续传就靠这一个头。
+                if name.eq_ignore_ascii_case("range")
+                    && let Some(rest) = value.strip_prefix("bytes=")
+                    && let Some(start) = rest.split('-').next()
+                    && let Ok(start) = start.parse()
+                {
+                    range = Some(start);
+                }
             }
         }
         let mut body = vec![0u8; length];
         let _ = reader.read_exact(&mut body);
-        recorded.lock().unwrap().push(format!("{method} {target}"));
+        let mut note = format!("{method} {target}");
+        if let Some(start) = range {
+            // 带了 Range 才记这一笔：断言"这回是接着传的"用。
+            note.push_str(&format!(" range={start}"));
+        }
+        recorded.lock().unwrap().push(note);
 
         let (status, content_type, payload): (&str, &str, Vec<u8>) = match method.as_str() {
             // 只有服务器"真的有"的这几处才回内容，其余一律 404：
@@ -947,13 +1058,45 @@ pub(crate) mod fake {
                 "application/xml",
                 FILESTATUS.as_bytes().to_vec(),
             ),
+            "PROPFIND" if target == "/dav/big.bin" => (
+                "207 Multi-Status",
+                "application/xml",
+                big_status().into_bytes(),
+            ),
             "PROPFIND" if known(&target) => (
                 "207 Multi-Status",
                 "application/xml",
                 MULTISTATUS.as_bytes().to_vec(),
             ),
             "PROPFIND" => ("404 Not Found", "text/plain", Vec::new()),
-            "GET" => ("200 OK", "text/plain", b"hello dav".to_vec()),
+            // 大文件：续传测试的对象，Range 照算。放在普通 GET 前面——
+            // 这两个分支的条件有重叠，顺序反了就永远轮不到它。
+            "GET" if target == "/dav/big.bin" => {
+                let body = big_bytes();
+                match range {
+                    Some(start) if (start as usize) < body.len() => (
+                        "206 Partial Content",
+                        "application/octet-stream",
+                        body[start as usize..].to_vec(),
+                    ),
+                    Some(_) => ("416 Range Not Satisfiable", "text/plain", Vec::new()),
+                    None => ("200 OK", "application/octet-stream", body),
+                }
+            }
+            "GET" => {
+                // 服务器"存着"的内容：跟上面列目录时报的大小（1234）没关系，
+                // 测试只看字节对不对，不拿它当金标准。
+                const BODY: &[u8] = b"hello dav";
+                match range {
+                    Some(start) if (start as usize) < BODY.len() => (
+                        "206 Partial Content",
+                        "text/plain",
+                        BODY[start as usize..].to_vec(),
+                    ),
+                    Some(_) => ("416 Range Not Satisfiable", "text/plain", Vec::new()),
+                    None => ("200 OK", "text/plain", BODY.to_vec()),
+                }
+            }
             _ => ("201 Created", "text/plain", Vec::new()),
         };
         let head = format!(
@@ -967,7 +1110,10 @@ pub(crate) mod fake {
 
     /// 假服务器上"存在"的路径：连接根和 `folder` 一处目录。
     fn known(target: &str) -> bool {
-        matches!(target, "/dav/" | "/dav/folder" | "/dav/folder/")
+        matches!(
+            target,
+            "/dav/" | "/dav/folder" | "/dav/folder/" | "/dav/big.bin"
+        )
     }
 
     /// 一条指向 `url` 的配置：测试里建客户端用。

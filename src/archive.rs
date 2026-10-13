@@ -13,9 +13,9 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
+use zip::CompressionMethod;
 use zip::ZipArchive;
 use zip::write::{SimpleFileOptions, ZipWriter};
-use zip::CompressionMethod;
 
 /// 压缩包里的一个条目。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,16 +93,14 @@ pub fn extract(path: &Path, dest: &Path, wanted: &[String]) -> Result<usize, Str
             continue;
         };
         if entry.is_dir() || name.ends_with('/') {
-            std::fs::create_dir_all(&out)
-                .map_err(|error| format!("建不了 {name}：{error}"))?;
+            std::fs::create_dir_all(&out).map_err(|error| format!("建不了 {name}：{error}"))?;
             continue;
         }
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("建不了 {name} 的上级目录：{error}"))?;
         }
-        let mut out_file =
-            File::create(&out).map_err(|error| format!("写不了 {name}：{error}"))?;
+        let mut out_file = File::create(&out).map_err(|error| format!("写不了 {name}：{error}"))?;
         std::io::copy(&mut entry, &mut out_file)
             .map_err(|error| format!("解 {name} 解到一半：{error}"))?;
         files += 1;
@@ -193,16 +191,16 @@ fn add_path<W: Write + std::io::Seek>(
         .to_str()
         .map(|name| name.replace('\\', "/"))
         .ok_or_else(|| format!("{source:?} 的名字不是合法 Unicode"))?;
-    let metadata = std::fs::symlink_metadata(source)
-        .map_err(|error| format!("看不了 {source:?}：{error}"))?;
+    let metadata =
+        std::fs::symlink_metadata(source).map_err(|error| format!("看不了 {source:?}：{error}"))?;
 
     if metadata.is_dir() {
         writer
             .add_directory(format!("{name}/"), options)
             .map_err(|error| format!("写不了目录 {name}：{error}"))?;
         let mut files = 0;
-        let children = std::fs::read_dir(source)
-            .map_err(|error| format!("列不出 {source:?}：{error}"))?;
+        let children =
+            std::fs::read_dir(source).map_err(|error| format!("列不出 {source:?}：{error}"))?;
         for child in children {
             let child = child.map_err(|error| format!("列不出 {source:?}：{error}"))?;
             let child_path = child.path();
@@ -220,10 +218,8 @@ fn add_path<W: Write + std::io::Seek>(
     writer
         .start_file(name.clone(), options)
         .map_err(|error| format!("写不了 {name}：{error}"))?;
-    let mut input =
-        File::open(source).map_err(|error| format!("读不了 {source:?}：{error}"))?;
-    std::io::copy(&mut input, writer)
-        .map_err(|error| format!("写 {name} 写到一半：{error}"))?;
+    let mut input = File::open(source).map_err(|error| format!("读不了 {source:?}：{error}"))?;
+    std::io::copy(&mut input, writer).map_err(|error| format!("写 {name} 写到一半：{error}"))?;
     Ok(1)
 }
 
@@ -342,8 +338,12 @@ mod tests {
         std::fs::write(work.path().join("one.txt"), "1").unwrap();
         std::fs::write(work.path().join("two.txt"), "2").unwrap();
         let zip = work.path().join("two.zip");
-        create(&zip, work.path(), &[work.path().join("one.txt"), work.path().join("two.txt")])
-            .expect("打包");
+        create(
+            &zip,
+            work.path(),
+            &[work.path().join("one.txt"), work.path().join("two.txt")],
+        )
+        .expect("打包");
 
         let out = work.path().join("out");
         let files = extract(&zip, &out, &["two.txt".to_string()]).expect("解压");
@@ -354,13 +354,34 @@ mod tests {
 
     #[test]
     fn a_malicious_entry_cannot_escape_the_destination() {
-        assert_eq!(safe_destination(Path::new("/out"), "ok.txt").as_deref(), Some(Path::new("/out/ok.txt")));
-        assert_eq!(safe_destination(Path::new("/out"), "a/b.txt").as_deref(), Some(Path::new("/out/a/b.txt")));
-        assert_eq!(safe_destination(Path::new("/out"), "../escape.txt"), None, "Zip-Slip");
-        assert_eq!(safe_destination(Path::new("/out"), "a/../../escape.txt"), None);
-        assert_eq!(safe_destination(Path::new("/out"), "/etc/passwd"), None, "绝对路径");
+        assert_eq!(
+            safe_destination(Path::new("/out"), "ok.txt").as_deref(),
+            Some(Path::new("/out/ok.txt"))
+        );
+        assert_eq!(
+            safe_destination(Path::new("/out"), "a/b.txt").as_deref(),
+            Some(Path::new("/out/a/b.txt"))
+        );
+        assert_eq!(
+            safe_destination(Path::new("/out"), "../escape.txt"),
+            None,
+            "Zip-Slip"
+        );
+        assert_eq!(
+            safe_destination(Path::new("/out"), "a/../../escape.txt"),
+            None
+        );
+        assert_eq!(
+            safe_destination(Path::new("/out"), "/etc/passwd"),
+            None,
+            "绝对路径"
+        );
         assert_eq!(safe_destination(Path::new("/out"), ""), None);
-        assert_eq!(safe_destination(Path::new("/out"), "..\\escape.txt"), None, "反斜杠也要认");
+        assert_eq!(
+            safe_destination(Path::new("/out"), "..\\escape.txt"),
+            None,
+            "反斜杠也要认"
+        );
     }
 
     #[test]

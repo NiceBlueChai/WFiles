@@ -115,11 +115,35 @@ mod tests {
 
     fn commands() -> Vec<Command> {
         vec![
-            Command::new("go-home", "前往个人文件夹", "Cmd+Shift+H", "前往", "home 主目录"),
+            Command::new(
+                "go-home",
+                "前往个人文件夹",
+                "Cmd+Shift+H",
+                "前往",
+                "home 主目录",
+            ),
             Command::new("go-desktop", "前往桌面", "", "前往", "desktop"),
-            Command::new("op-new-folder", "新建文件夹", "Cmd+Shift+N", "文件", "folder 创建 目录"),
-            Command::new("op-trash", "移到回收站", "Cmd+Backspace", "文件", "delete 删除"),
-            Command::new("op-copy-path", "复制路径", "Cmd+Alt+C", "文件", "path 剪贴板"),
+            Command::new(
+                "op-new-folder",
+                "新建文件夹",
+                "Cmd+Shift+N",
+                "文件",
+                "folder 创建 目录",
+            ),
+            Command::new(
+                "op-trash",
+                "移到回收站",
+                "Cmd+Backspace",
+                "文件",
+                "delete 删除",
+            ),
+            Command::new(
+                "op-copy-path",
+                "复制路径",
+                "Cmd+Alt+C",
+                "文件",
+                "path 剪贴板",
+            ),
         ]
     }
 

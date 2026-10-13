@@ -43,6 +43,83 @@ pub struct Sftp {
 }
 
 impl Sftp {
+    fn pull(&self, absolute: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+        self.runtime.block_on(async {
+            let mut file = self
+                .session
+                .open(absolute)
+                .await
+                .map_err(|error| format!("打不开 {absolute}：{error}"))?;
+            if offset > 0 {
+                use tokio::io::AsyncSeekExt as _;
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|error| format!("续传：定位不到 {offset}：{error}"))?;
+            }
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut total = 0u64;
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|error| format!("下载失败：{error}"))?;
+                if read == 0 {
+                    break;
+                }
+                sink.write_all(&buffer[..read])
+                    .map_err(|error| format!("写不进本地文件：{error}"))?;
+                total += read as u64;
+            }
+            file.close()
+                .await
+                .map_err(|error| format!("关不掉远程文件：{error}"))?;
+            Ok(total)
+        })
+    }
+
+    fn push(
+        &self,
+        absolute: &str,
+        reader: &mut dyn Read,
+        offset: Option<u64>,
+    ) -> Result<(), String> {
+        self.runtime.block_on(async {
+            // 续传时不截断：`CREATE | WRITE` 会新建，也会留着旧内容。
+            let flags = if offset.is_some() {
+                OpenFlags::CREATE | OpenFlags::WRITE
+            } else {
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
+            };
+            let mut file = self
+                .session
+                .open_with_flags(absolute, flags)
+                .await
+                .map_err(|error| format!("打不开 {absolute}：{error}"))?;
+            if let Some(offset) = offset {
+                use tokio::io::AsyncSeekExt as _;
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|error| format!("续传：定位不到 {offset}：{error}"))?;
+            }
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                let read = reader
+                    .read(&mut buffer)
+                    .map_err(|error| format!("读不了本地文件：{error}"))?;
+                if read == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..read])
+                    .await
+                    .map_err(|error| format!("上传失败：{error}"))?;
+            }
+            file.close()
+                .await
+                .map_err(|error| format!("关不掉远程文件：{error}"))?;
+            Ok(())
+        })
+    }
+
     /// 建一个连接（会联网：握手、登录、开 SFTP 子系统）。
     pub fn new(config: &Config, password: &str) -> Result<Self, String> {
         Self::connect(config, password, known_hosts_file())
@@ -201,6 +278,16 @@ impl Remote for Sftp {
         &self.id
     }
 
+    /// 两个方向都能续：SFTP 的读写都带偏移，`seek` 到断点就行。
+    /// 四种协议里只有它和 FTP 传下载都接得上。
+    fn resumes_download(&self) -> bool {
+        true
+    }
+
+    fn resumes_upload(&self) -> bool {
+        true
+    }
+
     fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
         let absolute = self.absolute(path);
         let entries = self.runtime.block_on(async {
@@ -252,61 +339,36 @@ impl Remote for Sftp {
 
     fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
         let absolute = self.absolute(path);
-        self.runtime.block_on(async {
-            let mut file = self
-                .session
-                .open(&absolute)
-                .await
-                .map_err(|error| format!("打不开 {absolute}：{error}"))?;
-            let mut buffer = vec![0u8; 64 * 1024];
-            let mut total = 0u64;
-            loop {
-                let read = file
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|error| format!("下载失败：{error}"))?;
-                if read == 0 {
-                    break;
-                }
-                sink.write_all(&buffer[..read])
-                    .map_err(|error| format!("写不进本地文件：{error}"))?;
-                total += read as u64;
-            }
-            file.close()
-                .await
-                .map_err(|error| format!("关不掉远程文件：{error}"))?;
-            Ok(total)
-        })
+        self.pull(&absolute, 0, sink)
+    }
+
+    /// 从 `offset` 接着下载：SFTP 的读是带偏移的，把文件光标
+    /// `seek` 到断点再照常读就行——russh 那边只是每次读多带一个 offset，
+    /// 服务器该回哪一段回哪一段。
+    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+        let absolute = self.absolute(path);
+        self.pull(&absolute, offset, sink)
     }
 
     fn upload(&self, path: &str, reader: &mut dyn Read, _length: u64) -> Result<(), String> {
         let absolute = self.absolute(path);
-        self.runtime.block_on(async {
-            let mut file = self
-                .session
-                .open_with_flags(
-                    &absolute,
-                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-                )
-                .await
-                .map_err(|error| format!("打不开 {absolute}：{error}"))?;
-            let mut buffer = vec![0u8; 64 * 1024];
-            loop {
-                let read = reader
-                    .read(&mut buffer)
-                    .map_err(|error| format!("读不了本地文件：{error}"))?;
-                if read == 0 {
-                    break;
-                }
-                file.write_all(&buffer[..read])
-                    .await
-                    .map_err(|error| format!("上传失败：{error}"))?;
-            }
-            file.close()
-                .await
-                .map_err(|error| format!("关不掉远程文件：{error}"))?;
-            Ok(())
-        })
+        self.push(&absolute, reader, None)
+    }
+
+    /// 从 `offset` 接着上传：照样 `seek` 过去再写。
+    ///
+    /// 注意 `TRUNCATE` 不能带——带上就等于把服务器上已有的半截先削掉，
+    /// 那还续什么传。调用方保证过服务器上正好有 `offset` 个字节，
+    /// 所以定位过去写，拼出来才是一个完整的文件。
+    fn upload_from(
+        &self,
+        path: &str,
+        reader: &mut dyn Read,
+        _length: u64,
+        offset: u64,
+    ) -> Result<(), String> {
+        let absolute = self.absolute(path);
+        self.push(&absolute, reader, Some(offset))
     }
 
     fn mkdir(&self, path: &str) -> Result<(), String> {

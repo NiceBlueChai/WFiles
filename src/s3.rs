@@ -376,6 +376,27 @@ impl Remote for S3 {
         &self.id
     }
 
+    /// 下载能续（`Range`），上传不能：对象存储没有"接着某个对象往后写"
+    /// 这回事，唯一的写法是分段上传——那得在客户端记一串 part id，
+    /// 断一次线就多一套要对账的状态。为一个功能引入第二套传输机制不划算，
+    /// 所以往 S3 上传断线只能从头再来（这条写在路线图"明确不做"里）。
+    fn resumes_download(&self) -> bool {
+        true
+    }
+
+    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
+        self.get(path, None, sink)
+    }
+
+    /// 从 `offset` 接着下载。
+    ///
+    /// 对象存储的 GET 也认 `Range`（回 206 加 `Content-Range`）。
+    /// 头要走签名：`extra` 里的每一项都会被算进 `SignedHeaders`，
+    /// 所以这里照常传进去就行，不用额外张罗。
+    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+        self.get(path, Some(offset), sink)
+    }
+
     fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
         // 列一层要把前缀写成 "dir/"；根就是空前缀。
         let prefix = if path.is_empty() {
@@ -441,29 +462,6 @@ impl Remote for S3 {
         Ok(None)
     }
 
-    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
-        let response = self.call("GET", path, &[], &[], Payload::none())?;
-        let status = response.status();
-        if !(200..300).contains(&status) {
-            let text = response.into_string().unwrap_or_default();
-            return Err(format!("下载：服务器回 {status}：{}", reason_of(&text)));
-        }
-        let mut reader = response.into_reader();
-        let mut buffer = vec![0u8; 64 * 1024];
-        let mut total = 0u64;
-        loop {
-            let read = reader
-                .read(&mut buffer)
-                .map_err(|error| format!("下载：读不回来：{error}"))?;
-            if read == 0 {
-                return Ok(total);
-            }
-            sink.write_all(&buffer[..read])
-                .map_err(|error| format!("下载：写不下去：{error}"))?;
-            total += read as u64;
-        }
-    }
-
     fn upload(&self, path: &str, reader: &mut dyn Read, length: u64) -> Result<(), String> {
         let response = self.call("PUT", path, &[], &[], Payload::stream(reader, length))?;
         let status = response.status();
@@ -521,6 +519,39 @@ impl Remote for S3 {
 }
 
 impl S3 {
+    fn get(&self, path: &str, offset: Option<u64>, sink: &mut dyn Write) -> Result<u64, String> {
+        let extra: Vec<(&str, String)> = match offset {
+            Some(offset) => vec![("range", format!("bytes={offset}-"))],
+            None => Vec::new(),
+        };
+        let extra: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let response = self.call("GET", path, &[], &extra, Payload::none())?;
+        let status = response.status();
+        // 206 = 真的给了半截；200 = 把 Range 当没看见。
+        let wanted = if offset.is_some() { 206 } else { 200 };
+        if status != wanted {
+            let text = response.into_string().unwrap_or_default();
+            return Err(format!(
+                "下载：服务器回 {status}（要的是 {wanted}）：{}",
+                reason_of(&text)
+            ));
+        }
+        let mut reader = response.into_reader();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("下载：读不回来：{error}"))?;
+            if read == 0 {
+                return Ok(total);
+            }
+            sink.write_all(&buffer[..read])
+                .map_err(|error| format!("下载：写不下去：{error}"))?;
+            total += read as u64;
+        }
+    }
+
     fn delete_one(&self, key: &str) -> Result<(), String> {
         let response = self.call("DELETE", key, &[], &[], Payload::none())?;
         let status = response.status();

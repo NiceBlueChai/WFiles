@@ -118,6 +118,16 @@ impl Remote for Ftp {
         &self.id
     }
 
+    /// 两个方向都能续：`REST`+`RETR` 读半截，`APPE` 写半截，
+    /// 都是 FTP 里活了三十多年的指令。
+    fn resumes_download(&self) -> bool {
+        true
+    }
+
+    fn resumes_upload(&self) -> bool {
+        true
+    }
+
     fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
         let absolute = self.absolute(path);
         let lines = self
@@ -189,19 +199,26 @@ impl Remote for Ftp {
     fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
         let absolute = self.absolute(path);
         self.lock()?
-            .retr(&absolute, |reader| {
-                let mut buffer = vec![0u8; 64 * 1024];
-                let mut total = 0u64;
-                loop {
-                    let read = reader.read(&mut buffer).map_err(broken_pipe)?;
-                    if read == 0 {
-                        return Ok(total);
-                    }
-                    sink.write_all(&buffer[..read]).map_err(broken_pipe)?;
-                    total += read as u64;
-                }
-            })
+            .retr(&absolute, |reader| pump(reader, sink))
             .map_err(|error| format!("下载失败：{error}"))
+    }
+
+    /// 从 `offset` 接着下载。
+    ///
+    /// FTP 的续传是老规矩：先 `REST <字节数>` 告诉服务器"跳过前面这些"，
+    /// 再照常 `RETR`。`REST` 自己不会开始传输，也不该留着——
+    /// 下一次不带 `REST` 的 `RETR` 用的是同一条控制连接，
+    /// 服务器还记得上一个断点，所以用完要把偏移归零。
+    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+        let absolute = self.absolute(path);
+        let mut session = self.lock()?;
+        session
+            .resume_transfer(offset as usize)
+            .map_err(|error| format!("续传失败：{error}"))?;
+        let result = session.retr(&absolute, |reader| pump(reader, sink));
+        // 不管成没成，把断点还回去：下一次普通下载该从 0 开始。
+        session.resume_transfer(0).ok();
+        result.map_err(|error| format!("下载失败：{error}"))
     }
 
     fn upload(&self, path: &str, reader: &mut dyn Read, _length: u64) -> Result<(), String> {
@@ -213,6 +230,27 @@ impl Remote for Ftp {
             .put_file(&absolute, &mut wrapped)
             .map(|_| ())
             .map_err(|error| format!("上传失败：{error}"))
+    }
+
+    /// 从 `offset` 接着上传：`APPE` 的意思是"接着文件末尾写"，
+    /// 而调用方已经确认过服务器上正好有 `offset` 个字节，两者对得上，
+    /// 所以这里不用再问一遍长度。
+    ///
+    /// 为什么不用 `REST` + `STOR`：`STOR` 会把文件截断，`REST` 对它的解释
+    /// 各服务器不一致（有的从断点写，有的从 0 写），而 `APPE` 的意思没有歧义。
+    fn upload_from(
+        &self,
+        path: &str,
+        reader: &mut dyn Read,
+        _length: u64,
+        _offset: u64,
+    ) -> Result<(), String> {
+        let absolute = self.absolute(path);
+        let mut wrapped = ReadRef(reader);
+        self.lock()?
+            .append_file(&absolute, &mut wrapped)
+            .map(|_| ())
+            .map_err(|error| format!("续传失败：{error}"))
     }
 
     fn mkdir(&self, path: &str) -> Result<(), String> {
@@ -281,6 +319,24 @@ struct ReadRef<'a>(&'a mut dyn Read);
 impl Read for ReadRef<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.0.read(buffer)
+    }
+}
+
+/// 把数据连接上的字节搬进 `sink`，返回搬了多少。
+///
+/// 单独拎出来是因为下载和续传下载都要用同一套循环——
+/// 两处各写一遍，改的时候准会漏掉一处。
+/// 错误类型跟着 `suppaftp` 的闭包要求走（它要 `FtpError`）。
+fn pump(reader: &mut dyn Read, sink: &mut dyn Write) -> Result<u64, suppaftp::FtpError> {
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = reader.read(&mut buffer).map_err(broken_pipe)?;
+        if read == 0 {
+            return Ok(total);
+        }
+        sink.write_all(&buffer[..read]).map_err(broken_pipe)?;
+        total += read as u64;
     }
 }
 

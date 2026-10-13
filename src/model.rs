@@ -115,9 +115,7 @@ pub enum SortKey {
     Kind,
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Sort {
     #[serde(default)]
     pub key: SortKey,
@@ -163,9 +161,7 @@ impl Sort {
 ///
 /// 派生 `Serialize` 是为了"每个目录记住它的视图"能落盘；
 /// 和 [`Sort`] 一样，旧配置里没有这个字段时必须还能读出来。
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewMode {
     /// 一行一项，带大小、修改时间、类型三列。

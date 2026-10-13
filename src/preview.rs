@@ -7,10 +7,7 @@
 //! 图片只返回 [`Preview::Opaque`]：真正的解码在 `thumbnails` 里异步做，
 //! 这里碰都不碰——那是几毫秒到几百毫秒的活，不该出现在读目录的路径上。
 
-use std::{
-    fs, io::Read as _,
-    path::Path,
-};
+use std::{fs, io::Read as _, path::Path};
 
 /// 一次预览愿意读多少内容。
 ///
@@ -277,7 +274,9 @@ pub fn load_with(path: &Path, budget: Budget) -> Preview {
     }
 
     let kind = classify(path);
-    let size = fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0);
+    let size = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     if kind.is_opaque() {
         return Preview::Opaque(kind);
     }
@@ -385,8 +384,18 @@ const ARCHIVE: &[&str] = &[
     "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "iso", "dmg", "deb", "rpm", "apk", "jar",
 ];
 const TEXT: &[&str] = &[
-    "txt", "text", "log", "csv", "tsv", "rtf", "env", "gitignore", "gitattributes", "editorconfig",
-    "nfo", "asc",
+    "txt",
+    "text",
+    "log",
+    "csv",
+    "tsv",
+    "rtf",
+    "env",
+    "gitignore",
+    "gitattributes",
+    "editorconfig",
+    "nfo",
+    "asc",
 ];
 
 #[cfg(test)]
@@ -453,7 +462,10 @@ mod tests {
     #[test]
     fn source_files_carry_their_language() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(text_of(&root, "a.rs", "fn main() {}").language, Some("Rust"));
+        assert_eq!(
+            text_of(&root, "a.rs", "fn main() {}").language,
+            Some("Rust")
+        );
         assert_eq!(
             text_of(&root, "a.json", "{}").language,
             Some("JSON"),

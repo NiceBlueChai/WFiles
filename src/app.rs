@@ -23,19 +23,19 @@ use crate::compare::Options as CompareOptions;
 use crate::compare_entity::{CompareEvent, ComparePanel};
 use crate::diff_entity::{DiffEvent, DiffPanel};
 use crate::drag::{self, DraggedPaths};
-use crate::meta::{Field as MetaField, Metadata};
 use crate::format;
-use crate::remote::{self, Kind as RemoteKind};
+use crate::meta::{Field as MetaField, Metadata};
 use crate::ops::{ConflictPolicy, ControlState};
 use crate::ops_entity::{Ops, OpsEvent, PendingAction};
 use crate::palette::{self, Command as PaletteCommand};
 use crate::pane::{Pane, PaneCommand, PaneEvent};
+use crate::remote::{self, Kind as RemoteKind};
 use crate::remotes::{Remotes, RemotesEvent};
 use crate::session::Session;
-use crate::thumbnails::Thumbnails;
 use crate::settings::{Layout, Settings};
-use crate::term_entity::{Terminal, TerminalEvent, TOGGLE_KEY};
+use crate::term_entity::{TOGGLE_KEY, Terminal, TerminalEvent};
 use crate::terminal;
+use crate::thumbnails::Thumbnails;
 
 gpui_kit::actions!(
     wfiles,
@@ -282,7 +282,9 @@ impl WFilesApp {
             tabs.push(tab);
         }
         let active = session.active.min(tabs.len() - 1);
-        let split = session.split.filter(|&index| index < tabs.len() && index != active);
+        let split = session
+            .split
+            .filter(|&index| index < tabs.len() && index != active);
 
         let mut app = Self {
             ops: ops.clone(),
@@ -334,9 +336,7 @@ impl WFilesApp {
         app.subscriptions.push(cx.subscribe_in(
             &remotes,
             window,
-            |this, _, event: &RemotesEvent, window, cx| {
-                this.on_remotes_event(event, window, cx)
-            },
+            |this, _, event: &RemotesEvent, window, cx| this.on_remotes_event(event, window, cx),
         ));
         app.saved_session = app.snapshot(cx);
 
@@ -431,8 +431,7 @@ impl WFilesApp {
     {
         let guard = destination.clone();
         let mut element = element.can_drop(move |value, _, _| {
-            crate::pane::dropped_paths(value)
-                .is_some_and(|paths| drag::can_drop(&guard, &paths))
+            crate::pane::dropped_paths(value).is_some_and(|paths| drag::can_drop(&guard, &paths))
         });
         let internal = destination.clone();
         element = element.on_drop(cx.listener(move |this, drag: &DraggedPaths, window, cx| {
@@ -447,9 +446,7 @@ impl WFilesApp {
     }
 
     fn navigate_active_tab(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.tabs[self.active].update(cx, |pane, cx| {
-            pane.navigate_to(path, true, window, cx)
-        });
+        self.tabs[self.active].update(cx, |pane, cx| pane.navigate_to(path, true, window, cx));
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -511,14 +508,12 @@ impl WFilesApp {
                             .child(Icon::new(IconName::FolderOpen).size_4()),
                     )
                     .child(
-                        v_flex()
-                            .child(div().font_semibold().child("WFiles"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("快速、清楚、可撤销"),
-                            ),
+                        v_flex().child(div().font_semibold().child("WFiles")).child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("快速、清楚、可撤销"),
+                        ),
                     ),
             )
             .child(
@@ -760,7 +755,11 @@ impl WFilesApp {
         // 两个下标都要跟着挪；另一栏正好被关掉就退回单栏。
         self.split = match self.split {
             Some(partner) if partner == index => None,
-            Some(partner) => Some(if partner > index { partner - 1 } else { partner }),
+            Some(partner) => Some(if partner > index {
+                partner - 1
+            } else {
+                partner
+            }),
             None => None,
         };
         if self.active > index {
@@ -979,7 +978,9 @@ impl WFilesApp {
     /// 这一栏里"当前那一个文件"：选中优先，没有选中就用光标下的。
     fn file_in_tab(&self, index: usize, cx: &App) -> Option<PathBuf> {
         let pane = self.tabs[index].read(cx);
-        pane.selected_paths().into_iter().find(|path| path.is_file())
+        pane.selected_paths()
+            .into_iter()
+            .find(|path| path.is_file())
     }
 
     /// 打开文件内容比较面板；已经开着就换掉（对象可能变了）。
@@ -1167,10 +1168,15 @@ impl WFilesApp {
     /// 这一步删不掉用户任何文件，但会删掉一个记不住的密码。
     fn forget_remote(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.forget_armed = None;
-        if self.secret_note.as_deref().is_some_and(|note| note.contains(id)) {
+        if self
+            .secret_note
+            .as_deref()
+            .is_some_and(|note| note.contains(id))
+        {
             self.secret_note = None;
         }
-        self.remotes.update(cx, |remotes, cx| remotes.forget(id, cx));
+        self.remotes
+            .update(cx, |remotes, cx| remotes.forget(id, cx));
         // 正停在那个远程目录里的标签要退回本地主页：
         // 留着会显示一个永远刷不出来的空列表。
         let home = Self::initial_dir();
@@ -1179,10 +1185,11 @@ impl WFilesApp {
             .iter()
             .enumerate()
             .filter(|(_, tab)| {
-                tab.read(cx)
-                    .path()
-                    .to_string_lossy()
-                    .contains(&format!("{}://{}/", remote::SCHEME, id))
+                tab.read(cx).path().to_string_lossy().contains(&format!(
+                    "{}://{}/",
+                    remote::SCHEME,
+                    id
+                ))
             })
             .map(|(index, _)| index)
             .collect();
@@ -1217,9 +1224,8 @@ impl WFilesApp {
             return;
         };
         let ops = self.ops.clone();
-        let panel = cx.new(|cx| {
-            ComparePanel::new(ops, CompareOptions::new(left, right), window, cx)
-        });
+        let panel =
+            cx.new(|cx| ComparePanel::new(ops, CompareOptions::new(left, right), window, cx));
         self.subscriptions.push(cx.subscribe_in(
             &panel,
             window,
@@ -1241,8 +1247,7 @@ impl WFilesApp {
     /// 跳到某个文件并收起比较面板：由面板的 Enter 触发。
     fn reveal_in_active(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.compare = None;
-        self.tabs[self.active]
-            .update(cx, |pane, cx| pane.reveal_path(path, window, cx));
+        self.tabs[self.active].update(cx, |pane, cx| pane.reveal_path(path, window, cx));
         cx.notify();
     }
 
@@ -1359,8 +1364,7 @@ impl WFilesApp {
                                         .as_ref()
                                         .map(|input| input.read(cx).value().to_string())
                                         .unwrap_or_default();
-                                    this.ops
-                                        .update(cx, |ops, cx| ops.submit_prompt(value, cx));
+                                    this.ops.update(cx, |ops, cx| ops.submit_prompt(value, cx));
                                 }
                                 // 不在失焦时关闭：点“创建”按钮会让输入框先失焦，
                                 // 那时关掉对话框按钮就再也点不到了。关闭只认
@@ -1395,9 +1399,9 @@ impl WFilesApp {
             .unwrap_or_default();
 
         let mut field = |initial: String,
-                     placeholder: &'static str,
-                     window: &mut Window,
-                     cx: &mut Context<Self>| {
+                         placeholder: &'static str,
+                         window: &mut Window,
+                         cx: &mut Context<Self>| {
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .default_value(initial)
@@ -1430,7 +1434,9 @@ impl WFilesApp {
             step,
         });
         if let Some(inputs) = self.bulk_inputs.as_ref() {
-            inputs.template.update(cx, |input, cx| input.focus(window, cx));
+            inputs
+                .template
+                .update(cx, |input, cx| input.focus(window, cx));
         }
     }
 
@@ -1476,17 +1482,14 @@ impl WFilesApp {
         self.ops.update(cx, |ops, cx| ops.cancel_conflict(cx));
 
         let items = self.build_palette_items(cx);
-        let commands: Vec<PaletteCommand> =
-            items.iter().map(|item| item.command.clone()).collect();
+        let commands: Vec<PaletteCommand> = items.iter().map(|item| item.command.clone()).collect();
         self.palette = Some(PaletteState {
             items,
             filtered: palette::filter(&commands, ""),
             selected: 0,
         });
 
-        let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("搜索命令、位置或标签页")
-        });
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索命令、位置或标签页"));
         input.update(cx, |input, cx| input.focus(window, cx));
         // 注意用闭包自己的 window 参数，不能捕获外层的：
         // subscribe_in 要求闭包 'static，捕获 &mut Window 会逃逸。
@@ -1520,8 +1523,11 @@ impl WFilesApp {
         let Some(state) = self.palette.as_mut() else {
             return;
         };
-        let commands: Vec<PaletteCommand> =
-            state.items.iter().map(|item| item.command.clone()).collect();
+        let commands: Vec<PaletteCommand> = state
+            .items
+            .iter()
+            .map(|item| item.command.clone())
+            .collect();
         state.filtered = palette::filter(&commands, &query);
         state.selected = 0;
         cx.notify();
@@ -1556,7 +1562,8 @@ impl WFilesApp {
     /// 设一个搬运限速。正在跑的那一趟立刻按新的来，不用等它结束。
     fn set_speed_limit(&mut self, bytes_per_second: u64, cx: &mut Context<Self>) {
         Settings::update(cx, |settings| settings.speed_limit = bytes_per_second);
-        self.ops.update(cx, |ops, cx| ops.set_speed_limit(bytes_per_second, cx));
+        self.ops
+            .update(cx, |ops, cx| ops.set_speed_limit(bytes_per_second, cx));
         cx.notify();
     }
 
@@ -1577,8 +1584,7 @@ impl WFilesApp {
                 }
             }
             PaletteAction::Pane(command) => {
-                self.tabs[self.active]
-                    .update(cx, |pane, cx| pane.run_command(command, window, cx));
+                self.tabs[self.active].update(cx, |pane, cx| pane.run_command(command, window, cx));
             }
             PaletteAction::EditKey(command) => {
                 self.tabs[self.active]
@@ -1597,9 +1603,8 @@ impl WFilesApp {
                     // 存过又被删掉了：命令面板是打开时快照的，这一条已经过期。
                     return;
                 };
-                self.tabs[self.active].update(cx, |pane, cx| {
-                    pane.run_saved_search(&saved, window, cx)
-                });
+                self.tabs[self.active]
+                    .update(cx, |pane, cx| pane.run_saved_search(&saved, window, cx));
             }
             PaletteAction::NewTab => self.new_tab(window, cx),
             PaletteAction::CloseTab => self.close_tab(self.active, window, cx),
@@ -1733,11 +1738,7 @@ impl WFilesApp {
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     "app:diff",
-                    format!(
-                        "比较文件内容：{} ↔ {}",
-                        name_of(&left),
-                        name_of(&right)
-                    ),
+                    format!("比较文件内容：{} ↔ {}", name_of(&left), name_of(&right)),
                     "",
                     "文件",
                     "diff 比较 内容 差异 行 十六进制 hex 字节",
@@ -1809,7 +1810,11 @@ impl WFilesApp {
         items.push(PaletteItem {
             command: PaletteCommand::new(
                 "app:split",
-                if split { "取消分栏" } else { "分栏显示" },
+                if split {
+                    "取消分栏"
+                } else {
+                    "分栏显示"
+                },
                 "Cmd+Alt+D",
                 "窗口",
                 "split 双栏 分屏 两栏 pane",
@@ -1877,7 +1882,13 @@ impl WFilesApp {
         }
 
         items.push(PaletteItem {
-            command: PaletteCommand::new("app:new-tab", "新建标签页", "Cmd+T", "标签页", "tab 新开"),
+            command: PaletteCommand::new(
+                "app:new-tab",
+                "新建标签页",
+                "Cmd+T",
+                "标签页",
+                "tab 新开",
+            ),
             action: PaletteAction::NewTab,
         });
         items.push(PaletteItem {
@@ -1922,7 +1933,11 @@ impl WFilesApp {
             command: PaletteCommand::new(
                 format!("terminal:{}", terminal::AUTO),
                 "默认终端：跟随系统",
-                if current == terminal::AUTO { "当前" } else { "" },
+                if current == terminal::AUTO {
+                    "当前"
+                } else {
+                    ""
+                },
                 "终端",
                 "terminal 默认 自动 shell",
             ),
@@ -2019,9 +2034,7 @@ impl WFilesApp {
         match command {
             PaneCommand::NewFolder => ("新建文件夹", "Cmd+Shift+N", "文件", "folder 创建 目录"),
             PaneCommand::Rename => ("重命名", "F2", "文件", "rename 改名"),
-            PaneCommand::BulkRename => {
-                ("批量重命名", "Cmd+Shift+R", "文件", "batch 序号 模板")
-            }
+            PaneCommand::BulkRename => ("批量重命名", "Cmd+Shift+R", "文件", "batch 序号 模板"),
             PaneCommand::Trash => ("移到回收站", "Cmd+Backspace", "文件", "delete 删除 trash"),
             PaneCommand::Copy => ("拷贝选中项", "Cmd+C", "文件", "copy"),
             PaneCommand::Cut => ("剪切选中项", "Cmd+X", "文件", "cut 移动"),
@@ -2037,9 +2050,7 @@ impl WFilesApp {
                 "文件",
                 "terminal 终端 shell 命令行",
             ),
-            PaneCommand::QuickLook => {
-                ("快速查看", "空格", "文件", "preview 预览 quick look 查看")
-            }
+            PaneCommand::QuickLook => ("快速查看", "空格", "文件", "preview 预览 quick look 查看"),
             PaneCommand::Search => (
                 "搜索当前目录",
                 "Cmd+Shift+F",
@@ -2052,12 +2063,18 @@ impl WFilesApp {
                 "文件",
                 "mark 标记 标签 颜色 tag color 色标",
             ),
-            PaneCommand::ViewArchive => {
-                ("查看压缩包内容", "", "文件", "zip 压缩包 archive 解压 unzip 浏览")
-            }
-            PaneCommand::CreateArchive => {
-                ("打包成 Zip", "", "文件", "zip 压缩包 archive 压缩 打包 compress")
-            }
+            PaneCommand::ViewArchive => (
+                "查看压缩包内容",
+                "",
+                "文件",
+                "zip 压缩包 archive 解压 unzip 浏览",
+            ),
+            PaneCommand::CreateArchive => (
+                "打包成 Zip",
+                "",
+                "文件",
+                "zip 压缩包 archive 压缩 打包 compress",
+            ),
             PaneCommand::EditRemote => (
                 "编辑远程文件",
                 "Cmd+Alt+E",
@@ -2133,7 +2150,11 @@ impl WFilesApp {
                     .py_2()
                     .rounded(radius)
                     .cursor_pointer()
-                    .bg(if is_selected { selected_bg } else { transparent_white() })
+                    .bg(if is_selected {
+                        selected_bg
+                    } else {
+                        transparent_white()
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -2260,7 +2281,13 @@ impl WFilesApp {
             // 同理：位置容器在 items_center 的父级里，高度要写死成父级的满高。
             .h_full()
             .child(self.render_pane_slot(visible[0], cx))
-            .child(div().w(px(1.)).h_full().flex_shrink_0().bg(cx.theme().border))
+            .child(
+                div()
+                    .w(px(1.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .bg(cx.theme().border),
+            )
             .child(self.render_pane_slot(visible[1], cx))
             .into_any_element()
     }
@@ -2296,65 +2323,75 @@ impl WFilesApp {
         let border = cx.theme().border;
         let radius = cx.theme().radius;
 
-        let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
-            let path = tab.read(cx).path().to_path_buf();
-            let label = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let is_active = index == active;
+        let tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let path = tab.read(cx).path().to_path_buf();
+                let label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let is_active = index == active;
 
-            let tab = h_flex()
-                .id(("tab", index))
-                // test_support 让集成测试能按标签序号定位；aria_label 顺带给读屏软件
-                // 报出这个标签打开的是哪个文件夹。
-                .test_support()
-                .aria_label(label.clone())
-                .h(px(26.))
-                .max_w(px(180.))
-                .pl_2()
-                .pr_1()
-                .gap_1()
-                .items_center()
-                .rounded(radius)
-                .border_1()
-                .border_color(if is_active { border } else { transparent_white() })
-                .bg(if is_active { muted } else { transparent_white() })
-                .cursor_pointer()
-                .hover(|style| style.bg(muted))
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .gap_1()
-                        .items_center()
-                        .child(Icon::new(IconName::Folder).size_3())
-                        .child(div().min_w_0().truncate().text_sm().child(label)),
-                )
-                .child(
-                    div()
-                        .id(("tab-close", index))
-                        .flex_shrink_0()
-                        .size_4()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(radius)
-                        .cursor_pointer()
-                        .hover(|style| style.bg(border))
-                        .child(Icon::new(IconName::X).size_3())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.close_tab(index, window, cx)
-                        })),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.focus_tab(index, cx)
-                }));
-            // 拖到某个标签上就是放进它打开的那个目录：
-            // 双栏时也能这么把东西送到另一栏去。
-            Self::drop_target(tab, path, cx)
-        })
-        // 同上：闭包要借 `cx`，先把结果收下来再用 `cx`。
-        .collect::<Vec<_>>();
+                let tab = h_flex()
+                    .id(("tab", index))
+                    // test_support 让集成测试能按标签序号定位；aria_label 顺带给读屏软件
+                    // 报出这个标签打开的是哪个文件夹。
+                    .test_support()
+                    .aria_label(label.clone())
+                    .h(px(26.))
+                    .max_w(px(180.))
+                    .pl_2()
+                    .pr_1()
+                    .gap_1()
+                    .items_center()
+                    .rounded(radius)
+                    .border_1()
+                    .border_color(if is_active {
+                        border
+                    } else {
+                        transparent_white()
+                    })
+                    .bg(if is_active {
+                        muted
+                    } else {
+                        transparent_white()
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(muted))
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .items_center()
+                            .child(Icon::new(IconName::Folder).size_3())
+                            .child(div().min_w_0().truncate().text_sm().child(label)),
+                    )
+                    .child(
+                        div()
+                            .id(("tab-close", index))
+                            .flex_shrink_0()
+                            .size_4()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(radius)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(border))
+                            .child(Icon::new(IconName::X).size_3())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_tab(index, window, cx)
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.focus_tab(index, cx)));
+                // 拖到某个标签上就是放进它打开的那个目录：
+                // 双栏时也能这么把东西送到另一栏去。
+                Self::drop_target(tab, path, cx)
+            })
+            // 同上：闭包要借 `cx`，先把结果收下来再用 `cx`。
+            .collect::<Vec<_>>();
 
         h_flex()
             .h(px(38.))
@@ -2559,7 +2596,11 @@ impl WFilesApp {
                     Button::new("transport")
                         .ghost()
                         .small()
-                        .icon(if paused { IconName::Play } else { IconName::Pause })
+                        .icon(if paused {
+                            IconName::Play
+                        } else {
+                            IconName::Pause
+                        })
                         .tooltip(if paused { "继续" } else { "暂停" })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.ops.update(cx, |ops, cx| {
@@ -2594,9 +2635,9 @@ impl WFilesApp {
                 .small()
                 .icon(IconName::RotateCw)
                 .tooltip(label)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.ops.update(cx, |ops, cx| ops.retry(cx))
-                }))
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.ops.update(cx, |ops, cx| ops.retry(cx))),
+                )
                 .into_any_element(),
             _ => div().into_any_element(),
         };
@@ -2630,9 +2671,9 @@ impl WFilesApp {
             .when(has_undo, |button| {
                 button.label(undo_label.clone().unwrap_or_default())
             })
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.ops.update(cx, |ops, cx| ops.request_undo(cx))
-            }));
+            .on_click(
+                cx.listener(|this, _, _, cx| this.ops.update(cx, |ops, cx| ops.request_undo(cx))),
+            );
 
         h_flex()
             .h(px(34.))
@@ -2679,9 +2720,11 @@ impl WFilesApp {
                     .absolute()
                     .inset_0()
                     .bg(cx.theme().overlay)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        close(this, window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            close(this, window, cx)
+                        }),
+                    ),
             )
             .child(
                 v_flex()
@@ -2717,13 +2760,16 @@ impl WFilesApp {
             return div().into_any_element();
         };
 
-        let body = div().text_sm().child(confirm.message.clone()).into_any_element();
+        let body = div()
+            .text_sm()
+            .child(confirm.message.clone())
+            .into_any_element();
         let cancel = Button::new("confirm-cancel")
             .label("取消")
             .ghost()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.ops.update(cx, |ops, cx| ops.confirm_cancel(cx))
-            }))
+            .on_click(
+                cx.listener(|this, _, _, cx| this.ops.update(cx, |ops, cx| ops.confirm_cancel(cx))),
+            )
             .into_any_element();
         let mut ok = Button::new("confirm-ok").label(confirm.ok_label.clone());
         ok = if confirm.ok_dangerous {
@@ -2731,9 +2777,9 @@ impl WFilesApp {
         } else {
             ok.primary()
         };
-        let ok = ok.on_click(cx.listener(|this, _, _, cx| {
-            this.ops.update(cx, |ops, cx| ops.confirm_ok(cx))
-        }));
+        let ok = ok.on_click(
+            cx.listener(|this, _, _, cx| this.ops.update(cx, |ops, cx| ops.confirm_ok(cx))),
+        );
 
         Self::overlay_card(
             confirm.title,
@@ -2752,14 +2798,10 @@ impl WFilesApp {
 
         let body = v_flex()
             .gap_2()
-            .child(
-                div()
-                    .text_sm()
-                    .child(format!(
-                        "目标文件夹里已有 {} 个同名项目，冲突的项怎么处理？",
-                        conflict.collisions
-                    )),
-            )
+            .child(div().text_sm().child(format!(
+                "目标文件夹里已有 {} 个同名项目，冲突的项怎么处理？",
+                conflict.collisions
+            )))
             .child(
                 div()
                     .text_xs()
@@ -2772,16 +2814,18 @@ impl WFilesApp {
             .label("保留两者")
             .primary()
             .on_click(cx.listener(|this, _, _, cx| {
-                this.ops
-                    .update(cx, |ops, cx| ops.resolve_conflict(ConflictPolicy::KeepBoth, cx))
+                this.ops.update(cx, |ops, cx| {
+                    ops.resolve_conflict(ConflictPolicy::KeepBoth, cx)
+                })
             }))
             .into_any_element();
         let replace = Button::new("conflict-replace")
             .label("替换")
             .danger()
             .on_click(cx.listener(|this, _, _, cx| {
-                this.ops
-                    .update(cx, |ops, cx| ops.resolve_conflict(ConflictPolicy::Replace, cx))
+                this.ops.update(cx, |ops, cx| {
+                    ops.resolve_conflict(ConflictPolicy::Replace, cx)
+                })
             }))
             .into_any_element();
         let skip = Button::new("conflict-skip")
@@ -2792,13 +2836,14 @@ impl WFilesApp {
                     .update(cx, |ops, cx| ops.resolve_conflict(ConflictPolicy::Skip, cx))
             }))
             .into_any_element();
-        let cancel = Button::new("conflict-cancel")
-            .label("取消")
-            .ghost()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.ops.update(cx, |ops, cx| ops.cancel_conflict(cx))
-            }))
-            .into_any_element();
+        let cancel =
+            Button::new("conflict-cancel")
+                .label("取消")
+                .ghost()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.ops.update(cx, |ops, cx| ops.cancel_conflict(cx))
+                }))
+                .into_any_element();
 
         Self::overlay_card(
             "名称冲突".to_string(),
@@ -2862,8 +2907,7 @@ impl WFilesApp {
                     .as_ref()
                     .map(|input| input.read(cx).value().to_string())
                     .unwrap_or_default();
-                this.ops
-                    .update(cx, |ops, cx| ops.submit_prompt(value, cx))
+                this.ops.update(cx, |ops, cx| ops.submit_prompt(value, cx))
             }))
             .into_any_element();
 
@@ -2893,12 +2937,7 @@ impl WFilesApp {
             v_flex()
                 .gap_1()
                 .min_w_0()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(label),
-                )
+                .child(div().text_xs().text_color(muted).child(label))
                 .child(Input::new(input).w_full())
         };
 
@@ -2914,13 +2953,29 @@ impl WFilesApp {
         // 预览列表：旧名 -> 新名，跳过/冲突的标出来。
         let rows = bulk.previews.iter().enumerate().map(|(index, item)| {
             let status: AnyElement = if let Some(error) = &item.error {
-                div().text_xs().text_color(danger).child(error.clone()).into_any_element()
+                div()
+                    .text_xs()
+                    .text_color(danger)
+                    .child(error.clone())
+                    .into_any_element()
             } else if item.collision {
-                div().text_xs().text_color(danger).child("名称冲突").into_any_element()
+                div()
+                    .text_xs()
+                    .text_color(danger)
+                    .child("名称冲突")
+                    .into_any_element()
             } else if item.unchanged {
-                div().text_xs().text_color(muted).child("无变化").into_any_element()
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("无变化")
+                    .into_any_element()
             } else {
-                div().text_xs().text_color(muted).child("将执行").into_any_element()
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("将执行")
+                    .into_any_element()
             };
 
             h_flex()
@@ -2970,9 +3025,7 @@ impl WFilesApp {
                     .border_color(cx.theme().border)
                     .rounded(cx.theme().radius)
                     .p_2()
-                    .child(
-                        v_flex().gap_1().children(rows),
-                    ),
+                    .child(v_flex().gap_1().children(rows)),
             )
             .child(
                 div()
@@ -2992,8 +3045,7 @@ impl WFilesApp {
             .primary()
             .disabled(executable == 0)
             .on_click(cx.listener(|this, _, _, cx| {
-                this.ops
-                    .update(cx, |ops, cx| ops.apply_bulk_rename(cx))
+                this.ops.update(cx, |ops, cx| ops.apply_bulk_rename(cx))
             }))
             .into_any_element();
 
@@ -3082,41 +3134,33 @@ impl WFilesApp {
         if state.kind == RemoteKind::WebDav {
             let url = state.url.clone();
             body = body.child(
-                div()
-                    .id("connect-presets")
-                    .test_support()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().text_xs().text_color(muted).child("常用服务"))
-                            .child(
-                                Button::new("connect-preset-jianguoyun")
-                                    .label("坚果云")
-                                    .ghost()
-                                    .small()
-                                    .on_click(cx.listener(move |_, _, window, cx| {
-                                        url.update(cx, |input, cx| {
-                                            input.set_value(
-                                                "https://dav.jianguoyun.com/dav/",
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    })),
-                            ),
-                    ),
+                div().id("connect-presets").test_support().child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().text_color(muted).child("常用服务"))
+                        .child(
+                            Button::new("connect-preset-jianguoyun")
+                                .label("坚果云")
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(move |_, _, window, cx| {
+                                    url.update(cx, |input, cx| {
+                                        input.set_value(
+                                            "https://dav.jianguoyun.com/dav/",
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                })),
+                        ),
+                ),
             );
         }
-        body = body.child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(format!(
-                    "地址形如 {}。密码只进系统钥匙串，不写进配置文件。",
-                    state.kind.url_hint()
-                )),
-        );
+        body = body.child(div().text_xs().text_color(muted).child(format!(
+            "地址形如 {}。密码只进系统钥匙串，不写进配置文件。",
+            state.kind.url_hint()
+        )));
 
         if let Some(error) = &state.error {
             body = body.child(
@@ -3191,41 +3235,34 @@ impl Render for WFilesApp {
         if let Some(terminal) = self.term.clone() {
             root = root.child(terminal.into_any_element());
         }
-        root = root.child(self.render_status_bar(cx))
-            .on_action(cx.listener(|this, _: &NewTab, window, cx| {
-                this.new_tab(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
-                this.close_tab(this.active, window, cx)
-            }))
+        root = root
+            .child(self.render_status_bar(cx))
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &CloseTab, window, cx| {
+                    this.close_tab(this.active, window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)))
-            .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
-                this.toggle_palette(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
-                this.toggle_split(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &SwapPane, window, cx| {
-                this.focus_other(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSync, window, cx| {
-                this.toggle_sync(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &CopyToOther, _, cx| {
-                this.transfer_to_other(false, cx)
-            }))
-            .on_action(cx.listener(|this, _: &MoveToOther, _, cx| {
-                this.transfer_to_other(true, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
-                this.toggle_terminal(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &Compare, window, cx| {
-                this.toggle_compare(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &Diff, window, cx| {
-                this.open_diff(window, cx)
-            }));
+            .on_action(
+                cx.listener(|this, _: &TogglePalette, window, cx| this.toggle_palette(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleSplit, window, cx| this.toggle_split(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &SwapPane, window, cx| this.focus_other(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSync, window, cx| this.toggle_sync(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &CopyToOther, _, cx| this.transfer_to_other(false, cx)),
+            )
+            .on_action(cx.listener(|this, _: &MoveToOther, _, cx| this.transfer_to_other(true, cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                    this.toggle_terminal(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &Compare, window, cx| this.toggle_compare(window, cx)))
+            .on_action(cx.listener(|this, _: &Diff, window, cx| this.open_diff(window, cx)));
 
         // 比较面板自带遮罩，压在窗格上；确认框与冲突框还要在它之上，
         // 所以放在 has_overlay 那一段之前挂。
@@ -3264,9 +3301,15 @@ mod tests {
 
     #[test]
     fn the_default_name_comes_from_the_host() {
-        assert_eq!(host_of("https://dav.jianguoyun.com/dav/").as_deref(), Some("dav.jianguoyun.com"));
+        assert_eq!(
+            host_of("https://dav.jianguoyun.com/dav/").as_deref(),
+            Some("dav.jianguoyun.com")
+        );
         // 没有协议头、带端口、带查询串都得认出来。
-        assert_eq!(host_of("host.local:8080/dav").as_deref(), Some("host.local"));
+        assert_eq!(
+            host_of("host.local:8080/dav").as_deref(),
+            Some("host.local")
+        );
         assert_eq!(host_of("http://host/dav?a=b").as_deref(), Some("host"));
         // 认不出就交给调用方用兜底名字，别拿一个空串当名字。
         assert_eq!(host_of(""), None);

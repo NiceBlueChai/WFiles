@@ -56,7 +56,10 @@ mod tests {
     #[test]
     fn name_only_drops_the_directory() {
         let paths = vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")];
-        assert_eq!(clipboard_text(&paths, ClipboardText::NameOnly), "a.txt\nb.txt");
+        assert_eq!(
+            clipboard_text(&paths, ClipboardText::NameOnly),
+            "a.txt\nb.txt"
+        );
     }
 
     #[test]

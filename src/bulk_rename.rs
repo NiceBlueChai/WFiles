@@ -367,8 +367,14 @@ mod tests {
         let (renamed, failed) = apply(&previews);
         assert!(failed.is_empty());
         assert_eq!(renamed.len(), 2);
-        assert_eq!(fs::read_to_string(root.path().join("x_a.txt")).unwrap(), "aaa");
-        assert_eq!(fs::read_to_string(root.path().join("x_b.txt")).unwrap(), "bbb");
+        assert_eq!(
+            fs::read_to_string(root.path().join("x_a.txt")).unwrap(),
+            "aaa"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("x_b.txt")).unwrap(),
+            "bbb"
+        );
         assert!(!root.path().join("a.txt").exists());
     }
 

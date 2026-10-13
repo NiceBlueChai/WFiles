@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 
 /// 一次匹配要用的文件信息。搜索器负责把它填出来，匹配器只读。
 #[derive(Clone, Copy, Debug)]
-    pub struct Record<'a> {
+pub struct Record<'a> {
     /// 文件名（原文）。
     pub name: &'a str,
     /// 完整路径（原文）。
@@ -128,10 +128,12 @@ impl Moment {
     fn to_system_time(self, now: SystemTime) -> SystemTime {
         match self {
             Self::Ago(seconds) => now - Duration::from_secs(seconds),
-            Self::Epoch(seconds) => match SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)) {
-                Some(time) => time,
-                None => SystemTime::UNIX_EPOCH,
-            },
+            Self::Epoch(seconds) => {
+                match SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)) {
+                    Some(time) => time,
+                    None => SystemTime::UNIX_EPOCH,
+                }
+            }
         }
     }
 }
@@ -352,7 +354,10 @@ impl<'a> Parser<'a> {
             let before = self.rest;
             let word = self.word()?;
             self.rest = before;
-            if word.as_deref().is_some_and(|it| it.eq_ignore_ascii_case("or")) {
+            if word
+                .as_deref()
+                .is_some_and(|it| it.eq_ignore_ascii_case("or"))
+            {
                 break;
             }
             let Some(term) = self.unary()? else {
@@ -472,7 +477,11 @@ impl<'a> Parser<'a> {
                 "text" | "文本" => "text",
                 "archive" | "压缩包" => "archive",
                 "code" | "源码" => "code",
-                _ => return Err(format!("type 只认 dir/file/image/video/audio/text/archive/code，不是“{bare}”")),
+                _ => {
+                    return Err(format!(
+                        "type 只认 dir/file/image/video/audio/text/archive/code，不是“{bare}”"
+                    ));
+                }
             })),
             "size" | "s" => {
                 let (cmp, rest) = split_cmp(&bare);
@@ -560,10 +569,7 @@ fn strip_quotes(value: &str) -> String {
     let Some(first) = value.chars().next() else {
         return String::new();
     };
-    if (first == '"' || first == '\'')
-        && value.len() > first.len_utf8()
-        && value.ends_with(first)
-    {
+    if (first == '"' || first == '\'') && value.len() > first.len_utf8() && value.ends_with(first) {
         return value[first.len_utf8()..value.len() - first.len_utf8()].to_string();
     }
     value.to_string()
@@ -621,9 +627,7 @@ fn parse_moment(value: &str) -> Result<Moment, String> {
         .or_else(|| text.strip_suffix('m'))
         .or_else(|| text.strip_suffix('y'))
     {
-        let amount: u64 = digits
-            .parse()
-            .map_err(|_| format!("时间看不懂：{value}"))?;
+        let amount: u64 = digits.parse().map_err(|_| format!("时间看不懂：{value}"))?;
         let seconds = match text.chars().last().unwrap_or('d') {
             'd' => amount * 86_400,
             'w' => amount * 604_800,
@@ -641,12 +645,8 @@ fn parse_moment(value: &str) -> Result<Moment, String> {
     let (month, day) = rest
         .split_once('-')
         .ok_or_else(|| format!("时间要写成 7d 或者 2026-01-01，不是 {value}"))?;
-    let year: i32 = year
-        .parse()
-        .map_err(|_| format!("年份看不懂：{value}"))?;
-    let month: u32 = month
-        .parse()
-        .map_err(|_| format!("月份看不懂：{value}"))?;
+    let year: i32 = year.parse().map_err(|_| format!("年份看不懂：{value}"))?;
+    let month: u32 = month.parse().map_err(|_| format!("月份看不懂：{value}"))?;
     let day: u32 = day.parse().map_err(|_| format!("日期看不懂：{value}"))?;
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return Err(format!("日期不在日历上：{value}"));
@@ -660,7 +660,13 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> u64 {
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let year_of_era = year - era * 400;
     let day_of_year =
-        (153 * (if month > 2 { month as i64 - 3 } else { month as i64 + 9 }) + 2) / 5 + day as i64
+        (153 * (if month > 2 {
+            month as i64 - 3
+        } else {
+            month as i64 + 9
+        }) + 2)
+            / 5
+            + day as i64
             - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     (era * 146_097 + day_of_era - 719_468) as u64
@@ -719,7 +725,6 @@ mod tests {
         }
     }
 
-
     fn hits(query: &str, record: &Record<'_>) -> bool {
         Query::parse(query)
             .unwrap_or_else(|error| panic!("{query} 解析失败：{error}"))
@@ -774,16 +779,19 @@ mod tests {
         assert!(hits("type:dir", &dir("src")));
         assert!(!hits("type:dir", &file("src.rs")));
         assert!(hits("type:image", &file("a.PNG")));
-        assert!(hits("path:src", &Record {
-            name: "main.rs",
-            path: "/work/src/main.rs",
-            ext: "rs",
-            is_dir: false,
-            size: 1,
-            modified: None,
-            color: None,
-            tags: &[],
-        }));
+        assert!(hits(
+            "path:src",
+            &Record {
+                name: "main.rs",
+                path: "/work/src/main.rs",
+                ext: "rs",
+                is_dir: false,
+                size: 1,
+                modified: None,
+                color: None,
+                tags: &[],
+            }
+        ));
     }
 
     #[test]

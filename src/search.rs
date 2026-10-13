@@ -14,8 +14,8 @@ use crate::query::{Query, Record};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 /// 一次搜索最多收多少条。
@@ -74,11 +74,11 @@ pub const SKIP_DIRS: &[&str] = &[
 /// 读进来发现是二进制（见 [`Text::read`]）再丢掉——宁可多读一个，别漏掉
 /// `.conf` `.gitignore` 这种没有扩展名的文本。
 const BINARY_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "avif", "ico", "psd",
-    "mp4", "mov", "mkv", "avi", "webm", "m4v", "flv", "wmv", "mpg", "mpeg", "mp3", "wav", "flac",
-    "aac", "m4a", "ogg", "opus", "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "iso",
-    "dmg", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "exe", "dll", "so", "dylib", "o",
-    "a", "class", "jar", "wasm", "db", "sqlite", "sqlite3", "ttf", "otf", "woff", "woff2", "eot",
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "avif", "ico", "psd", "mp4",
+    "mov", "mkv", "avi", "webm", "m4v", "flv", "wmv", "mpg", "mpeg", "mp3", "wav", "flac", "aac",
+    "m4a", "ogg", "opus", "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "iso", "dmg", "pdf",
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "exe", "dll", "so", "dylib", "o", "a", "class",
+    "jar", "wasm", "db", "sqlite", "sqlite3", "ttf", "otf", "woff", "woff2", "eot",
 ];
 
 /// 一条命中。
@@ -214,15 +214,12 @@ impl Search {
                 let size = metadata.as_ref().map_or(0, |it| it.len());
                 let modified = metadata.as_ref().and_then(|it| it.modified().ok());
 
-                let text = if is_dir
-                    || !needs_content
-                    || binary_ext(&ext)
-                    || size > MAX_CONTENT_BYTES
-                {
-                    None
-                } else {
-                    Text::read(&path)
-                };
+                let text =
+                    if is_dir || !needs_content || binary_ext(&ext) || size > MAX_CONTENT_BYTES {
+                        None
+                    } else {
+                        Text::read(&path)
+                    };
 
                 let item = Item {
                     path: &path,
@@ -345,7 +342,6 @@ impl Cancel {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
-
 }
 
 impl Drop for Cancel {
@@ -434,7 +430,10 @@ mod tests {
         write(root.path().join("notes.txt"), "hello world\nsecond line\n");
         write(root.path().join("photo.png"), "hello in a binary-ish file");
         fs::create_dir_all(root.path().join("node_modules/pkg")).expect("建目录");
-        write(root.path().join("node_modules/pkg/index.js"), "hello from a dep");
+        write(
+            root.path().join("node_modules/pkg/index.js"),
+            "hello from a dep",
+        );
         root
     }
 
@@ -475,7 +474,9 @@ mod tests {
     fn noisy_directories_are_skipped() {
         let root = tree();
         assert!(
-            found(root.path(), "hello").iter().all(|hit| hit.name == "notes.txt"),
+            found(root.path(), "hello")
+                .iter()
+                .all(|hit| hit.name == "notes.txt"),
             "node_modules 里的东西不该出现"
         );
     }
@@ -537,7 +538,9 @@ mod tests {
     fn known_binary_extensions_are_not_read() {
         let root = tree();
         assert!(
-            found(root.path(), "content:hello").iter().all(|hit| hit.name == "notes.txt"),
+            found(root.path(), "content:hello")
+                .iter()
+                .all(|hit| hit.name == "notes.txt"),
             "png 里就算有 hello 也不该被当成文本读"
         );
     }
@@ -548,8 +551,11 @@ mod tests {
         for index in 0..20 {
             write(root.path().join(format!("file{index}.txt")), "");
         }
-        let search =
-            Search::new(root.path().to_path_buf(), Query::parse("*.txt").expect("解析")).with_limit(3);
+        let search = Search::new(
+            root.path().to_path_buf(),
+            Query::parse("*.txt").expect("解析"),
+        )
+        .with_limit(3);
         let mut hits = Vec::new();
         let stats = search.walk(&AtomicBool::new(false), &mut |hit| hits.push(hit));
         assert_eq!(hits.len(), 3);
@@ -563,7 +569,10 @@ mod tests {
             write(root.path().join(format!("file{index}.txt")), "");
         }
         let cancel = AtomicBool::new(false);
-        let search = Search::new(root.path().to_path_buf(), Query::parse("*.txt").expect("解析"));
+        let search = Search::new(
+            root.path().to_path_buf(),
+            Query::parse("*.txt").expect("解析"),
+        );
         let mut hits = Vec::new();
         let stats = search.walk(&cancel, &mut |hit| {
             hits.push(hit);

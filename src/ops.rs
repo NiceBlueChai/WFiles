@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{self, Write, Read as _},
+    io::{self, Read as _, Seek as _, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -16,6 +16,7 @@ use std::{
 };
 
 use crate::remote::{self, Client};
+use crate::resume;
 
 /// 目标已存在时的处理方式。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -269,11 +270,7 @@ pub fn restore_from_trash(original: &Path, trashed_at: SystemTime) -> Result<(),
     #[cfg(not(any(
         target_os = "windows",
         target_os = "macos",
-        all(
-            unix,
-            not(target_os = "ios"),
-            not(target_os = "android")
-        )
+        all(unix, not(target_os = "ios"), not(target_os = "android"))
     )))]
     {
         let _ = (original, trashed_at);
@@ -308,19 +305,23 @@ fn restore_from_trash_dir(
             continue;
         }
 
-        let Ok(metadata) = entry.metadata() else { continue };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         // 移入回收站会刷新 inode 的 ctime；早于删除时刻的是更早删的，不动。
         if metadata.ctime() < cutoff_seconds(cutoff) {
             continue;
         }
-        if best.as_ref().is_none_or(|(seen, _)| metadata.ctime() > *seen) {
+        if best
+            .as_ref()
+            .is_none_or(|(seen, _)| metadata.ctime() > *seen)
+        {
             best = Some((metadata.ctime(), entry.path()));
         }
     }
 
-    let (_, candidate) = best.ok_or_else(|| {
-        "回收站里找不到这次删掉的项，请手动打开回收站放回".to_string()
-    })?;
+    let (_, candidate) =
+        best.ok_or_else(|| "回收站里找不到这次删掉的项，请手动打开回收站放回".to_string())?;
 
     if original.exists() {
         return Err("原位置已经有同名项目，先移走它再撤销".to_string());
@@ -386,6 +387,10 @@ fn copy_entry(source: &Path, dest: &Path, report: &mut dyn FnMut(u64) -> bool) -
 /// 代价是放弃了 macOS APFS 上 clonefile 那种"瞬间复制"的优化——
 /// 一个能暂停、能显示剩余时间的操作中心比这个优化值钱：
 /// 用户暂停之后等三分钟才真的停下来，等于没有暂停。
+///
+/// 也**不往目标上直接写**：先写状态目录底下的暂存文件，成了才落成目标。
+/// 这样中止一个 40 GB 的拷贝，目标目录里不会多一个看着像传好了的半截货，
+/// 而半截数据还留在暂存处——下一次同样的 (源, 目标) 会接着传（见 `resume`）。
 fn copy_file(source: &Path, target: &Path, report: &mut dyn FnMut(u64) -> bool) -> io::Result<()> {
     // 拷到自己身上会把源文件先截断成 0 字节——`fs::copy` 内置了这个检查，
     // 手写拷贝必须自己补上。
@@ -396,34 +401,173 @@ fn copy_file(source: &Path, target: &Path, report: &mut dyn FnMut(u64) -> bool) 
         ));
     }
 
-    let mut reader = fs::File::open(source)?;
-    let mut writer = fs::File::create(target)?;
-    let mut buffer = vec![0u8; COPY_CHUNK];
+    let journal = resume::journal();
+    let key = resume::key(&show(source), &show(target));
+    // 从这一刻起（暂存文件建出来之前）就把这一对占住，
+    // 免得并发的另一趟搬运顺手 sweep() 把正在写的半截数据当垃圾删掉。
+    let _hold = journal.hold(&key);
+    let metadata = fs::metadata(source)?;
+    let total = metadata.len();
+    let modified = modified_of(&metadata);
+    // 上一次传到哪儿了。源对不上（大小或时间变了）这本账就作废，
+    // 老老实实从头传——接着一个已经变了的文件传，得到的是个四不像。
+    let mut done = match journal.load(&key) {
+        Some(record) if record.fresh(total, modified) => record.done,
+        _ => {
+            journal.clear(&key);
+            0
+        }
+    };
 
+    let staging = journal.staging(&key);
+    if let Some(parent) = staging.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // 暂存文件可能被清掉过（系统清临时目录、用户手动清）：磁盘上没那么多
+    // 字节就别逞强，从实际有的地方接。
+    let on_disk = fs::metadata(&staging).map(|it| it.len()).unwrap_or(0);
+    if on_disk < done {
+        done = on_disk;
+        if done == 0 {
+            journal.clear(&key);
+        }
+    }
+
+    let mut reader = fs::File::open(source)?;
+    // **不开 `truncate`**：一截就回到 0，续传直接失效。
+    // 要多长由下面那句 `set_len(done)` 说了算。
+    #[allow(clippy::suspicious_open_options)]
+    let mut writer = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&staging)?;
+    // 不管原来有多长，就认前 `done` 个字节：多出来的当垃圾截掉，
+    // 然后**读写都从断点起**。少任何一半都会出事——
+    // 只 seek 读不 seek 写，接出来的文件是错位的；
+    // 不截断，暂存文件会一直带着上次的尾巴长大。
+    writer.set_len(done)?;
+    if done > 0 {
+        reader.seek(io::SeekFrom::Start(done))?;
+        writer.seek(io::SeekFrom::Start(done))?;
+    }
+
+    // 先把已经传好的那部分报上去：进度条从 45% 开始，
+    // 而不是从 0 猛跳到 45%（那看起来像卡了一下）。
+    if done > 0 && !report(done) {
+        journal.save(
+            &key,
+            &resume::Record {
+                source: show(source),
+                size: total,
+                modified,
+                done,
+            },
+        );
+        journal.sweep();
+        return Err(aborted());
+    }
+
+    let result = pump(&mut reader, &mut writer, &mut done, report);
+    writer.flush().ok();
+    // 先放手：Windows 上握着打开的文件，改名/删除都会失败。
+    drop(writer);
+
+    match result {
+        Ok(()) => {
+            // 暂存文件还在就改名落成目标；已经叫别人清掉了（系统清临时目录，
+            // 或者哪个测试把自己的状态目录连窝端了）就换个法子把内容补上。
+            land(&staging, target, || {
+                fs::copy(source, target)
+                    .map(|_| ())
+                    .map_err(|error| io::Error::other(format!("落不了盘：{error}")))
+            })?;
+            // `fs::copy` 会带上权限位，手写拷贝必须自己补：
+            // 否则拷出来的脚本和程序会丢掉执行权限。
+            if let Ok(metadata) = fs::metadata(source) {
+                fs::set_permissions(target, metadata.permissions()).ok();
+            }
+            journal.clear(&key);
+            Ok(())
+        }
+        Err(error) => {
+            // 只把进度记下来：暂存文件留着，目标上一个字节都没碰。
+            // 下一次同样的 (源, 目标) 会从 `done` 接着来。
+            journal.save(
+                &key,
+                &resume::Record {
+                    source: show(source),
+                    size: total,
+                    modified,
+                    done,
+                },
+            );
+            // 暂存变大了：顺手扫一遍，别让它悄悄把磁盘吃干。
+            journal.sweep();
+            Err(error)
+        }
+    }
+}
+
+/// 读一块、写一块、报一块。`done` 是已经落盘的字节数，跟着一起往前走，
+/// 好让调用方知道该把断点记在哪儿。
+fn pump(
+    reader: &mut fs::File,
+    writer: &mut fs::File,
+    done: &mut u64,
+    report: &mut dyn FnMut(u64) -> bool,
+) -> io::Result<()> {
+    let mut buffer = vec![0u8; COPY_CHUNK];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
-            break;
+            return Ok(());
         }
         writer.write_all(&buffer[..read])?;
+        *done += read as u64;
         if !report(read as u64) {
             // 只删这一个没拷完的文件，由**这一层**负责：
             // 拷文件夹时兄弟们已经拷好了，在外面删会把整棵子树连坐删掉——
-            // 中止一个拷到 90% 的文件夹，用户至少该留着前 90%。
-            drop(writer);
-            remove_entry(target).ok();
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "已中止"));
+            // 现在更简单了：半截的在暂存处，目标里本来就没有它。
+            return Err(aborted());
         }
     }
-    writer.flush()?;
-    drop(writer);
+}
 
-    // `fs::copy` 会带上权限位，手写拷贝必须自己补：
-    // 否则拷出来的脚本和程序会丢掉执行权限。
-    if let Ok(metadata) = fs::metadata(source) {
-        fs::set_permissions(target, metadata.permissions()).ok();
-    }
-    Ok(())
+/// 路径转成字符串，只为存进续传账本（给人看、也给同一个键用）。
+fn show(path: &Path) -> String {
+    path.display().to_string()
+}
+
+/// 用户按了中止时抛出的错误。
+///
+/// **为什么不能用 `ErrorKind::Interrupted`**：那个种类的含义是"被信号
+/// 打断，重试一次就好"，于是 `write_all` / `read_exact` / `io::copy`
+/// 都会把它当成该重试的错误——中止一个下载会变成无限重试，
+/// 一直写到磁盘满才停下（实测写掉了 28 GB）。
+/// 换成一个不触发重试的种类，再靠文案认出它。
+fn aborted() -> io::Error {
+    io::Error::other("已中止")
+}
+
+/// 这个错误是不是"用户中止了"。
+fn is_aborted(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Other && error.to_string() == "已中止"
+}
+
+/// 修改时间（Unix 秒）。取不到就没有——续传账本拿它当"源没变过"的证据之一。
+/// 修改时间（Unix 纳秒）。取不到就没有——续传账本拿它当"源没变过"的证据之一。
+///
+/// **为什么精确到纳秒而不是秒**：秒级精度下，"拷到一半停下来、同一秒内
+/// 又改了源文件、再接着传"这种情形会被判成"源没变过"，于是接着旧断点
+/// 往下拼，得到一个前半截是旧内容、后半截是新内容的四不像。
+/// APFS / ext4 / NTFS 都能给出亚秒精度；碰到只有秒级的文件系统
+/// （老 HFS+、FAT），精度自然退化，不会比现在更糟。
+fn modified_of(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|it| it.as_nanos() as u64)
 }
 
 /// 递归删除，目录用完了才能这么干；调用方需确认过。
@@ -601,7 +745,11 @@ pub fn remote_exists(client: &dyn remote::Remote, target: &Path) -> bool {
 ///
 /// 本地那一支走 [`resolve_conflict`]（靠文件系统判"有没有"），
 /// 远程这一支改成问服务器，并且"保留两者"的候选名也得由服务器确认没人用。
-fn resolve_target(target: &Path, policy: ConflictPolicy, client: Option<&dyn remote::Remote>) -> Option<PathBuf> {
+fn resolve_target(
+    target: &Path,
+    policy: ConflictPolicy,
+    client: Option<&dyn remote::Remote>,
+) -> Option<PathBuf> {
     let Some(client) = client else {
         return resolve_conflict(target, policy);
     };
@@ -658,9 +806,9 @@ fn transfer_one(
             let sub = sub_of(source)?;
             download_entry(client, &sub, target, report)?;
             if remove_source {
-                client
-                    .remove(&sub)
-                    .map_err(|error| TransferError::Failed(format!("已下载但删除远程源失败：{error}")))?;
+                client.remove(&sub).map_err(|error| {
+                    TransferError::Failed(format!("已下载但删除远程源失败：{error}"))
+                })?;
             }
             Ok(())
         }
@@ -703,10 +851,11 @@ fn local_to_local(
         }
     }
 
-    // 没拷完的那一个已经由 `copy_file` 自己删掉了，这里不能再删 `target`：
-    // 拷目录时 `target` 是整棵子树，里面有已经拷好的东西。
+    // 拷到一半停下时，没拷完的那一个留在续传暂存处，目标里本来就没有它，
+    // 所以这里不用、也不能删 `target`：拷目录时 `target` 是整棵子树，
+    // 里面有已经拷好的东西。
     copy_entry(source, target, report).map_err(|error| {
-        if error.kind() == io::ErrorKind::Interrupted {
+        if is_aborted(&error) {
             TransferError::Aborted
         } else {
             TransferError::Failed(format!("拷贝失败：{error}"))
@@ -714,9 +863,8 @@ fn local_to_local(
     })?;
 
     if remove_source {
-        remove_entry(source).map_err(|error| {
-            TransferError::Failed(format!("已拷贝但删除源文件失败：{error}"))
-        })?;
+        remove_entry(source)
+            .map_err(|error| TransferError::Failed(format!("已拷贝但删除源文件失败：{error}")))?;
     }
     Ok(())
 }
@@ -736,35 +884,151 @@ fn download_entry(
     if info.is_dir {
         fs::create_dir_all(target)
             .map_err(|error| TransferError::Failed(format!("建不了本地目录：{error}")))?;
-        let children = client
-            .list(sub)
-            .map_err(TransferError::Failed)?;
+        let children = client.list(sub).map_err(TransferError::Failed)?;
         for child in children {
             download_entry(client, &child.path, &target.join(&child.name), report)?;
         }
         return Ok(());
     }
 
-    let mut file = fs::File::create(target)
+    // 下载也走暂存 + 续传：远程断了线，下一次从服务器上半路接着要，
+    // 而用户的目录里始终只有完整的文件。
+    let journal = resume::journal();
+    let key = resume::key(&remote_source(client, sub), &show(target));
+    // 同上：占住，别让并发的清扫动正在下载的这一块。
+    let _hold = journal.hold(&key);
+    let can_resume = client.resumes_download();
+    let mut done = match journal.load(&key) {
+        Some(record) if can_resume && record.fresh(info.size, info.modified) => record.done,
+        _ => {
+            journal.clear(&key);
+            0
+        }
+    };
+    let staging = journal.staging(&key);
+    if let Some(parent) = staging.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| TransferError::Failed(format!("建不了暂存目录：{error}")))?;
+    }
+    // 暂存文件被动过（系统清临时目录、磁盘满写坏了）：以磁盘上实际有的为准。
+    let on_disk = fs::metadata(&staging).map(|it| it.len()).unwrap_or(0);
+    if on_disk < done {
+        done = on_disk;
+        if done == 0 {
+            journal.clear(&key);
+        }
+    }
+
+    // 同上：不开 `truncate`，长度由紧接着的 `set_len(done)` 定。
+    #[allow(clippy::suspicious_open_options)]
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&staging)
         .map_err(|error| TransferError::Failed(format!("写不了本地文件：{error}")))?;
+    // 同上：只认前 `done` 个字节，读写都从断点起。
+    file.set_len(done)
+        .map_err(|error| TransferError::Failed(format!("写不了本地文件：{error}")))?;
+    if done > 0 {
+        file.seek(io::SeekFrom::Start(done))
+            .map_err(|error| TransferError::Failed(format!("写不了本地文件：{error}")))?;
+    }
+
+    // 续上的那部分先报一次，进度条从半路开始。
+    if done > 0 && !report(done) {
+        drop(file);
+        note_download(&journal, &key, client, sub, &info, done);
+        journal.sweep();
+        return Err(TransferError::Aborted);
+    }
+
     let result = {
         let mut sink = Reporting {
             inner: &mut file,
             report,
         };
-        client.download(sub, &mut sink)
-    };
-    // 中止时那半个文件交给这一层删：拷目录时兄弟们已经下好了，
-    // 在外面删会把整棵子树连坐删掉。先关掉句柄——Windows 上开着的文件删不掉。
-    if let Err(error) = result {
-        drop(file);
-        remove_entry(target).ok();
-        if error.contains("已中止") {
-            return Err(TransferError::Aborted);
+        if done > 0 {
+            client.download_from(sub, done, &mut sink)
+        } else {
+            client.download(sub, &mut sink)
         }
-        return Err(TransferError::Failed(error));
+    };
+    // 先关掉句柄：Windows 上开着的文件动不了。
+    drop(file);
+    match result {
+        Ok(_) => {
+            land(&staging, target, || {
+                // 暂存叫清了：重新下一趟，直接落到目标上。
+                // 不报进度——这些字节前面已经报过了，再报一遍进度条会跑过 100%。
+                let mut file = fs::File::create(target)
+                    .map_err(|error| io::Error::other(format!("写不了本地文件：{error}")))?;
+                client
+                    .download(sub, &mut file)
+                    .map_err(|error| io::Error::other(format!("下载失败：{error}")))?;
+                Ok(())
+            })
+            .map_err(|error| TransferError::Failed(error.to_string()))?;
+            journal.clear(&key);
+            Ok(())
+        }
+        Err(error) => {
+            // 半截数据留着：这是下一次的起点。目标里一个字节都没有，
+            // 所以"失败"之后用户的目录是干净的，只是还没拿到文件。
+            let done = fs::metadata(&staging).map(|it| it.len()).unwrap_or(done);
+            note_download(&journal, &key, client, sub, &info, done);
+            journal.sweep();
+            if error.contains("已中止") {
+                Err(TransferError::Aborted)
+            } else {
+                Err(TransferError::Failed(error))
+            }
+        }
     }
-    Ok(())
+}
+
+/// 下载的续传账本怎么记：`done` 以暂存文件实际有多长为准。
+fn note_download(
+    journal: &resume::Journal,
+    key: &str,
+    client: &dyn remote::Remote,
+    sub: &str,
+    info: &remote::Entry,
+    done: u64,
+) {
+    journal.save(
+        key,
+        &resume::Record {
+            source: remote_source(client, sub),
+            size: info.size,
+            modified: info.modified,
+            done,
+        },
+    );
+}
+
+/// 远程那一项在账本里的名字。
+///
+/// 带 `remote://` 前缀是为了跟本地路径分得开：本地路径也可能叫 `dav/x.txt`，
+/// 而两本账撞键的后果是"接着一个完全不相干的目标传"。
+fn remote_source(client: &dyn remote::Remote, sub: &str) -> String {
+    format!("remote://{}/{}", client.id(), sub)
+}
+
+/// 把暂存文件落成目标；暂存已经不见了就换个法子把内容补上。
+///
+/// `fallback` 是"没有暂存文件时怎么把内容搬过去"：本地拷贝是整个重拷一遍，
+/// 远程下载是重新下一趟。两条路都**不报进度**——这些字节前面已经报过了，
+/// 再报一遍进度条就会跑过 100%。
+fn land(
+    staging: &Path,
+    target: &Path,
+    fallback: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if staging.exists() {
+        resume::finish(staging, target).map_err(io::Error::other)
+    } else {
+        fallback()
+    }
 }
 
 /// 把本地一项（文件或整棵子树）上传到远程 `sub`。
@@ -781,9 +1045,7 @@ fn upload_entry(
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| TransferError::Failed(format!("读不了源文件：{error}")))?;
     if metadata.is_dir() {
-        client
-            .mkdir(sub)
-            .map_err(TransferError::Failed)?;
+        client.mkdir(sub).map_err(TransferError::Failed)?;
         let children = fs::read_dir(source)
             .map_err(|error| TransferError::Failed(format!("列不了本地目录：{error}")))?;
         for child in children {
@@ -806,31 +1068,110 @@ fn upload_entry(
     }
 
     let length = metadata.len();
+    let modified = modified_of(&metadata);
+    let journal = resume::journal();
+    let key = resume::key(&show(source), &remote_source(client, sub));
+    // 上传一样要占住：这一趟也会写账本、也会 sweep()，
+    // 顺手把并发那趟正在写的暂存清掉就白干了。
+    let _hold = journal.hold(&key);
+    let can_resume = client.resumes_upload();
+
+    // 上传的断点在**服务器上**，所以得多问一句：服务器那份现在有多长？
+    // 问不出来、或者长度对不上（上一回是别的原因断的、中间有人动过），
+    // 这本账就不能用——接着一个说不清长度的文件往后写太危险。
+    let mut done = 0u64;
+    if can_resume {
+        if let Some(record) = journal.load(&key)
+            && record.fresh(length, modified)
+            && let Ok(Some(there)) = client.stat(sub)
+            && there.size == record.done
+            && record.done < length
+        {
+            done = record.done;
+        }
+        if done == 0 {
+            journal.clear(&key);
+        }
+    }
+
     let file = fs::File::open(source)
         .map_err(|error| TransferError::Failed(format!("读不了源文件：{error}")))?;
-    let mut reader = Reporting { inner: file, report };
-    let result = client.upload(sub, &mut reader, length);
-    if let Err(error) = result {
-        // 上传失败时服务器上多半留着半个文件：它由这一层负责清掉，
-        // 免得"失败"之后目标目录里多一个看起来传好了的残骸。
-        client.remove(sub).ok();
-        if error.contains("已中止") {
+    let mut file = file;
+    if done > 0 {
+        file.seek(io::SeekFrom::Start(done))
+            .map_err(|error| TransferError::Failed(format!("读不了源文件：{error}")))?;
+        // 已经传上去的那部分先报一次，进度条从半路开始。
+        if !report(done) {
             return Err(TransferError::Aborted);
         }
+    }
+    // 数一数这一趟实际交出去多少字节：断点要按这个记，
+    // 不能按源文件的总长度（那会把没传的也算成传了）。
+    let mut counting = Counting {
+        inner: file,
+        sent: 0,
+    };
+    let result = {
+        let mut reader = Reporting {
+            inner: &mut counting,
+            report,
+        };
+        if done > 0 {
+            client.upload_from(sub, &mut reader, length, done)
+        } else {
+            client.upload(sub, &mut reader, length)
+        }
+    };
+    let sent = done + counting.sent;
+    if let Err(error) = result {
+        if error.contains("已中止") {
+            // 用户叫停：服务器上那一段是资产，留着，下次接着传。
+            journal.save(
+                &key,
+                &resume::Record {
+                    source: show(source),
+                    size: length,
+                    modified,
+                    done: sent,
+                },
+            );
+            journal.sweep();
+            return Err(TransferError::Aborted);
+        }
+        // 真失败：把服务器上的残骸清掉。续传账本是给"我主动停一下"用的，
+        // 一趟莫名失败的传输，它的断点说不清可不可信，从头传更稳妥。
+        client.remove(sub).ok();
+        journal.clear(&key);
         return Err(TransferError::Failed(error));
     }
+    journal.clear(&key);
     if remove_source {
-        remove_entry(source).map_err(|error| {
-            TransferError::Failed(format!("已上传但删除本地源失败：{error}"))
-        })?;
+        remove_entry(source)
+            .map_err(|error| TransferError::Failed(format!("已上传但删除本地源失败：{error}")))?;
     }
     Ok(())
 }
 
+/// 数一遭读过去多少字节：上传的断点只能这么记——
+/// 服务器不会告诉客户端"你刚才传到我这儿了多少"。
+struct Counting<R> {
+    inner: R,
+    sent: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for Counting<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.sent += read as u64;
+        Ok(read)
+    }
+}
+
 /// 边读边报字节数（上传用）/ 边写边报（下载用）的那一层包装。
 ///
-/// 返回 false 就是用户按了中止：这里把它变成一个 `Interrupted` 的 IO 错误，
+/// 返回 false 就是用户按了中止：这里把它变成一个 [`aborted`] 的 IO 错误，
 /// 顺着 `io::copy` / `ureq` 的读冒泡出去，调用方据此收尾。
+/// 错误种类必须是"不会触发重试"的那种——理由见 [`aborted`]。
 struct Reporting<'a, R> {
     inner: R,
     report: &'a mut dyn FnMut(u64) -> bool,
@@ -840,7 +1181,7 @@ impl<R: std::io::Read> std::io::Read for Reporting<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read(buffer)?;
         if read > 0 && !(self.report)(read as u64) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "已中止"));
+            return Err(aborted());
         }
         Ok(read)
     }
@@ -850,7 +1191,7 @@ impl<R: Write> Write for Reporting<'_, R> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let written = self.inner.write(buffer)?;
         if written > 0 && !(self.report)(written as u64) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "已中止"));
+            return Err(aborted());
         }
         Ok(written)
     }
@@ -893,7 +1234,10 @@ fn bytes_remote(client: &dyn remote::Remote, sub: &str) -> u64 {
     let Ok(children) = client.list(sub) else {
         return 0;
     };
-    children.iter().map(|child| bytes_remote(client, &child.path)).sum()
+    children
+        .iter()
+        .map(|child| bytes_remote(client, &child.path))
+        .sum()
 }
 
 fn bytes_local(path: &Path) -> u64 {
@@ -913,7 +1257,9 @@ fn bytes_local(path: &Path) -> u64 {
     // 文件跟着链接走：真要拷的是链接指向的内容，
     // 链接自己那几十个字节（目标路径的长度）不是我们要搬的量。
     // 失效链接在这里取不到元数据，按 0 算。
-    fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0)
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
 fn count_one(path: &Path, client: Option<&dyn remote::Remote>) -> usize {
@@ -974,7 +1320,9 @@ pub enum HistoryEntry {
     /// 批量重命名：撤销就是按记录全部改回去。
     BulkRenamed { moves: Vec<(PathBuf, PathBuf)> },
     /// 移进回收站：撤销就是从回收站放回原处。
-    Trashed { originals: Vec<(PathBuf, SystemTime)> },
+    Trashed {
+        originals: Vec<(PathBuf, SystemTime)>,
+    },
 }
 
 impl HistoryEntry {
@@ -992,9 +1340,7 @@ impl HistoryEntry {
                 .iter()
                 .flat_map(|(from, to)| [from.clone(), to.clone()])
                 .collect(),
-            Self::Trashed { originals } => {
-                originals.iter().map(|(path, _)| path.clone()).collect()
-            }
+            Self::Trashed { originals } => originals.iter().map(|(path, _)| path.clone()).collect(),
         }
     }
 
@@ -1028,9 +1374,7 @@ impl HistoryEntry {
     /// 只涉及本地路径时它是空的，行为跟以前一样。
     pub fn undo(&self, clients: &HashMap<String, Client>) -> Result<(), String> {
         match self {
-            Self::Created { path } => {
-                remove_any(path, clients)
-            }
+            Self::Created { path } => remove_any(path, clients),
             Self::Renamed { from, to } => {
                 if exists_any(to, clients) != Some(true) {
                     return Err("原文件已经不在改名后的位置了".to_string());
@@ -1056,10 +1400,7 @@ impl HistoryEntry {
                 // 逆序改回去，避免序号类改名互相踩。
                 for (from, to) in moves.iter().rev() {
                     if !to.exists() {
-                        return Err(format!(
-                            "“{}”已经不在改名后的位置了",
-                            display_name(to)
-                        ));
+                        return Err(format!("“{}”已经不在改名后的位置了", display_name(to)));
                     }
                     fs::rename(to, from).map_err(|error| error.to_string())?;
                 }
@@ -1090,8 +1431,7 @@ fn exists_any(path: &Path, clients: &HashMap<String, Client>) -> Option<bool> {
 /// 本地或远程，删掉这一项。
 fn remove_any(path: &Path, clients: &HashMap<String, Client>) -> Result<(), String> {
     let Some((id, sub)) = remote::parse_location(path) else {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|_| "这一项已经不存在了".to_string())?;
+        let metadata = fs::symlink_metadata(path).map_err(|_| "这一项已经不存在了".to_string())?;
         if metadata.is_dir() {
             let empty = fs::read_dir(path)
                 .map(|mut entries| entries.next().is_none())
@@ -1114,8 +1454,12 @@ fn move_back(from: &Path, to: &Path, clients: &HashMap<String, Client>) -> Resul
     let to_remote = remote::parse_location(to);
     // 先按“两边各是什么位置”取好客户端，后面哪个分支用得上就用。
     let sides = RemoteSides {
-        source: to_remote.as_ref().and_then(|(id, _)| clients.get(id).cloned()),
-        dest: from_remote.as_ref().and_then(|(id, _)| clients.get(id).cloned()),
+        source: to_remote
+            .as_ref()
+            .and_then(|(id, _)| clients.get(id).cloned()),
+        dest: from_remote
+            .as_ref()
+            .and_then(|(id, _)| clients.get(id).cloned()),
     };
     match (from_remote, to_remote) {
         (None, None) => {
@@ -1327,7 +1671,10 @@ mod tests {
             resolve_conflict(&target, ConflictPolicy::KeepBoth),
             Some(root.path().join("a 2.txt"))
         );
-        assert_eq!(resolve_conflict(&target, ConflictPolicy::Replace), Some(target.clone()));
+        assert_eq!(
+            resolve_conflict(&target, ConflictPolicy::Replace),
+            Some(target.clone())
+        );
         assert_eq!(resolve_conflict(&target, ConflictPolicy::Skip), None);
     }
 
@@ -1801,7 +2148,11 @@ mod tests {
         let worker = ui.clone();
 
         worker.pause();
-        assert_eq!(ui.state(), ControlState::Paused, "工作线程那一份改了，UI 这边要看得见");
+        assert_eq!(
+            ui.state(),
+            ControlState::Paused,
+            "工作线程那一份改了，UI 这边要看得见"
+        );
 
         ui.abort();
         assert!(!worker.should_continue());
@@ -1937,7 +2288,9 @@ mod tests {
         assert_eq!(outcome.done, 0);
         let copied = dest.join("src");
         assert_eq!(
-            fs::metadata(copied.join("f0.bin")).expect("第一个该完整留着").len(),
+            fs::metadata(copied.join("f0.bin"))
+                .expect("第一个该完整留着")
+                .len(),
             3 * 1024 * 1024,
         );
         assert!(
@@ -1968,13 +2321,18 @@ mod tests {
         let folder = create_folder_named(root.path(), "未命名文件夹").unwrap();
 
         let mut history = History::default();
-        history.push(HistoryEntry::Created { path: folder.clone() });
+        history.push(HistoryEntry::Created {
+            path: folder.clone(),
+        });
         assert_eq!(
             history.last_describe(),
             Some("新建“未命名文件夹”".to_string())
         );
 
-        assert_eq!(history.pop_undo(&HashMap::new()).unwrap(), "新建“未命名文件夹”");
+        assert_eq!(
+            history.pop_undo(&HashMap::new()).unwrap(),
+            "新建“未命名文件夹”"
+        );
         assert!(!folder.exists());
         assert!(history.is_empty());
     }
@@ -1986,13 +2344,12 @@ mod tests {
         fs::write(folder.join("later.txt"), "x").unwrap();
 
         let mut history = History::default();
-        history.push(HistoryEntry::Created { path: folder.clone() });
+        history.push(HistoryEntry::Created {
+            path: folder.clone(),
+        });
 
         assert!(history.pop_undo(&HashMap::new()).is_err());
-        assert!(
-            history.last_describe().is_some(),
-            "撤不动要留在栈里"
-        );
+        assert!(history.last_describe().is_some(), "撤不动要留在栈里");
         assert!(folder.exists());
     }
 
@@ -2054,7 +2411,13 @@ mod tests {
         let dest = root.path().join("dest");
         fs::create_dir(&dest).unwrap();
         let sources = vec![src.join("a.txt"), src.join("b.txt")];
-        let outcome = move_entries(&sources, &dest, ConflictPolicy::KeepBoth, &RemoteSides::default(), &mut |_| true);
+        let outcome = move_entries(
+            &sources,
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
+            &mut |_| true,
+        );
         assert_eq!(outcome.done, 2);
 
         // 撤销记录按“源 -> 目标”成对记住，放回时反着来。
@@ -2087,10 +2450,17 @@ mod tests {
         let moves: Vec<(PathBuf, PathBuf)> = paths
             .iter()
             .enumerate()
-            .map(|(index, path)| (path.clone(), root.path().join(format!("IMG_{}.txt", index + 1))))
+            .map(|(index, path)| {
+                (
+                    path.clone(),
+                    root.path().join(format!("IMG_{}.txt", index + 1)),
+                )
+            })
             .collect();
         let mut history = History::default();
-        history.push(HistoryEntry::BulkRenamed { moves: moves.clone() });
+        history.push(HistoryEntry::BulkRenamed {
+            moves: moves.clone(),
+        });
 
         for (from, to) in &moves {
             fs::rename(from, to).unwrap();
@@ -2136,12 +2506,16 @@ mod tests {
         let renamed = rename(&folder, "改名了").unwrap();
 
         let mut history = History::default();
-        history.push(HistoryEntry::Created { path: folder.clone() });
+        history.push(HistoryEntry::Created {
+            path: folder.clone(),
+        });
         history.note_renamed(&folder, &renamed);
 
         assert_eq!(
             history.entries[0],
-            HistoryEntry::Created { path: renamed.clone() }
+            HistoryEntry::Created {
+                path: renamed.clone()
+            }
         );
         history.pop_undo(&HashMap::new()).unwrap();
         assert!(!renamed.exists());
@@ -2232,7 +2606,244 @@ mod tests {
         let much_later = SystemTime::now() + Duration::from_secs(3600);
         let error = restore_from_trash_dir(&trash_dir, &original, much_later).unwrap_err();
 
-        assert!(error.contains("回收站"), "应当给出可理解的失败原因：{error}");
+        assert!(
+            error.contains("回收站"),
+            "应当给出可理解的失败原因：{error}"
+        );
         assert!(trash_dir.join("old.txt").exists(), "旧项不能被误放回");
+    }
+
+    // ---- 断点续传 ----
+
+    /// 比一个数据块多一点的 data：半路叫停才停得在数据块中间。
+    ///
+    /// 只多一百来字节是刻意的：数据块有 1 MB，测试跑在可能只剩
+    /// 一两百兆空闲的机器上，没必要为验一件事先写出两个大文件。
+    fn chunky() -> Vec<u8> {
+        (0..COPY_CHUNK + 100).map(|ix| (ix % 251) as u8).collect()
+    }
+
+    #[test]
+    fn an_aborted_copy_resumes_from_where_it_stopped() {
+        let root = temp();
+        let src = root.path().join("big.bin");
+        let data = chunky();
+        fs::write(&src, &data).unwrap();
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let target = dest.join("big.bin");
+
+        // 第一趟：拷完一个数据块就叫停。
+        let outcome = copy_entries(
+            std::slice::from_ref(&src),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
+            &mut |progress| progress.bytes_done < COPY_CHUNK as u64,
+        );
+        assert_eq!(outcome.done, 0, "没拷完不算完成");
+        assert_eq!(outcome.skipped, 1);
+        assert!(
+            !target.exists(),
+            "半截文件不该出现在目标目录里——它该在续传暂存处"
+        );
+
+        // 第二趟：同一对 (源, 目标) 接着传。
+        let mut started_at = None;
+        let outcome = copy_entries(
+            std::slice::from_ref(&src),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
+            &mut |progress| {
+                if progress.bytes_done > 0 && started_at.is_none() {
+                    started_at = Some(progress.bytes_done);
+                }
+                true
+            },
+        );
+
+        assert_eq!(outcome.done, 1);
+        assert_eq!(fs::read(&target).unwrap(), data, "接上去的得是完整的一份");
+        assert_eq!(
+            started_at,
+            Some(COPY_CHUNK as u64),
+            "第二趟只该报剩下那一截：续传不是把整份重新读一遍"
+        );
+    }
+
+    #[test]
+    fn a_changed_source_invalidates_the_resume_point() {
+        let root = temp();
+        let src = root.path().join("big.bin");
+        let data = chunky();
+        fs::write(&src, &data).unwrap();
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let aborted = copy_entries(
+            std::slice::from_ref(&src),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
+            &mut |progress| progress.bytes_done < COPY_CHUNK as u64,
+        );
+        assert_eq!(aborted.skipped, 1);
+
+        // 源被改过了：续传点作废，第二趟得从 0 开始。
+        let mut changed = data.clone();
+        changed[0] = changed[0].wrapping_add(1);
+        fs::write(&src, &changed).unwrap();
+
+        let mut started_at = None;
+        let outcome = copy_entries(
+            std::slice::from_ref(&src),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &RemoteSides::default(),
+            &mut |progress| {
+                if progress.bytes_done > 0 && started_at.is_none() {
+                    started_at = Some(progress.bytes_done);
+                }
+                true
+            },
+        );
+
+        assert_eq!(outcome.done, 1);
+        assert_eq!(fs::read(dest.join("big.bin")).unwrap(), changed);
+        assert_eq!(started_at, Some(COPY_CHUNK as u64), "这一趟是整份重拷");
+    }
+
+    #[test]
+    fn an_aborted_download_resumes_with_a_range_request() {
+        let (client, server) = remote_client();
+        let root = temp();
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let source = remote::location("t1", "big.bin");
+        let sides = RemoteSides {
+            source: Some(client.clone()),
+            dest: None,
+        };
+        // 第一趟：下到一半叫停。"一半"是按总数说的，具体停在哪个字节
+        // 取决于收数据的缓冲有多大——所以不断言死数字，第二趟照实际接上的
+        // 那个位置去核对 Range。
+        let half = crate::remote::big_bytes().len() as u64 / 2;
+        let aborted = copy_entries(
+            std::slice::from_ref(&source),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &sides,
+            &mut |progress| progress.bytes_done < half,
+        );
+        assert_eq!(aborted.skipped, 1, "没下完不算完成");
+        assert!(
+            !dest.join("big.bin").exists(),
+            "半截文件不该落在用户的目录里"
+        );
+
+        // 第二趟：服务器该收到一个带 Range 的请求，位置正是上次停下那儿。
+        let mut started_at = None;
+        let outcome = copy_entries(
+            std::slice::from_ref(&source),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &sides,
+            &mut |progress| {
+                if progress.bytes_done > 0 && started_at.is_none() {
+                    started_at = Some(progress.bytes_done);
+                }
+                true
+            },
+        );
+
+        let resumed_at = started_at.expect("第二趟该报过进度");
+        assert!(
+            resumed_at > 0 && resumed_at < half * 2,
+            "该接在半路上：{resumed_at}"
+        );
+        assert_eq!(outcome.done, 1);
+        assert_eq!(
+            fs::read(dest.join("big.bin")).unwrap(),
+            crate::remote::big_bytes(),
+            "半截接半截，接出来得是原来那一份"
+        );
+        assert!(
+            seen_requests(&server)
+                .iter()
+                .any(|it| it == &format!("GET /dav/big.bin range={resumed_at}")),
+            "续传要走 Range：{:?}",
+            seen_requests(&server)
+        );
+    }
+
+    #[test]
+    fn a_download_whose_staging_was_wiped_still_lands() {
+        let (client, server) = remote_client();
+        let root = temp();
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let source = remote::location("t1", "big.bin");
+        let sides = RemoteSides {
+            source: Some(client.clone()),
+            dest: None,
+        };
+
+        let aborted = copy_entries(
+            std::slice::from_ref(&source),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &sides,
+            &mut |progress| progress.bytes_done < 2048,
+        );
+        assert_eq!(aborted.skipped, 1);
+
+        // 暂存处叫人连窝端了（系统清临时目录、别的程序当垃圾扫了）：
+        // 半截数据没了，可服务器还在，重新下一趟就是了。
+        let journal = resume::journal();
+        let key = resume::key(
+            &remote_source(client.as_ref(), "big.bin"),
+            &dest.join("big.bin").display().to_string(),
+        );
+        fs::remove_file(journal.staging(&key)).expect("暂存文件该在");
+        journal.clear(&key);
+
+        let mut started_at = None;
+        let mut reported = 0u64;
+        let outcome = copy_entries(
+            std::slice::from_ref(&source),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &sides,
+            &mut |progress| {
+                if progress.bytes_done > 0 && started_at.is_none() {
+                    started_at = Some(progress.bytes_done);
+                }
+                reported = progress.bytes_done;
+                true
+            },
+        );
+
+        assert_eq!(outcome.done, 1);
+        assert_eq!(
+            fs::read(dest.join("big.bin")).unwrap(),
+            crate::remote::big_bytes(),
+            "没有半截可接也得把文件拿全"
+        );
+        // "整份重下"要看这一趟一共报了多少字节，而不是看第一块有多大：
+        // 第一块的尺寸取决于套接字一次能给多少，那不是断点的事。
+        assert_eq!(
+            reported,
+            crate::remote::big_bytes().len() as u64,
+            "没有半截可接，就整份重下"
+        );
+        assert!(
+            !seen_requests(&server)
+                .iter()
+                .any(|it| it.contains("range=")),
+            "这一趟不该发 Range：{:?}",
+            seen_requests(&server)
+        );
     }
 }

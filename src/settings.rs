@@ -122,7 +122,10 @@ impl Layout {
         }
         // 至少得有一部分落在"第一块屏幕（原点在左上）"里。
         // 外接屏在左边时 x 可以是负的，所以只要求右侧/下侧还看得见。
-        self.x + self.width > 160. && self.y + self.height > 120. && self.x < 20_000. && self.y < 20_000.
+        self.x + self.width > 160.
+            && self.y + self.height > 120.
+            && self.x < 20_000.
+            && self.y < 20_000.
     }
 }
 
@@ -183,7 +186,10 @@ impl Settings {
     ///
     /// 写盘失败不回报给调用方：设置丢了最多是下次用默认值，
     /// 不该因为一个写不进的配置文件打断用户正在做的事。
-    pub fn update<R>(cx: &mut impl gpui_kit::BorrowAppContext, f: impl FnOnce(&mut Self) -> R) -> R {
+    pub fn update<R>(
+        cx: &mut impl gpui_kit::BorrowAppContext,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         cx.update_default_global::<Self, _>(|settings, _| {
             let result = f(settings);
             let _ = settings.save();
@@ -204,7 +210,11 @@ impl Settings {
     /// 同一个目录再来就更新并挪到最前面，超过上限丢最久没用的那个——
     /// 这是"最近用过的目录"，不是"去过的所有目录"。
     pub fn remember_view(&mut self, path: PathBuf, sort: Sort, view: ViewMode) {
-        if let Some(position) = self.folder_views.iter().position(|entry| entry.path == path) {
+        if let Some(position) = self
+            .folder_views
+            .iter()
+            .position(|entry| entry.path == path)
+        {
             self.folder_views.remove(position);
         } else if self.folder_views.len() >= MAX_FOLDER_VIEWS {
             self.folder_views.pop();
@@ -339,8 +349,16 @@ mod tests {
     #[test]
     fn a_saved_search_can_be_forgotten() {
         let mut stored = Settings::default();
-        stored.save_search("找图".to_string(), "*.png".to_string(), PathBuf::from("/tmp"));
-        stored.save_search("找码".to_string(), "*.rs".to_string(), PathBuf::from("/tmp"));
+        stored.save_search(
+            "找图".to_string(),
+            "*.png".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        stored.save_search(
+            "找码".to_string(),
+            "*.rs".to_string(),
+            PathBuf::from("/tmp"),
+        );
         stored.forget_search("找图");
         assert_eq!(stored.saved_searches.len(), 1);
         assert_eq!(stored.saved_search("找图"), None);
@@ -368,9 +386,16 @@ mod tests {
             sort_by(SortKey::Modified),
             ViewMode::Grid,
         );
-        stored.remember_view(projects.clone(), sort_by(SortKey::Name), ViewMode::default());
+        stored.remember_view(
+            projects.clone(),
+            sort_by(SortKey::Name),
+            ViewMode::default(),
+        );
 
-        assert_eq!(sort_for(&stored, &downloads), Some(sort_by(SortKey::Modified)));
+        assert_eq!(
+            sort_for(&stored, &downloads),
+            Some(sort_by(SortKey::Modified))
+        );
         assert_eq!(sort_for(&stored, &projects), Some(sort_by(SortKey::Name)));
         assert_eq!(
             stored.view_for(&PathBuf::from("/Users/me/Music")),
@@ -480,7 +505,10 @@ mod tests {
         .unwrap();
 
         let loaded = Settings::load_from(&path).expect("老配置也要读得进");
-        assert_eq!(sort_for(&loaded, &PathBuf::from("/a")), Some(Sort::default()));
+        assert_eq!(
+            sort_for(&loaded, &PathBuf::from("/a")),
+            Some(Sort::default())
+        );
         assert_eq!(
             loaded.view_for(&PathBuf::from("/a")).map(|view| view.view),
             Some(ViewMode::List)

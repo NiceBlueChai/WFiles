@@ -111,7 +111,11 @@ mod tests {
     #[test]
     fn dragging_inside_the_app_moves_until_alt_says_otherwise() {
         assert_eq!(drop_action(false, false), DropAction::Move);
-        assert_eq!(drop_action(false, true), DropAction::Copy, "按住 Alt 是拷贝");
+        assert_eq!(
+            drop_action(false, true),
+            DropAction::Copy,
+            "按住 Alt 是拷贝"
+        );
     }
 
     #[test]
