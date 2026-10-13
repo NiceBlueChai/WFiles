@@ -4699,3 +4699,110 @@ fn deepest_crumb(window: &mut gpui_kit::Window) -> Option<Bounds<Pixels>> {
         .filter_map(|index| window.try_find(("crumb", index)).map(|it| it.bounds()))
         .last()
 }
+
+/// Quick Look 的遮罩要盖住**整个窗口**，不只是窗格那一块。
+///
+/// 它是"看一眼整个文件"，不是某一栏的事。挂在窗格里的时候遮罩从侧栏右缘
+/// 开始：实测 1180 px 的窗口里遮罩 `x = 210`，标签栏和侧栏都亮着，浮层被框在
+/// 窗格中间；520 px 的窗口里窗格只剩 310 px 宽，那张 720 px 的卡片根本没法看。
+///
+/// 判据是遮罩的四条边都贴着窗口——跟上面那几条对话框测试同一个道理，
+/// 只查"卡片没越界"不够：卡片在窗格内也算没越界，但遮罩该盖的没盖。
+#[gpui_kit::test]
+fn quick_look_covers_the_whole_window(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("note.txt"), "hello").expect("造文件");
+
+    for width in [1180.0f32, 700.0, 520.0] {
+        let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+        step(cx, handle, settle);
+        step(cx, handle, |window, cx| {
+            window.press("down", cx);
+            settle(window, cx);
+            window.press("space", cx);
+            settle(window, cx);
+        });
+
+        step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            let veil = window
+                .try_find("quick-look")
+                .unwrap_or_else(|| panic!("窗口 {width}：按空格该弹出 Quick Look"))
+                .bounds();
+            assert!(
+                veil.origin.x <= px(1.)
+                    && veil.origin.y <= px(1.)
+                    && veil.origin.x + veil.size.width >= px(width - 1.),
+                "窗口 {width}：Quick Look 遮罩是 x={}~{}——\
+                 侧栏与标签栏没被盖住，浮层被框在窗格里",
+                veil.origin.x,
+                veil.origin.x + veil.size.width,
+            );
+            // 卡片自己也得留在窗口里。
+            let card = window
+                .try_find("quick-look-card")
+                .expect("Quick Look 卡片")
+                .bounds();
+            assert_inside_window(card, width, "Quick Look 卡片");
+        });
+    }
+}
+
+/// Quick Look 在窄窗口里也要能用：卡片退到窗口宽度，正文自己滚。
+///
+/// 720px 的卡片在 520px 的窗口里装不下，而 Quick Look 恰恰是最需要看全的时候
+/// ——文件名都已经截短了，再看不到正文等于什么都没说。
+#[gpui_kit::test]
+fn quick_look_fits_a_narrow_window(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    // 几百行：够正文滚起来，量得到「关闭」按钮留在原地。
+    let body = (0..400)
+        .map(|i| format!("第 {i} 行"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.path().join("long.txt"), body).expect("造文件");
+
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 520.);
+    step(cx, handle, settle);
+    step(cx, handle, |window, cx| {
+        window.press("down", cx);
+        settle(window, cx);
+        window.press("space", cx);
+        settle(window, cx);
+    });
+
+    step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        let card = window
+            .try_find("quick-look-card")
+            .expect("Quick Look 卡片")
+            .bounds();
+        assert_inside_window(card, 520., "Quick Look 卡片");
+        let close = window
+            .try_find("quick-look-close")
+            .expect("关闭按钮")
+            .bounds();
+        // 「关闭」必须在卡片内、正文之下——正文滚多长都推不动它。
+        assert!(
+            close.origin.y > card.origin.y
+                && close.origin.y + close.size.height <= card.origin.y + card.size.height,
+            "关闭按钮（y={}~{}）掉出卡片（y={}~{}）了",
+            close.origin.y,
+            close.origin.y + close.size.height,
+            card.origin.y,
+            card.origin.y + card.size.height,
+        );
+    });
+
+    // 点它真能关：这一条守住「关掉谁」的判断（双栏时不能写死一栏）。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("quick-look-close", cx);
+        settle(window, cx);
+    });
+    let gone = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.try_find("quick-look").is_none()
+    });
+    assert!(gone, "点了「关闭」Quick Look 还开着");
+}

@@ -437,10 +437,10 @@ struct Column {
 ///
 /// 名字带 State 是因为 `QuickLook` 已经是那个空格键动作的名字了。
 #[derive(Clone)]
-struct QuickLookState {
-    path: PathBuf,
-    name: String,
-    content: Preview,
+pub struct QuickLookState {
+    pub path: PathBuf,
+    pub name: String,
+    pub content: Preview,
 }
 
 /// 菜单项回调的动作落回窗格自己。
@@ -1966,6 +1966,25 @@ impl Pane {
     /// Quick Look 开着没有。Esc 要先关它，再谈取消选中。
     pub fn quick_look_open(&self) -> bool {
         self.quick_look.is_some()
+    }
+
+    /// 当前 Quick Look 的状态，交给应用层去渲染。
+    ///
+    /// **为什么浮层画在应用层而不是窗格里**：Quick Look 是"看一眼整个文件"，
+    /// 它不是某一栏的事。画在窗格里的话，遮罩只盖住侧栏右边的部分——
+    /// 实测 1180px 的窗口里遮罩从 x=210 开始（侧栏右缘），标签栏和侧栏
+    /// 都亮着，浮层被框在窗格中间；520px 的窗口里窗格只剩 310px 宽，
+    /// 那张 720px 的卡片根本没法看。
+    ///
+    /// 状态留在窗格：Esc 的优先级、命令面板里"快速查看"那条显不显示，
+    /// 都得知道**当前这个窗格**在看谁。
+    pub fn quick_look_snapshot(&self) -> Option<QuickLookState> {
+        self.quick_look.clone()
+    }
+
+    /// 关掉 Quick Look。应用层那个「关闭」按钮回调到这里。
+    pub fn close_quick_look_from(&mut self, cx: &mut Context<Self>) {
+        self.close_quick_look(cx);
     }
 
     /// 命令面板据此决定要不要列出"快速查看"。
@@ -4152,219 +4171,6 @@ impl Pane {
             .into_any_element()
     }
 
-    /// Quick Look 浮层：居中卡片，内容按类型分派。
-    ///
-    /// **没做"点背景关掉"**：GPUI 的点击会冒泡到父元素，卡片里选中一段文字
-    /// 也会被当成点了背景，一选就关太难受。关闭走 Esc、再按一次空格，
-    /// 或者卡片底部的按钮。
-    fn render_quick_look(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(look) = self.quick_look.clone() else {
-            return div().into_any_element();
-        };
-
-        // 大图在这一帧问一次就够了，标题和正文共用。
-        let thumbnail = self.thumbnail_of_size(&look.path, thumbnails::PREVIEW_EDGE, cx);
-        let subtitle = Self::quick_look_subtitle(&look, thumbnail.clone());
-        let body = match &look.content {
-            Preview::Text(text) => Self::render_quick_look_text(text, cx),
-            Preview::Hex(hex) => Self::render_quick_look_hex(hex, cx),
-            Preview::Opaque(preview::Kind::Image) => {
-                Self::render_quick_look_image(thumbnail.clone(), cx)
-            }
-            Preview::Opaque(kind) => {
-                Self::render_quick_look_placeholder(icon_for_kind(*kind), &look.name, cx)
-            }
-            Preview::Directory => {
-                Self::render_quick_look_placeholder(IconName::FolderOpen, &look.name, cx)
-            }
-            Preview::Unavailable(reason) => {
-                Self::render_quick_look_placeholder(IconName::File, reason, cx)
-            }
-        };
-
-        let muted = cx.theme().muted_foreground;
-        div()
-            .id("quick-look")
-            .test_support()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(cx.theme().overlay)
-            .child(
-                v_flex()
-                    .id("quick-look-card")
-                    .w(px(720.))
-                    .max_h(px(560.))
-                    .gap_3()
-                    .p_5()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .min_w_0()
-                            .child(div().font_semibold().truncate().child(look.name.clone()))
-                            .child(
-                                div()
-                                    .id("quick-look-subtitle")
-                                    .test_support()
-                                    .aria_label(subtitle.clone())
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(subtitle),
-                            ),
-                    )
-                    .child(body)
-                    .child(
-                        h_flex().justify_end().child(
-                            Button::new("quick-look-close")
-                                .label("关闭（Esc）")
-                                .ghost()
-                                .small()
-                                .on_click(cx.listener(|this, _, _, cx| this.close_quick_look(cx))),
-                        ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// 卡片标题下面那一行：类型、规模，以及"这份不是全文"。
-    fn quick_look_subtitle(
-        look: &QuickLookState,
-        thumbnail: Option<thumbnails::Thumbnail>,
-    ) -> String {
-        match &look.content {
-            Preview::Text(text) => {
-                let language = text.language.unwrap_or("文本");
-                format!(
-                    "{language} · {} 行{}",
-                    text.lines,
-                    if text.truncated {
-                        "（只显示开头）"
-                    } else {
-                        ""
-                    }
-                )
-            }
-            Preview::Hex(hex) => format!(
-                "二进制 · {} 字节（只显示前 {} 行）",
-                hex.total_bytes,
-                hex.rows.len()
-            ),
-            Preview::Opaque(kind) => match thumbnail {
-                Some(thumbnail) => format!(
-                    "{} · {} × {}",
-                    kind.label(),
-                    thumbnail.source_width,
-                    thumbnail.source_height
-                ),
-                None => kind.label().to_string(),
-            },
-            Preview::Directory => "文件夹".to_string(),
-            Preview::Unavailable(_) => "无法预览".to_string(),
-        }
-    }
-
-    /// 文本/代码：等宽 + 不折行 + 自带滚动。
-    fn render_quick_look_text(text: &preview::TextPreview, cx: &mut Context<Self>) -> AnyElement {
-        let mono = cx.theme().mono_font_family.clone();
-        div()
-            .id("quick-look-text")
-            .test_support()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .font_family(mono)
-            .text_sm()
-            .child(
-                v_flex().children(
-                    text.text
-                        .lines()
-                        .map(|line| div().whitespace_nowrap().child(line.to_string())),
-                ),
-            )
-            .into_any_element()
-    }
-
-    /// 二进制：hex 转储，每行已经排好版。
-    fn render_quick_look_hex(hex: &preview::HexPreview, cx: &mut Context<Self>) -> AnyElement {
-        let mono = cx.theme().mono_font_family.clone();
-        div()
-            .id("quick-look-hex")
-            .test_support()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .font_family(mono)
-            .text_sm()
-            .child(
-                v_flex().children(
-                    hex.rows
-                        .iter()
-                        .map(|row| div().whitespace_nowrap().child(row.format())),
-                ),
-            )
-            .into_any_element()
-    }
-
-    /// 图片：还没生成好就先显示占位，图到了会收到事件再画一次。
-    fn render_quick_look_image(
-        thumbnail: Option<thumbnails::Thumbnail>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(thumbnail) = thumbnail else {
-            return Self::render_quick_look_placeholder(
-                IconName::GalleryVerticalEnd,
-                "正在生成预览…",
-                cx,
-            );
-        };
-
-        div()
-            .id("quick-look-image")
-            .test_support()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(cx.theme().radius)
-            .bg(cx.theme().muted)
-            .child(
-                img(ImageSource::Render(thumbnail.image))
-                    .max_w_full()
-                    .max_h_full()
-                    .object_fit(ObjectFit::Contain)
-                    .rounded(cx.theme().radius),
-            )
-            .into_any_element()
-    }
-
-    /// 没有内容可显示时的占位：一个图标加一句话。
-    fn render_quick_look_placeholder(
-        icon: IconName,
-        message: &str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .h(px(220.))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .rounded(cx.theme().radius)
-            .bg(cx.theme().muted)
-            .text_color(cx.theme().muted_foreground)
-            .child(Icon::new(icon).size_12())
-            .child(div().text_sm().child(message.to_string()))
-            .into_any_element()
-    }
-
     /// 向缩略图层要一张图；列表里用小图，Quick Look 用大图。
     /// 元数据列的表头：显示的是"当前这一列是什么"。没开就是 `None`（整列不画）。
     fn meta_label(&mut self, cx: &mut Context<Self>) -> Option<&'static str> {
@@ -4408,7 +4214,7 @@ pub(crate) fn dropped_paths(value: &dyn Any) -> Option<Vec<PathBuf>> {
 }
 
 /// 每种类型用什么图标。没有专门图标的就退回通用文件图标。
-fn icon_for_kind(kind: preview::Kind) -> IconName {
+pub(crate) fn icon_for_kind(kind: preview::Kind) -> IconName {
     match kind {
         preview::Kind::Image => IconName::GalleryVerticalEnd,
         preview::Kind::Pdf | preview::Kind::Text | preview::Kind::Code => IconName::FileText,
@@ -4450,9 +4256,6 @@ impl Render for Pane {
             root = root.child(self.render_details(cx));
         }
 
-        if self.quick_look.is_some() {
-            root = root.child(self.render_quick_look(cx));
-        }
         if self.archive_view.is_some() {
             root = root.child(self.render_archive(cx));
         }

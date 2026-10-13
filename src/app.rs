@@ -28,7 +28,8 @@ use crate::meta::{Field as MetaField, Metadata};
 use crate::ops::{ConflictPolicy, ControlState};
 use crate::ops_entity::{Ops, OpsEvent, PendingAction};
 use crate::palette::{self, Command as PaletteCommand};
-use crate::pane::{Pane, PaneCommand, PaneEvent};
+use crate::pane::{Pane, PaneCommand, PaneEvent, QuickLookState};
+use crate::preview::Preview;
 use crate::remote::{self, Kind as RemoteKind};
 use crate::remotes::{Remotes, RemotesEvent};
 use crate::session::Session;
@@ -3583,6 +3584,253 @@ impl WFilesApp {
             |this, _, cx| this.close_connect(cx),
         )
     }
+
+    // ---- Quick Look ----
+
+    /// 当前显示的那几栏里，有哪一栏正开着 Quick Look。
+    ///
+    /// 双栏时两个窗格各自能开各自的 Quick Look（"看一眼左栏这个文件"），
+    /// 但只画当前显示的那一栏的——另一栏的浮层盖在上面会让用户以为在
+    /// 看左栏，实际看的是右栏。
+    fn quick_look_of_visible_pane(&self, cx: &App) -> Option<QuickLookState> {
+        for index in self.visible() {
+            let look = self.tabs[index].read(cx).quick_look_snapshot();
+            if look.is_some() {
+                return look;
+            }
+        }
+        None
+    }
+
+    /// Quick Look 浮层：居中卡片，内容按类型分派。
+    ///
+    /// **画在整个窗口之上**，跟标签栏、侧栏、状态栏一起盖住——
+    /// 它是"看一眼整个文件"，不是某一栏的事。挂在窗格里的话遮罩只盖住
+    /// 侧栏右边的部分：实测 1180px 的窗口里遮罩从 x=210 开始，标签栏和
+    /// 侧栏都亮着；520px 的窗口里窗格只剩 310px，那张卡片根本没法看。
+    ///
+    /// **没做"点背景关掉"**：GPUI 的点击会冒泡到父元素，卡片里选中一段文字
+    /// 也会被当成点了背景，一选就关太难受。关闭走 Esc、再按一次空格，
+    /// 或者卡片底部的按钮。
+    fn render_quick_look(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(look) = self.quick_look_of_visible_pane(cx) else {
+            return div().into_any_element();
+        };
+
+        // 大图在这一帧问一次就够了，标题和正文共用。
+        let thumbnail = self.thumbs.update(cx, |thumbs, cx| {
+            thumbs.get(&look.path, crate::thumbnails::PREVIEW_EDGE, cx)
+        });
+        let subtitle = Self::quick_look_subtitle(&look, thumbnail.clone());
+        let body = match &look.content {
+            Preview::Text(text) => Self::quick_look_text(text, cx),
+            Preview::Hex(hex) => Self::quick_look_hex(hex, cx),
+            Preview::Opaque(kind) if *kind == crate::preview::Kind::Image => {
+                Self::quick_look_image(thumbnail.clone(), cx)
+            }
+            Preview::Opaque(kind) => {
+                Self::quick_look_placeholder(crate::pane::icon_for_kind(*kind), &look.name, cx)
+            }
+            Preview::Directory => {
+                Self::quick_look_placeholder(IconName::FolderOpen, &look.name, cx)
+            }
+            Preview::Unavailable(reason) => {
+                Self::quick_look_placeholder(IconName::File, reason, cx)
+            }
+        };
+
+        let muted = cx.theme().muted_foreground;
+        // 关掉谁：显示着 Quick Look 的那一栏。双栏时是左或右，不能写死一个。
+        let owner = self
+            .visible()
+            .into_iter()
+            .find(|index| self.tabs[*index].read(cx).quick_look_open());
+        let pane = owner.map(|index| self.tabs[index].clone());
+
+        div()
+            .id("quick-look")
+            .test_support()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            // 跟对话框同一道约束：卡片宽写死 720 px，窗口可以是 520 px。
+            .px_4()
+            .py_6()
+            .bg(cx.theme().overlay)
+            .child(
+                v_flex()
+                    .id("quick-look-card")
+                    .test_support()
+                    .w(px(720.))
+                    .max_w_full()
+                    .max_h_full()
+                    .gap_3()
+                    .p_5()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(
+                        v_flex()
+                            .flex_shrink_0()
+                            .gap_1()
+                            .min_w_0()
+                            .child(div().font_semibold().truncate().child(look.name.clone()))
+                            .child(
+                                div()
+                                    .id("quick-look-subtitle")
+                                    .test_support()
+                                    .aria_label(subtitle.clone())
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(subtitle),
+                            ),
+                    )
+                    // 正文自己滚：文件有几千行时标题与「关闭」按钮留在原地。
+                    .child(div().flex_1().min_h_0().child(body))
+                    .child(
+                        h_flex().flex_shrink_0().justify_end().child(
+                            Button::new("quick-look-close")
+                                .label("关闭（Esc）")
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    if let Some(pane) = pane.as_ref() {
+                                        pane.update(cx, |pane, cx| pane.close_quick_look_from(cx));
+                                    }
+                                })),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 卡片标题下面那一行：类型、规模，以及"这份不是全文"。
+    fn quick_look_subtitle(
+        look: &QuickLookState,
+        thumbnail: Option<crate::thumbnails::Thumbnail>,
+    ) -> String {
+        match &look.content {
+            Preview::Text(text) => {
+                let language = text.language.unwrap_or("文本");
+                format!(
+                    "{language} · {} 行{}",
+                    text.lines,
+                    if text.truncated {
+                        "（只显示开头）"
+                    } else {
+                        ""
+                    }
+                )
+            }
+            Preview::Hex(hex) => format!(
+                "二进制 · {} 字节（只显示前 {} 行）",
+                hex.total_bytes,
+                hex.rows.len()
+            ),
+            Preview::Opaque(kind) => match thumbnail {
+                Some(thumbnail) => format!(
+                    "{} · {} × {}",
+                    kind.label(),
+                    thumbnail.source_width,
+                    thumbnail.source_height
+                ),
+                None => kind.label().to_string(),
+            },
+            Preview::Directory => "文件夹".to_string(),
+            Preview::Unavailable(_) => "无法预览".to_string(),
+        }
+    }
+
+    /// 文本/代码：等宽 + 不折行 + 自带滚动。
+    fn quick_look_text(text: &crate::preview::TextPreview, cx: &mut Context<Self>) -> AnyElement {
+        let mono = cx.theme().mono_font_family.clone();
+        div()
+            .id("quick-look-text")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .font_family(mono)
+            .text_sm()
+            .child(
+                v_flex().children(
+                    text.text
+                        .lines()
+                        .map(|line| div().whitespace_nowrap().child(line.to_string())),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// 二进制：hex 转储，每行已经排好版。
+    fn quick_look_hex(hex: &crate::preview::HexPreview, cx: &mut Context<Self>) -> AnyElement {
+        let mono = cx.theme().mono_font_family.clone();
+        div()
+            .id("quick-look-hex")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .font_family(mono)
+            .text_sm()
+            .child(
+                v_flex().children(
+                    hex.rows
+                        .iter()
+                        .map(|row| div().whitespace_nowrap().child(row.format())),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// 图片：还没生成好就先显示占位，图到了会收到事件再画一次。
+    fn quick_look_image(
+        thumbnail: Option<crate::thumbnails::Thumbnail>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(thumbnail) = thumbnail else {
+            return Self::quick_look_placeholder(IconName::GalleryVerticalEnd, "正在生成预览…", cx);
+        };
+
+        div()
+            .id("quick-look-image")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().muted)
+            .child(
+                img(ImageSource::Render(thumbnail.image))
+                    .max_w_full()
+                    .max_h_full()
+                    .object_fit(ObjectFit::Contain)
+                    .rounded(cx.theme().radius),
+            )
+            .into_any_element()
+    }
+
+    /// 没有内容可显示时的占位：一个图标加一句话。
+    fn quick_look_placeholder(icon: IconName, message: &str, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .h(px(220.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().muted)
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(icon).size_12())
+            .child(div().text_sm().child(message.to_string()))
+            .into_any_element()
+    }
 }
 
 impl Render for WFilesApp {
@@ -3675,6 +3923,12 @@ impl Render for WFilesApp {
                 self.render_confirm(cx)
             };
             root = root.child(overlay);
+        }
+
+        // Quick Look 压在对话框之上：对话框是"我必须先处理这件事"，
+        // Quick Look 只是一眼，两者同时开着时对话框优先。
+        if self.quick_look_of_visible_pane(cx).is_some() {
+            root = root.child(self.render_quick_look(cx));
         }
 
         root
