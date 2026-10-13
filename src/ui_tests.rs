@@ -4465,3 +4465,96 @@ fn the_bulk_rename_fields_get_the_width_they_ask_for(cx: &mut TestAppContext) {
         });
     }
 }
+
+/// 色点不能让某些行的文件名单独错开。
+///
+/// 原来色点只在"这个文件被标记过"时才插进行里，于是那一行的名字比旁边所有行
+/// 右移 8 px（点宽）加一个 12 px 的 gap = 20 px。界面上看着只是"这一行的字没对齐"，
+/// 不量坐标发现不了；而一行一行地对不齐，整列名字就成了波浪。
+///
+/// 现在色点槽**整列常驻**：标了色的画真颜色，没标记的画全透明。
+#[gpui_kit::test]
+fn the_mark_dot_does_not_shift_the_names_of_unmarked_rows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    for name in ["a-marked.txt", "b-plain.txt", "c-plain2.txt"] {
+        std::fs::write(dir.path().join(name), "x").expect("造文件");
+    }
+    let (_isolation, handle) = open_in(cx, dir.path());
+    step(cx, handle, settle);
+
+    // 标记第一行。
+    step(cx, handle, |window, cx| {
+        window.press("down", cx);
+        settle(window, cx);
+        window.press("cmd-alt-m", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("mark-color-red", cx);
+        settle(window, cx);
+        window.press("enter", cx);
+    });
+
+    step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 三行的色点槽左边缘必须一致——它紧挨着文件名的起排处。
+        let xs: Vec<Pixels> = (0..3usize)
+            .map(|position| {
+                window
+                    .try_find(("row-mark", position))
+                    .unwrap_or_else(|| panic!("找不到第 {position} 行的色点槽"))
+                    .bounds()
+                    .origin
+                    .x
+            })
+            .collect();
+        assert!(
+            xs.windows(2).all(|pair| pair[0] == pair[1]),
+            "三行的色点槽左边缘分别是 {xs:?}——有一行被多推了一把，\
+             标记色点还在按需插入",
+        );
+    });
+}
+
+/// 表头的「名称」要跟下面所有行的文件名列起排。
+///
+/// 这条和上一条是一件事的两头：行里多了个 8 px 的色点槽，表头不补上同一个槽，
+/// "名称"两个字就比下面的文件名右移 20 px（槽宽 + 一个 gap）。
+#[gpui_kit::test]
+fn the_name_header_lines_up_with_the_file_names(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    for name in ["a-marked.txt", "b-plain.txt", "c-plain2.txt"] {
+        std::fs::write(dir.path().join(name), "x").expect("造文件");
+    }
+    let (_isolation, handle) = open_in(cx, dir.path());
+    step(cx, handle, settle);
+    // 标记第一行：色点槽存在，才量得到它跟表头的关系。
+    step(cx, handle, |window, cx| {
+        window.press("down", cx);
+        settle(window, cx);
+        window.press("cmd-alt-m", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("mark-color-red", cx);
+        settle(window, cx);
+        window.press("enter", cx);
+    });
+
+    step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        let header = window.try_find(("header", 0usize)).expect("名称列表头");
+        let mark = window
+            .try_find(("row-mark", 0usize))
+            .expect("第一行的色点槽");
+        // 名字紧挨着色点槽（中间一个 12 px 的 gap）。
+        let gap = header.bounds().origin.x - (mark.bounds().origin.x + mark.bounds().size.width);
+        assert!(
+            (gap - px(12.)).abs() <= px(1.),
+            "表头「名称」左边缘 {}px、色点槽右边缘 {}px，差 {gap}px\
+             （该是12 px 的间隙）——表头少留了色点槽那一段",
+            header.bounds().origin.x,
+            mark.bounds().origin.x + mark.bounds().size.width,
+        );
+    });
+}

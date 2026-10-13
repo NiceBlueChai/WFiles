@@ -2505,7 +2505,10 @@ impl Pane {
             .bg(cx.theme().background)
             .text_xs()
             .font_medium()
+            // 图标占位 20px + 色点占位 8px：行里就是这么摆的，表头也得留出同一段，
+            // 否则"名称"三个字比下面所有行的文件名右移 20 px。
             .child(div().w(px(20.)).flex_shrink_0())
+            .child(div().w(px(8.)).flex_shrink_0())
             .child(self.header_cell(0, SortKey::Name, "名称", None, cx))
             .when_some(self.meta_label(cx), |this, label| {
                 this.child(
@@ -2649,23 +2652,35 @@ impl Pane {
                                 .into_any_element(),
                             }),
                     )
-                    .when_some(
-                        Settings::read(cx)
+                    // 色点槽**整列常驻**，标了色的画真颜色，没标记的画透明的——
+                    // 宽度一样、gap 一样，于是所有行的名字都从同一处起排。
+                    //
+                    // 原来只在标了色的时候才插这颗点，于是那一行的文字比旁边
+                    // 所有行右移 8 px（点宽）加一个 12 px 的 gap——上下行对不齐，
+                    // 整列名字看过去是波浪，而"这一行有没有标记"是它自己的事，
+                    // 不该让整列的字都跟着错开 20 px。表头的「名称」列也就对上了。
+                    .child({
+                        let hex = Settings::read(cx)
                             .marks
                             .color_of(&path)
-                            .map(marks::color_hex),
-                        |this, hex| {
-                            // 标了色的文件在名字前面带一个色点。
-                            this.child(
-                                div()
-                                    .w(px(8.))
-                                    .h(px(8.))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(rgb(hex)),
-                            )
-                        },
-                    )
+                            .map(marks::color_hex);
+                        div()
+                            .id(("row-mark", position))
+                            .test_support()
+                            .w(px(8.))
+                            .h(px(8.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(match hex {
+                                Some(hex) => rgb(hex),
+                                // 全透明而不是 `transparent_white()`：后者是
+                                // Hsla，而 rgb() 给的是 Rgba，两个类型不接。
+                                None => rgba(0x00000000),
+                            })
+                    })
+                    // 名字这一格靠外层那个 `row-name` 容器量：它在图标槽与色点槽
+                    // **之前**，所以量它自己得不到"名字从哪儿起排"。要量起排位置
+                    // 就量色点槽——它紧挨着名字，两者左边缘之差是固定的 12 px。
                     .child(div().flex_1().min_w_0().truncate().child(name))
                     .when_some(self.meta_text(&path, is_dir, cx), |this, text| {
                         // 整列常驻、里面可以空：不然每行少一个格子会左右跳。
