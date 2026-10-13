@@ -975,6 +975,17 @@ fn download_entry(
             // 半截数据留着：这是下一次的起点。目标里一个字节都没有，
             // 所以"失败"之后用户的目录是干净的，只是还没拿到文件。
             let done = fs::metadata(&staging).map(|it| it.len()).unwrap_or(done);
+            // 但有一种"中止"其实下完了：`Reporting` 是读完一块才报进度，
+            // 所以那块恰好覆盖到文件末尾时，回调说停就停，暂存里躺着的
+            // 是一份完整的文件。这种时候再判中止等于白下一趟——用户已经
+            // 有一份完整文件躺在暂存里，却得看着它被扫掉重来。
+            // 判据只能是长度：续传账本拿不到"服务器那边还剩多少"。
+            if error.contains("已中止") && done >= info.size {
+                land(&staging, target, || Ok(()))
+                    .map_err(|error| TransferError::Failed(error.to_string()))?;
+                journal.clear(&key);
+                return Ok(());
+            }
             note_download(&journal, &key, client, sub, &info, done);
             journal.sweep();
             if error.contains("已中止") {
@@ -1125,6 +1136,19 @@ fn upload_entry(
     let sent = done + counting.sent;
     if let Err(error) = result {
         if error.contains("已中止") {
+            // 同下载那边：`Reporting` 读完一块才报进度，那块若刚好盖到文件
+            // 末尾，回调说停就停，其实服务器上已经是一份完整的文件。
+            // 这时候报中止等于让用户白传一遍——下次接着传会从"长度正好
+            // 等于总长"处起步，那本账本就永远用不上。
+            if sent >= length {
+                journal.clear(&key);
+                if remove_source {
+                    remove_entry(source).map_err(|error| {
+                        TransferError::Failed(format!("已上传但删除本地源失败：{error}"))
+                    })?;
+                }
+                return Ok(());
+            }
             // 用户叫停：服务器上那一段是资产，留着，下次接着传。
             journal.save(
                 &key,
@@ -2776,6 +2800,80 @@ mod tests {
             "续传要走 Range：{:?}",
             seen_requests(&server)
         );
+    }
+
+    /// 中止恰好落在最后一个字节上时，那一趟其实**已经下完了**。
+    ///
+    /// `Reporting` 是读完一块才报进度，所以小块文件必然一次读完、必然在
+    /// 文件末尾被判中止。报中止就等于让用户把一份完整的文件留在暂存里
+    /// 等着被扫掉——这测试就是钉这个的。
+    #[test]
+    fn a_download_stopped_on_its_last_byte_still_lands() {
+        let (client, _server) = remote_client();
+        let root = temp();
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let source = remote::location("t1", "small.bin");
+        let sides = RemoteSides {
+            source: Some(client.clone()),
+            dest: None,
+        };
+
+        // 只在真收到数据的那一刻叫停。`bytes_done == 0` 的是每个条目
+        // 开场先报的那一次"还没开始"，在哪儿停都不算数。
+        let outcome = copy_entries(
+            std::slice::from_ref(&source),
+            &dest,
+            ConflictPolicy::KeepBoth,
+            &sides,
+            &mut |progress| progress.bytes_done == 0,
+        );
+
+        assert_eq!(outcome.done, 1, "下完了就算完成，不该报中止");
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(
+            fs::read(dest.join("small.bin")).unwrap(),
+            crate::remote::small_bytes(),
+            "用户该拿到完整的那一份，不是半截也不是没有"
+        );
+        // 账本得清掉：这一趟不是"停在中途"，没有什么下次要接着传的。
+        let key = resume::key(
+            &remote_source(client.as_ref(), "small.bin"),
+            &dest.join("small.bin").to_string_lossy().into_owned(),
+        );
+        assert!(
+            !resume::journal().staging(&key).exists(),
+            "暂存该被收走，不能留在盘上等清扫"
+        );
+    }
+
+    /// 上传侧的同一个洞：`Counting` 数到的字节已经够了，就别再报中止。
+    #[test]
+    fn an_upload_stopped_on_its_last_byte_still_counts_as_done() {
+        let (client, _server) = remote_client();
+        let root = temp();
+        let local = root.path().join("small.bin");
+        fs::write(&local, crate::remote::small_bytes()).unwrap();
+        let sides = RemoteSides {
+            source: None,
+            dest: Some(client.clone()),
+        };
+
+        let outcome = copy_entries(
+            std::slice::from_ref(&local),
+            &remote::location("t1", ""),
+            ConflictPolicy::KeepBoth,
+            &sides,
+            &mut |progress| progress.bytes_done == 0,
+        );
+
+        assert_eq!(outcome.done, 1, "传完了就算完成，不该报中止");
+        assert_eq!(outcome.skipped, 0);
+        let stored = client
+            .stat("small.bin")
+            .unwrap()
+            .expect("服务器上该有这一份");
+        assert_eq!(stored.size, crate::remote::small_bytes().len() as u64);
     }
 
     #[test]

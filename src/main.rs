@@ -36,6 +36,7 @@ mod term_entity;
 mod terminal;
 mod throttle;
 mod thumbnails;
+mod volumes;
 mod watch;
 
 #[cfg(test)]

@@ -3488,3 +3488,71 @@ fn run_one_copy(
     wait_until_idle(cx, ops);
     started.elapsed()
 }
+
+#[gpui_kit::test]
+fn the_sidebar_lists_volumes_and_one_click_goes_there(cx: &mut TestAppContext) {
+    // 和 volumes 模块里的单测共用一把锁：两边改的是同一份 override。
+    let _serial = crate::volumes::test_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("USB");
+    std::fs::create_dir(&disk).unwrap();
+    std::fs::write(disk.join("a.txt"), "插上的盘").unwrap();
+
+    // 跑测试的机器上大概率一个卷都没有，真扫出来是空的；
+    // 钉一个假的才能验那几行。
+    crate::volumes::set_override(vec![crate::volumes::Volume {
+        name: "USB".to_string(),
+        path: disk.clone(),
+    }]);
+    let (session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let row = window
+            .try_find(("volume", 0usize))
+            .expect("侧栏该列出刚挂上的那个卷");
+        // `label()` 取的是读屏文案：光念 "USB" 不知道那是块盘。
+        assert_eq!(row.label(), Some("磁盘：USB"), "读屏要听得懂这是块盘");
+    });
+
+    // 点一下就该过去——挂载点跟普通目录没有任何区别，
+    // 这正是"不做专用传输 UI"要保证的那件事。
+    // 点的是行本身。外面那层 `volume-drop` 只是拖放用的壳，
+    // 它没调 `.test_support()`，观察表里没有它的条目（只有别的元素
+    // 路过时把它记成祖先）——`place-drop` 同样点不到，这里没必要学它。
+    step(cx, handle, |window, cx| {
+        window.click(("volume", 0usize), cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 单栏布局里没有 `pane-slot` 那层壳（多包一层会把虚拟列表挤扁），
+        // 所以直接按 `row-name` 找，不走 `row_names_in`。
+        let name = window
+            .try_find(("row-name", 0usize))
+            .and_then(|row| row.label().map(|label| label.to_string()))
+            .unwrap_or_default();
+        assert_eq!(name, "a.txt", "该切到 U 盘里并看到内容，实际是 {name:?}");
+    });
+
+    drop(session);
+    crate::volumes::clear_override();
+}
+
+#[gpui_kit::test]
+fn an_empty_machine_shows_no_volumes_section(cx: &mut TestAppContext) {
+    let _serial = crate::volumes::test_guard();
+    crate::volumes::set_override(Vec::new());
+    let dir = tempfile::tempdir().unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find(("volume", 0usize)).is_none(),
+            "一个卷都没挂时不该留一个空分组"
+        );
+    });
+
+    crate::volumes::clear_override();
+}

@@ -978,6 +978,11 @@ impl Pane {
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        // 卷会热插拔，而插拔事件三个平台给得都不一样（见 `volumes`
+        // 模块注释），所以靠"用户明确刷了一下"来重扫。放在这儿而不是
+        // 只挂在命令面板上：Cmd+R 走的是窗格自己的 `on_action`，
+        // 挂 app 层的话这条最常用的路反而漏掉了。
+        crate::volumes::rescan_now();
         let path = self.listing.path().to_path_buf();
         // 远程目录刷新 = 重新问一次服务器（缓存丢掉，别拿旧的糊弄）。
         if let Some((id, sub)) = remote::parse_location(&path) {

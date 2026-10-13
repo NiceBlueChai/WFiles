@@ -62,6 +62,7 @@ cargo fmt --check
 | `src/remotes.rs` | 远程连接注册表实体：客户端、目录缓存、后台列目录与下载（界面线程不做网络）；远程编辑：下载到临时目录 → 监听 → 按指纹去重回传 |
 | `src/s3.rs` | S3 兼容对象存储客户端：SigV4 签名、桶的两种写法、前缀当文件夹用 |
 | `src/watch.rs` | 文件系统监听（notify） |
+| `src/volumes.rs` | 本机挂着的卷：三个平台各自的扫描落点、3 秒 TTL 快照缓存 |
 | `src/ui_tests.rs` | 无头窗口 UI 集成测试 |
 | `ROADMAP.md` | 产品路线图：功能范围、阶段划分、明确不做清单 |
 | `docs/cross-platform-filesystem.md` | 三平台文件系统约束调研（文件名/路径/回收站元数据） |

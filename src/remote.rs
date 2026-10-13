@@ -973,9 +973,41 @@ fn big_status() -> String {
     )
 }
 
+/// 一个比单个数据块还小的文件：专治"中止恰好落在最后一个字节上"那类情形。
+///
+/// [`big_bytes`] 反而不适合验这个——它有多大全看 socket 缓冲，
+/// 这块缓冲一变，"一次读完全文"就从必然变成偶尔，测试就成了薛定谔的。
+#[cfg(test)]
+const SMALL_LEN: usize = 64;
+
+/// [`big_bytes`] 的小号版，同样按序号取模，好逐字节核对。
+#[cfg(test)]
+pub(crate) fn small_bytes() -> Vec<u8> {
+    (0..SMALL_LEN).map(|ix| (ix % 251) as u8).collect()
+}
+
+/// `small.bin` 的 PROPFIND 响应，大小跟 [`small_bytes`] 一致。
+#[cfg(test)]
+fn small_status() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/dav/small.bin</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>small.bin</d:displayname>
+      <d:getcontentlength>{SMALL_LEN}</d:getcontentlength>
+      <d:getlastmodified>Wed, 21 Oct 2015 07:28:00 GMT</d:getlastmodified>
+      <d:resourcetype/>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod fake {
-    use super::{FILESTATUS, MULTISTATUS, big_bytes, big_status};
+    use super::{FILESTATUS, MULTISTATUS, big_bytes, big_status, small_bytes, small_status};
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -1063,6 +1095,11 @@ pub(crate) mod fake {
                 "application/xml",
                 big_status().into_bytes(),
             ),
+            "PROPFIND" if target == "/dav/small.bin" => (
+                "207 Multi-Status",
+                "application/xml",
+                small_status().into_bytes(),
+            ),
             "PROPFIND" if known(&target) => (
                 "207 Multi-Status",
                 "application/xml",
@@ -1073,6 +1110,18 @@ pub(crate) mod fake {
             // 这两个分支的条件有重叠，顺序反了就永远轮不到它。
             "GET" if target == "/dav/big.bin" => {
                 let body = big_bytes();
+                match range {
+                    Some(start) if (start as usize) < body.len() => (
+                        "206 Partial Content",
+                        "application/octet-stream",
+                        body[start as usize..].to_vec(),
+                    ),
+                    Some(_) => ("416 Range Not Satisfiable", "text/plain", Vec::new()),
+                    None => ("200 OK", "application/octet-stream", body),
+                }
+            }
+            "GET" if target == "/dav/small.bin" => {
+                let body = small_bytes();
                 match range {
                     Some(start) if (start as usize) < body.len() => (
                         "206 Partial Content",
@@ -1108,11 +1157,11 @@ pub(crate) mod fake {
         let _ = stream.flush();
     }
 
-    /// 假服务器上"存在"的路径：连接根和 `folder` 一处目录。
+    /// 假服务器上"存在"的路径：连接根、`folder` 一处目录，两个二进制文件。
     fn known(target: &str) -> bool {
         matches!(
             target,
-            "/dav/" | "/dav/folder" | "/dav/folder/" | "/dav/big.bin"
+            "/dav/" | "/dav/folder" | "/dav/folder/" | "/dav/big.bin" | "/dav/small.bin"
         )
     }
 

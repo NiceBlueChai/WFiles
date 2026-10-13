@@ -531,6 +531,7 @@ impl WFilesApp {
                     )
                     .children(items),
             )
+            .child(self.render_volumes_section(cx))
             .child(self.render_cloud_section(cx))
             .child(self.render_remote_section(cx))
             .child(div().flex_1())
@@ -545,6 +546,70 @@ impl WFilesApp {
                     .child(Icon::new(IconName::HardDrive).size_4())
                     .child("本地文件系统"),
             )
+    }
+
+    /// 侧栏的「磁盘」区：本机挂着的卷（外接盘、U 盘、网络共享）一条一行。
+    ///
+    /// 一个卷都没挂的时候整块都不出现——跟云盘那一条一个道理，
+    /// 空分组比没有更烦人。
+    ///
+    /// 排在云盘上面：插 U 盘找它是眼下最急的一件事，不该排在云盘后面。
+    fn render_volumes_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.tabs[self.active].read(cx).path().to_path_buf();
+        let volumes = crate::volumes::detected();
+        if volumes.is_empty() {
+            return div().into_any_element();
+        }
+
+        let rows: Vec<AnyElement> = volumes
+            .iter()
+            .enumerate()
+            .map(|(index, volume)| {
+                let target = volume.path.clone();
+                let spoken = volume.spoken();
+                let row = ListItem::new(("volume", index))
+                    .rounded(cx.theme().radius)
+                    .selected(current == volume.path)
+                    .accessibility_label(spoken)
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(Icon::new(IconName::HardDrive).size_4())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(volume.name.clone()),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.navigate_active_tab(target.clone(), window, cx);
+                    }));
+                // 拖到某个卷上 = 拷进去，跟拖到"位置"里的"下载"是一个道理。
+                Self::drop_target(
+                    div().id(("volume-drop", index)).child(row),
+                    volume.path.clone(),
+                    cx,
+                )
+                .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .p_2()
+            .gap_1()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("磁盘"),
+            )
+            .children(rows)
+            .into_any_element()
     }
 
     /// 侧栏的"云盘"区：本机上找得到的同步文件夹，一条一行。
