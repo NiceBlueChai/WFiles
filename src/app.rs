@@ -2485,6 +2485,7 @@ impl WFilesApp {
             // 只有带 id 的 Stateful<Div> 才有，所以先落一个 id。
             let list = div()
                 .id("palette-list")
+                .test_support()
                 .flex()
                 .flex_col()
                 .max_h(px(380.))
@@ -2495,13 +2496,21 @@ impl WFilesApp {
         };
 
         let card = v_flex()
+            .id("palette-card")
+            .test_support()
             .w(px(600.))
+            // 跟对话框同一道约束：600 px 是常用宽度，但窗口可以是 520 px。
+            // 实测不加这句时卡片 x = -39、右边缘 559，两边各溢出几十像素，
+            // "Esc 关闭"那行提示条直接看不见。
+            .max_w_full()
+            .max_h_full()
             .rounded(cx.theme().radius)
             .border_1()
             .border_color(border)
             .bg(cx.theme().background)
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_2()
                     .px_3()
@@ -2511,9 +2520,11 @@ impl WFilesApp {
                     .child(Icon::new(IconName::Search).size_4().text_color(muted))
                     .child(Input::new(&input).cleanable(true).w_full()),
             )
-            .child(body)
+            // 列表自己滚：命令很多时它让出高度，输入框与底部提示条留在原地。
+            .child(div().flex_1().min_h_0().child(body))
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .h(px(30.))
                     .px_3()
                     .gap_3()
@@ -2535,7 +2546,12 @@ impl WFilesApp {
             .flex()
             .flex_col()
             .items_center()
+            // 顶部 90 px 是"命令面板从上方落下来"的手感，不是安全边距——
+            // 它得跟内容高度一起被窗口高度管住，所以改成"最多下探 90 px"：
+            // 窗口够高时在 90 px 处，窗口不够高时贴着上边。
             .pt(px(90.))
+            .px_4()
+            .max_h_full()
             .bg(cx.theme().overlay)
             .on_click(cx.listener(|this, _, _, cx| this.close_palette(cx)))
             .child(card)
@@ -2995,9 +3011,21 @@ impl WFilesApp {
             .child(undo_button)
     }
 
-    /// 半透明遮罩 + 居中卡片。确认、冲突、输入三类对话框共用。
+    /// 半透明遮罩 + 居中卡片。确认、冲突、输入、批量重命名、连接五类对话框共用。
     ///
     /// 点遮罩等于取消；卡片内部的点击不会传到遮罩上。
+    ///
+    /// 两道约束都是量出来的，不是预防性防御：
+    ///
+    /// - **宽度**：卡片宽是写死的（420–620 px），而窗口可以是 520 px。
+    ///   实测批量重命名那张 620 px 的卡在 520 px 窗口里 `x = -50`、
+    ///   右边缘 570 px——**左右各溢出 50 px**，确认/取消两颗按钮有一半在屏幕外，
+    ///   而用户在屏幕上只看到半张卡片，不知道还能往哪儿点。
+    ///   做法是给遮罩加 16 px 内边距、卡片加 `max_w_full`，让它在窄窗口里
+    ///   自己退到可用宽度，而不是靠裁剪。
+    /// - **高度**：卡片没有高度上限，正文一多页脚就掉到窗口外面去。
+    ///   做法是正文那一段自己滚，页脚留在卡片底部——**"确认/取消"永远在、
+    ///   永远点得到**，这是对话框唯一不能缺的东西。
     fn overlay_card(
         title: String,
         width: Pixels,
@@ -3011,17 +3039,25 @@ impl WFilesApp {
         let for_escape = close.clone();
         div()
             .id("overlay")
+            .test_support()
             .absolute()
             .inset_0()
             .flex()
             .items_center()
             .justify_center()
+            // 这 16 px 是卡片的活动余量：卡片自己再窄，也要留一圈边距，
+            // 否则窄窗口下它会贴到窗口边上、边框被切掉一半。
+            .px_4()
+            .py_6()
             // 遮罩是卡片的**兄弟**，不是它的父级：点事件会顺着元素树往上冒，
             // 挂在父级上就等于"点卡片里任何一个按钮都会顺手把对话框关掉"——
             // 比如连接失败那句话刚写进去，对话框就没了。
+            //
+            // 它是 absolute 的，铺的是整个 overlay 容器，不受上面那圈内边距影响。
             .child(
                 div()
                     .id("overlay-backdrop")
+                    .test_support()
                     .absolute()
                     .inset_0()
                     .bg(cx.theme().overlay)
@@ -3034,21 +3070,38 @@ impl WFilesApp {
             .child(
                 v_flex()
                     .id("overlay-card")
+                    .test_support()
                     .w(width)
+                    // 窄窗口里退到可用宽度（遮罩宽度减去那圈内边距）。
+                    // 用 `max_w_full` 而不是直接写死一个小宽度：正常窗口下这张卡
+                    // 还是自己声明的宽度，只有装不下的时候才让位。
+                    .max_w_full()
+                    // 高度同理。窗口再矮，正文滚动、页脚不动。
+                    .max_h_full()
                     .gap_4()
                     .p_5()
                     .rounded(cx.theme().radius)
                     .border_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
-                    // 点击往下传是按 z 序来的：遮罩虽然不是卡片的父级，
+                    // 点击往下传是按z 序来的：遮罩虽然不是卡片的父级，
                     // 但它在卡片下面、又铺满整屏，所以卡片里任何一个按钮按下
                     // 都会"漏"到遮罩上把对话框关掉（连接失败那句话刚写进去就没了）。
                     // 这里在卡片上收住：按钮先执行，卡片把事件掐断，遮罩收不到。
                     .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
-                    .child(div().font_semibold().child(title))
-                    .child(body)
-                    .child(h_flex().justify_end().gap_2().child(footer)),
+                    .child(div().font_semibold().flex_shrink_0().child(title))
+                    // 正文是唯一会自己变长的一段，所以滚动放在它身上：
+                    // 标题与页脚留在原地，页脚里的按钮永远不会被滚走。
+                    .child(
+                        div()
+                            .id("overlay-body")
+                            .test_support()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(body),
+                    )
+                    .child(h_flex().flex_shrink_0().justify_end().gap_2().child(footer)),
             )
             // 焦点在对话框里的输入框上时，按键事件会冒到这里——
             // 于是每个对话框都认 Esc，不用各自再挂一次。

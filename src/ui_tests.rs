@@ -7,7 +7,7 @@
 use gpui_kit::point;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Bounds, Point, TestAppContext, WindowBounds, WindowOptions};
-use gpui_kit::{base::Root, px, size};
+use gpui_kit::{Pixels, base::Root, px, size};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -4194,4 +4194,217 @@ fn a_long_undo_label_cannot_push_the_status_bar_off_screen(cx: &mut TestAppConte
             undo.size.width,
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 浮层：对话框与命令面板在窄窗口里也必须完整可用
+// ---------------------------------------------------------------------------
+
+/// 临时目录里摆八个文件，够撑起列表也够触发批量重命名。
+fn overlay_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("临时目录");
+    for i in 0..8 {
+        std::fs::write(dir.path().join(format!("f{i}.txt")), "x").expect("造文件");
+    }
+    dir
+}
+
+/// 把某个元素量出来，顺带把它的右边缘算好——越界判据关心的就是这条边。
+fn bounds_of(window: &mut gpui_kit::Window, id: &str, width: f32, what: &str) -> Bounds<Pixels> {
+    window
+        .try_find(id.to_string())
+        .map(|element| element.bounds())
+        .unwrap_or_else(|| panic!("窗口 {width}：找不到{what}（element id 变了？）"))
+}
+
+/// 每一层浮层都得留在窗口里。
+///
+/// 判据是**四条边都在窗口内**——只查右边不够：卡片居中放置，窄到超过
+/// 遮罩宽度时是**左右同时**溢出（实测批量重命名那张620px 的卡在 520px
+/// 窗口里 `x = -50`），只查右边会漏掉左半边按钮点不到的情况。
+fn assert_inside_window(bounds: Bounds<Pixels>, width: f32, what: &str) {
+    let right = bounds.origin.x + bounds.size.width;
+    assert!(
+        bounds.origin.x >= px(0.) && right <= px(width),
+        "{what} 左 {width}px、右 {}px，越出窗口 {}px——\
+         浮层宽度是写死的，装不下时该退到可用宽度，而不是被裁掉一半",
+        right,
+        bounds.origin.x,
+    );
+}
+
+/// 对话框卡片在窄窗口里必须完整可见，页脚按钮必须点得到。
+///
+/// 三类对话框都在同一张卡上（[`WFilesApp::overlay_card`]），所以测三类：
+/// 420px 的重命名框、460px 的连接框、620px 的批量重命名框——620 是最宽的，
+/// 也是最容易把 520px 的窗口撑破的那一张。
+#[gpui_kit::test]
+fn every_dialog_stays_inside_a_narrow_window(cx: &mut TestAppContext) {
+    for width in [1180.0f32, 700.0, 520.0] {
+        // 重命名框：420px
+        {
+            let dir = overlay_fixture();
+            let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+            step(cx, handle, settle);
+            step(cx, handle, |window, cx| {
+                window.press("down", cx);
+                settle(window, cx);
+            });
+            step(cx, handle, |window, cx| {
+                window.press("f2", cx);
+                settle(window, cx);
+            });
+            step_value(cx, handle, |window, cx| {
+                settle(window, cx);
+                assert_inside_window(
+                    bounds_of(window, "overlay-card", width, "重命名对话框"),
+                    width,
+                    "重命名对话框",
+                );
+                let ok = bounds_of(window, "prompt-ok", width, "重命名对话框的确认按钮");
+                assert!(
+                    ok.origin.x >= px(0.) && ok.origin.x + ok.size.width <= px(width),
+                    "确认按钮左 {}px、右 {}px（窗口 {width}px）",
+                    ok.origin.x,
+                    ok.origin.x + ok.size.width,
+                );
+            });
+        }
+        // 连接框：460px
+        {
+            let dir = overlay_fixture();
+            let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+            step(cx, handle, settle);
+            step(cx, handle, |window, cx| {
+                window.press("cmd-p", cx);
+                settle(window, cx);
+            });
+            step(cx, handle, |window, cx| {
+                window.input("连接远程服务器", cx);
+                settle(window, cx);
+            });
+            step(cx, handle, |window, cx| {
+                window.click("app:connect", cx);
+                settle(window, cx);
+            });
+            step_value(cx, handle, |window, cx| {
+                settle(window, cx);
+                assert_inside_window(
+                    bounds_of(window, "overlay-card", width, "连接对话框"),
+                    width,
+                    "连接对话框",
+                );
+                assert_inside_window(
+                    bounds_of(window, "connect-ok", width, "连接对话框的连接按钮"),
+                    width,
+                    "连接按钮",
+                );
+            });
+        }
+        // 批量重命名框：620px，最宽的那一张
+        {
+            let dir = overlay_fixture();
+            let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+            step(cx, handle, settle);
+            step(cx, handle, |window, cx| {
+                window.press("cmd-a", cx);
+                settle(window, cx);
+            });
+            step(cx, handle, |window, cx| {
+                window.press("cmd-shift-r", cx);
+                settle(window, cx);
+            });
+            step_value(cx, handle, |window, cx| {
+                settle(window, cx);
+                assert_inside_window(
+                    bounds_of(window, "overlay-card", width, "批量重命名对话框"),
+                    width,
+                    "批量重命名对话框",
+                );
+                assert_inside_window(
+                    bounds_of(window, "bulk-ok", width, "批量重命名对话框的执行按钮"),
+                    width,
+                    "执行重命名按钮",
+                );
+            });
+        }
+    }
+}
+
+/// 命令面板也得跟着窗口收窄。
+///
+/// 它不走 `overlay_card`（自己一套顶部落下的布局），但同一条约束：600px
+/// 写死的宽度在 520px 的窗口里会溢出，而溢出的正好是底部"Esc 关闭"那行提示
+/// ——那行是新手唯一能看见的键位说明。
+#[gpui_kit::test]
+fn the_command_palette_stays_inside_a_narrow_window(cx: &mut TestAppContext) {
+    for width in [1180.0f32, 700.0, 520.0] {
+        let dir = overlay_fixture();
+        let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+        step(cx, handle, settle);
+        step(cx, handle, |window, cx| {
+            window.press("cmd-p", cx);
+            settle(window, cx);
+        });
+
+        step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            assert_inside_window(
+                bounds_of(window, "palette-card", width, "命令面板"),
+                width,
+                "命令面板",
+            );
+        });
+    }
+}
+
+/// 对话框的正文自己滚，页脚留在卡片底部。
+///
+/// 这条守的是"内容再多，按钮也不会掉出窗口"：正文那一段带
+/// `overflow_y_scroll`，页脚是它的兄弟而不是子节点，所以正文滚多长都推不动
+/// 页脚。反过来（把按钮塞进滚动区里）滚到底之前就点不到它。
+#[gpui_kit::test]
+fn the_dialog_footer_survives_a_scrolling_body(cx: &mut TestAppContext) {
+    let dir = overlay_fixture();
+    // 批量重命名是唯一带滚动列表的对话框，用它验。
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 520.);
+    step(cx, handle, settle);
+    step(cx, handle, |window, cx| {
+        window.press("cmd-a", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-shift-r", cx);
+        settle(window, cx);
+    });
+
+    step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        let card = bounds_of(window, "overlay-card", 520., "批量重命名对话框");
+        let body = bounds_of(window, "overlay-body", 520., "对话框正文区");
+        let ok = bounds_of(window, "bulk-ok", 520., "执行重命名按钮");
+
+        // 页脚在卡片的下半部分：正文在上、按钮在下，两条不重叠。
+        assert!(
+            ok.origin.y > body.origin.y,
+            "执行按钮（y={}）该在正文区（y={}，高 {}）下方——\
+             按钮在正文里的话，正文一长就被滚走了",
+            ok.origin.y,
+            body.origin.y,
+            body.size.height,
+        );
+        // 正文与页脚都还在卡片里。
+        assert!(
+            body.origin.y + body.size.height <= card.origin.y + card.size.height,
+            "正文区底边 {}px 越出卡片底边 {}px",
+            body.origin.y + body.size.height,
+            card.origin.y + card.size.height,
+        );
+        assert!(
+            ok.origin.y + ok.size.height <= card.origin.y + card.size.height,
+            "执行按钮底边 {}px 越出卡片底边 {}px",
+            ok.origin.y + ok.size.height,
+            card.origin.y + card.size.height,
+        );
+    });
 }
