@@ -61,6 +61,14 @@ pub struct Settings {
     /// 单位解析器，而写错了还得猜用户想说的是 1000 还是 1024。
     #[serde(default)]
     pub speed_limit: u64,
+    /// 界面语言，存 `i18n::Locale::code()`（`zh-Hans` / `en`）。
+    ///
+    /// 存字符串而不是枚举，跟 `meta_column` 同一个理由：
+    /// 手改配置写错一个字，最多退回"跟着系统走"，
+    /// 不会让整份配置解析失败——那会把终端、标记、快捷键一起弄丢。
+    /// 认不出来的串在 [`Settings::locale`] 里被当成"没设"。
+    #[serde(default)]
+    pub locale: String,
 }
 
 /// 一个存下来的搜索。
@@ -148,6 +156,9 @@ impl Default for Settings {
             remotes: Vec::new(),
             meta_column: String::new(),
             speed_limit: 0,
+            // 空串 = "跟着系统走"。不是直接写死中文：一份英文系统上刚装好
+            // 就该是英文，让用户自己去设置里挑语言是把默认值做成了默认值。
+            locale: String::new(),
         }
     }
 }
@@ -195,6 +206,27 @@ impl Settings {
             let _ = settings.save();
             result
         })
+    }
+
+    /// 当前生效的界面语言。
+    ///
+    /// 优先级：**命令行 > 设置 > 系统环境 > 中文**。
+    /// 命令行排最前，因为它是"这一次启动我要什么"——脚本、录屏演示，
+    /// 不该因为配置文件里存着别的语言就跑偏。
+    ///
+    /// 设置里那格存空串时**跟着系统环境走**（`LANG=zh_CN.UTF-8` → 简中），
+    /// 环境也认不出来才落到中文。系统环境排在设置之后：用户在自己机器上
+    /// 显式选过一次，比系统的全局默认更该算数。
+    pub fn locale(&self) -> crate::i18n::Locale {
+        crate::i18n::cli_locale()
+            .or_else(|| crate::i18n::Locale::parse(&self.locale))
+            .or_else(crate::i18n::Locale::from_env)
+            .unwrap_or_default()
+    }
+
+    /// 记下界面语言。空串 = 跟着系统走。
+    pub fn set_locale(&mut self, locale: crate::i18n::Locale) {
+        self.locale = locale.code().to_string();
     }
 
     /// 这个目录上次用的排序与视图；没记住过就是 `None`，由调用方决定默认值。

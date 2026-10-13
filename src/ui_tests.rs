@@ -4806,3 +4806,94 @@ fn quick_look_fits_a_narrow_window(cx: &mut TestAppContext) {
     });
     assert!(gone, "点了「关闭」Quick Look 还开着");
 }
+
+/// 读某个元素上的**无障碍名**。
+///
+/// 名字叫 `text_at` 是错的：它读不到界面上显示的字。GPUI 的测试快照只收了
+/// 无障碍属性，`ElementSnapshot::value()` 的文档原话是
+/// "not rendered text or pixels"，而 `Button::tooltip()` 与 `ListItem` 的
+/// 无障碍名都**不进快照**（插探针量过：带 tooltip 的按钮 `label=None`，
+/// 纯 div 也 `label=None`，只有显式 `accessibility_label` 的元素才有值）。
+///
+/// 所以验 i18n 只有一条路可走：**给要验的那几处文案补上无障碍名**。
+/// 这不是为测试改代码——侧栏的品牌标语、段落标题本来就该有，
+/// 读屏软件现在念不出它们。
+fn a11y_label_at(window: &mut gpui_kit::Window, id: &str) -> String {
+    window
+        .try_find(id.to_string())
+        .and_then(|element| element.label().map(|label| label.to_string()))
+        .unwrap_or_default()
+}
+
+#[gpui_kit::test]
+fn the_sidebar_speaks_english_when_english_is_chosen(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    // 默认中文（隔离目录里没有设置文件，而 CI 上 LANG 通常是 C/POSIX，
+    // 认不出语言 → 回落中文）。
+    let chinese = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            a11y_label_at(window, "sidebar-tagline"),
+            a11y_label_at(window, "sidebar-places-title"),
+            a11y_label_at(window, "sidebar-local"),
+        )
+    });
+    assert_eq!(chinese.0, "快速、清楚、可撤销");
+    assert_eq!(chinese.1, "位置");
+    assert_eq!(chinese.2, "本地文件系统");
+
+    // 改语言之后**重画一遍**界面上就得是英文。
+    // 这一步是这一批 i18n 唯一的真验证：查表函数返回什么我说了算，
+    // 界面会不会跟着变，只有真的切一次语言才知道。
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+
+    let english = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            a11y_label_at(window, "sidebar-tagline"),
+            a11y_label_at(window, "sidebar-places-title"),
+            a11y_label_at(window, "sidebar-local"),
+        )
+    });
+    assert_eq!(english.0, "Fast, clear, undoable");
+    assert_eq!(english.1, "Places");
+    assert_eq!(english.2, "Local file system");
+}
+
+#[gpui_kit::test]
+fn sidebar_place_names_follow_the_chosen_language(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+
+    // 「个人文件夹 / 桌面 / 文稿 / 下载」这一组：它们在 `places()` 里是
+    // `&'static str`，界面上是 ListItem 的 label。
+    let names = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        let mut names = Vec::new();
+        for index in 0usize..8 {
+            let Some(item) = window.try_find(("place", index)) else {
+                break;
+            };
+            names.push(item.label().unwrap_or_default().to_string());
+        }
+        names
+    });
+
+    // 一个都没有 = 侧栏压根没画出来，这条断言就不会失败——那是假的通过。
+    assert!(!names.is_empty(), "侧栏一个「位置」条目都没有");
+    // 家目录在 macOS 上叫 "Home"；只要全部是英文、不含中文就算过。
+    assert!(
+        names
+            .iter()
+            .all(|name| !name.chars().any(|c| c as u32 > 0x2E80)),
+        "切到英文之后侧栏条目里还有中文：{names:?}"
+    );
+}

@@ -520,10 +520,13 @@ impl WFilesApp {
             .enumerate()
             .map(|(index, (label, icon, path))| {
                 let target = path.clone();
+                // 查一次，标签与无障碍名共用：两边不一致的话读屏软件会念出
+                // 一个界面上根本不存在的词条，而用户看不见它错在哪。
+                let label = crate::i18n::tr(cx, label);
                 let item = ListItem::new(("place", index))
                     .rounded(cx.theme().radius)
                     .selected(current == path)
-                    .accessibility_label(label)
+                    .accessibility_label(label.clone())
                     .child(
                         h_flex()
                             .gap_3()
@@ -577,9 +580,12 @@ impl WFilesApp {
                     .child(
                         v_flex().child(div().font_semibold().child("WFiles")).child(
                             div()
+                                .id("sidebar-tagline")
+                                .test_support()
+                                .aria_label(crate::i18n::tr(cx, "快速、清楚、可撤销"))
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("快速、清楚、可撤销"),
+                                .child(crate::i18n::tr(cx, "快速、清楚、可撤销")),
                         ),
                     )
                     .child(
@@ -588,7 +594,7 @@ impl WFilesApp {
                             .ghost()
                             .small()
                             .ml_auto()
-                            .tooltip("收起侧栏（Cmd+B）")
+                            .tooltip(crate::i18n::tr(cx, "收起侧栏（Cmd+B）"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.sidebar_collapsed = true;
                                 cx.notify();
@@ -601,12 +607,15 @@ impl WFilesApp {
                     .gap_1()
                     .child(
                         div()
+                            .id("sidebar-places-title")
+                            .test_support()
+                            .aria_label(crate::i18n::tr(cx, "位置"))
                             .px_3()
                             .py_2()
                             .text_xs()
                             .font_medium()
                             .text_color(cx.theme().muted_foreground)
-                            .child("位置"),
+                            .child(crate::i18n::tr(cx, "位置")),
                     )
                     .children(items),
             )
@@ -616,6 +625,9 @@ impl WFilesApp {
             .child(div().flex_1())
             .child(
                 h_flex()
+                    .id("sidebar-local")
+                    .test_support()
+                    .aria_label(crate::i18n::tr(cx, "本地文件系统"))
                     .m_2()
                     .p_3()
                     .gap_2()
@@ -623,7 +635,7 @@ impl WFilesApp {
                     .bg(cx.theme().muted)
                     .text_sm()
                     .child(Icon::new(IconName::HardDrive).size_4())
-                    .child("本地文件系统"),
+                    .child(crate::i18n::tr(cx, "本地文件系统")),
             )
             .into_any_element()
     }
@@ -640,12 +652,14 @@ impl WFilesApp {
             .enumerate()
             .map(|(index, (label, icon, path))| {
                 let target = path.clone();
+                // 同上：tooltip 与无障碍名共用一句翻译。
+                let label = crate::i18n::tr(cx, label);
                 Button::new(("collapsed-place", index))
                     .icon(icon)
                     .ghost()
                     .small()
                     .selected(current == path)
-                    .tooltip(label)
+                    .tooltip(label.clone())
                     .accessibility_label(label)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.navigate_active_tab(target.clone(), window, cx);
@@ -669,8 +683,8 @@ impl WFilesApp {
                     .icon(IconName::PanelLeftOpen)
                     .ghost()
                     .small()
-                    .tooltip("展开侧栏（Cmd+B）")
-                    .accessibility_label("展开侧栏")
+                    .tooltip(crate::i18n::tr(cx, "展开侧栏（Cmd+B）"))
+                    .accessibility_label(crate::i18n::tr(cx, "展开侧栏"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_collapsed = false;
                         cx.notify();
