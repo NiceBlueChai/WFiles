@@ -3291,22 +3291,42 @@ impl WFilesApp {
         let muted = cx.theme().muted_foreground;
         let danger = cx.theme().danger;
 
-        let labeled = |label: &'static str, input: &Entity<InputState>| {
+        // 每个输入框带自己的 element id：布局测试要按名字量宽度，
+        // 而"名字模板"这五个框宽窄不一（260/120/120/80/70），只能一把把量。
+        let labeled = |id: &'static str, label: &'static str, input: &Entity<InputState>| {
             v_flex()
+                .id(id)
+                .test_support()
                 .gap_1()
                 .min_w_0()
                 .child(div().text_xs().text_color(muted).child(label))
                 .child(Input::new(input).w_full())
         };
 
-        let rules = h_flex()
+        // 五个框分两行，跟地址栏 / 工具栏分两行是同一个道理。
+        //
+        // 一行摆不下：260+120+120+80+70 = 650，加四个 12px 间隙 = 698 px，
+        // 而 620 px 的卡片扣掉两 padding 只剩 580 px。挤在一行的后果不是
+        // "窄了点"，是**五个框全都在缩**——实测 1180 px 的宽窗口下也一样：
+        // 模板 260 → 212、查找 120 → 98、步长 70 → 57，每个框都被按比例削掉
+        // 十几个像素。窗口越宽越显得莫名其妙，因为问题跟窗口根本没关系。
+        //
+        // 模板是主角（{name}_{n}_副本 这一串要打得下），给它一整行；
+        // 四个参数是配角，第二行 390 + 36 = 426 px 装得下。
+        let rules = v_flex()
+            .id("bulk-rules")
+            .test_support()
             .gap_3()
-            .items_end()
-            .child(labeled("名字模板", &inputs.template).w(px(260.)))
-            .child(labeled("查找", &inputs.find).w(px(120.)))
-            .child(labeled("替换为", &inputs.replace).w(px(120.)))
-            .child(labeled("起始序号", &inputs.start).w(px(80.)))
-            .child(labeled("步长", &inputs.step).w(px(70.)));
+            .child(labeled("bulk-template", "名字模板", &inputs.template).w_full())
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_end()
+                    .child(labeled("bulk-find", "查找", &inputs.find).w(px(120.)))
+                    .child(labeled("bulk-replace", "替换为", &inputs.replace).w(px(120.)))
+                    .child(labeled("bulk-start", "起始序号", &inputs.start).w(px(80.)))
+                    .child(labeled("bulk-step", "步长", &inputs.step).w(px(70.))),
+            );
 
         // 预览列表：旧名 -> 新名，跳过/冲突的标出来。
         let rows = bulk.previews.iter().enumerate().map(|(index, item)| {

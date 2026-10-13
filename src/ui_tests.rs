@@ -4408,3 +4408,60 @@ fn the_dialog_footer_survives_a_scrolling_body(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// 批量重命名的五个输入框都得拿到自己声明的宽度。
+///
+/// 这条守的是"别再挤成一行"：一行摆下 260+120+120+80+70 加四个间隙是
+/// 698 px，而 620 px 的卡片只剩 580 px 内容宽——挤在一行时**五个框全都在缩**
+/// （实测 1180 px 的宽窗口下模板 260→212、步长 70→57，跟窗口宽窄毫无关系）。
+/// 拆成两行之后，每一行的需求都在可用宽度之内。
+#[gpui_kit::test]
+fn the_bulk_rename_fields_get_the_width_they_ask_for(cx: &mut TestAppContext) {
+    for width in [1180.0f32, 520.0] {
+        let dir = overlay_fixture();
+        let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+        step(cx, handle, settle);
+        step(cx, handle, |window, cx| {
+            window.press("cmd-a", cx);
+            settle(window, cx);
+        });
+        step(cx, handle, |window, cx| {
+            window.press("cmd-shift-r", cx);
+            settle(window, cx);
+        });
+
+        step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            for (id, want) in [
+                ("bulk-find", 120.),
+                ("bulk-replace", 120.),
+                ("bulk-start", 80.),
+                ("bulk-step", 70.),
+            ] {
+                let got = bounds_of(window, id, width, id).size.width;
+                assert!(
+                    got >= px(want),
+                    "窗口 {width}：{id} 要 {want} px，实得 {got} px——\
+                     五个框又被挤回一行了",
+                );
+            }
+            // 模板独占一行：它下面那行（查找/替换/起始/步长）的顶边必须在它底下。
+            let template = bounds_of(window, "bulk-template", width, "名字模板输入框");
+            let find = bounds_of(window, "bulk-find", width, "查找输入框");
+            assert!(
+                find.origin.y > template.origin.y,
+                "窗口 {width}：查找框（y={}）该在模板框（y={}）下方——\
+                 模板要占一整行，那是它唯一能打得下完整模板串的地方",
+                find.origin.y,
+                template.origin.y,
+            );
+            // 模板是撑开的那一个：比它下面任何一格都宽。
+            assert!(
+                template.size.width > find.size.width,
+                "窗口 {width}：模板框 {}px 该比参数框 {}px 宽",
+                template.size.width,
+                find.size.width,
+            );
+        });
+    }
+}
