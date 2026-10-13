@@ -36,6 +36,18 @@ pub enum Locale {
 }
 
 impl Locale {
+    /// 界面上显示的名字。
+    ///
+    /// **用该语言自己写**，跟设置列表里那条一致：一个人在英文界面里
+    /// 找 "English" 比找 "英文（简体）" 容易得多，而中文用户在中文界面里
+    /// 看到 "简体中文" 也不需要任何解释。
+    pub fn label(self) -> &'static str {
+        match self {
+            Locale::ZhHans => "简体中文",
+            Locale::En => "English",
+        }
+    }
+
     /// 稳定标识，存进设置文件。
     pub fn code(self) -> &'static str {
         match self {
@@ -43,6 +55,9 @@ impl Locale {
             Locale::En => "en",
         }
     }
+
+    /// 全部语言，命令面板里列得出来。
+    pub const ALL: &'static [Locale] = &[Locale::ZhHans, Locale::En];
 
     /// 认一个语言标识。认不出来返回 `None`，由调用方决定回落成什么。
     ///
@@ -124,6 +139,51 @@ pub fn lookup(locale: Locale, text: &str) -> String {
     }
 }
 
+/// 查一句带占位符的文案，并把 `{name}` 换成实参。
+///
+/// **占位符必须带名字**（`{name}` 而不是 `{}`）：英文的语序跟中文不同，
+/// "已在 foo 中打开 3 项" 英文是 "Opened 3 items in foo"——两个实参得能换位置。
+/// 位置不同的代价是每种语言一套拼接代码，而带名字的占位符一套就够。
+///
+/// 实参是 `String` 而不是 `&str`：值多半是刚 `format!` 出来的，
+/// 收 `String` 省掉一次克隆，而这里不在渲染热路径的紧循环里。
+pub fn tr_args(cx: &gpui_kit::App, text: &str, args: &[(&str, String)]) -> String {
+    fill(&tr(cx, text), args)
+}
+
+/// [`tr_args`] 的纯函数内核：在一句已经查好的话里填占位符。
+///
+/// 认不出来的占位符**原样留着**（`{foo}` 留在结果里）：填错了要在输出里看得见，
+/// 悄悄吞掉会让一句"已复制 N 个路径"变成"已复制的路径"。
+fn fill(template: &str, args: &[(&str, String)]) -> String {
+    if !template.contains('{') {
+        return template.to_string();
+    }
+    let mut out = String::with_capacity(template.len() + 32);
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            // 没有配对的 `}`：剩下的原样搬过去，别把句子截断。
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let name = &after[..close];
+        match args.iter().find(|(key, _)| *key == name) {
+            Some((_, value)) => out.push_str(value),
+            None => {
+                out.push('{');
+                out.push_str(name);
+                out.push('}');
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// 英文译文表：中文原文 → 英文。
 ///
 /// 键就是中文原文（见模块注释）。查不到的回落原文，所以**漏一条不会崩，
@@ -145,6 +205,12 @@ static EN: &[(&str, &str)] = &[
     ("桌面", "Desktop"),
     ("文稿", "Documents"),
     ("下载", "Downloads"),
+    // ---- 命令面板（设置类）----
+    // 语言名不翻（`Locale::label` 用该语言自己写），要翻的是它前后那两个字。
+    ("界面语言：跟随系统", "Interface language: follow system"),
+    ("界面语言：{label}", "Interface language: {label}"),
+    ("当前", "Current"),
+    ("视图", "View"),
 ];
 
 /// 英文表里有没有漏掉不该出现的条目：译文等于原文（等于没翻），
@@ -241,5 +307,39 @@ mod tests {
             "英文表里有等于原文或空串的条目：{:?}",
             suspect_entries()
         );
+    }
+
+    #[test]
+    fn named_arguments_are_filled_in_and_the_order_is_the_translation_s() {
+        // 英文把两个实参换了位置——这正是不用 `{}` 顺序占位符的理由。
+        assert_eq!(
+            fill(
+                "已在{name}中打开 {count}",
+                &[("name", "foo".into()), ("count", "3".into())]
+            ),
+            "已在foo中打开 3"
+        );
+        assert_eq!(
+            fill(
+                "Opened {count} items in {name}",
+                &[("name", "foo".into()), ("count", "3".into())]
+            ),
+            "Opened 3 items in foo"
+        );
+    }
+
+    #[test]
+    fn an_unknown_placeholder_stays_visible() {
+        // 填错名字要在输出里看得见，不能悄悄吞掉变成一句缺字的病话。
+        assert_eq!(
+            fill("撤销：{label}（Cmd+Z）", &[("titel", "复制".into())]),
+            "撤销：{label}（Cmd+Z）"
+        );
+        // 没有配对的 `}`：整段原样搬过去，不截断。
+        assert_eq!(
+            fill("未闭合 {label", &[("label", "复制".into())]),
+            "未闭合 {label"
+        );
+        assert_eq!(fill("没有占位符", &[]), "没有占位符");
     }
 }

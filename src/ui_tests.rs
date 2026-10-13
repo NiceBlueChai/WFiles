@@ -4694,10 +4694,15 @@ fn no_breadcrumb_escapes_the_address_bar(cx: &mut TestAppContext) {
 ///
 /// 序号不能写死成"第几层"：临时目录本身带着 `/var/folders/...` 与随机串，
 /// 真实段数比测试自己造出来的层数多好几段。
+///
+/// **从后往前找，不是 `filter_map(…).last()`**：后者会把 0..24 全扫一遍
+/// 才返回最后一个，clippy 也会报它（DoubleEndedIterator 上的 `last`）。
+/// 序号是连续的，从 23 往下第一个命中的就是最大的那个 —— 同样一个结果，
+/// 但一般两三次就返回了。
 fn deepest_crumb(window: &mut gpui_kit::Window) -> Option<Bounds<Pixels>> {
     (0..24usize)
-        .filter_map(|index| window.try_find(("crumb", index)).map(|it| it.bounds()))
-        .last()
+        .rev()
+        .find_map(|index| window.try_find(("crumb", index)).map(|it| it.bounds()))
 }
 
 /// Quick Look 的遮罩要盖住**整个窗口**，不只是窗格那一块。
@@ -4896,4 +4901,155 @@ fn sidebar_place_names_follow_the_chosen_language(cx: &mut TestAppContext) {
             .all(|name| !name.chars().any(|c| c as u32 > 0x2E80)),
         "切到英文之后侧栏条目里还有中文：{names:?}"
     );
+}
+
+#[gpui_kit::test]
+fn the_command_palette_switches_the_interface_language(cx: &mut TestAppContext) {
+    let session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("界面语言", cx);
+    });
+
+    // 面板里要列出两种语言 + "跟随系统"。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("locale:auto").is_some(),
+            "语言列表里没有「跟随系统」"
+        );
+        assert!(
+            window.try_find("locale:zh-Hans").is_some(),
+            "语言列表里没有「简体中文」"
+        );
+        assert!(
+            window.try_find("locale:en").is_some(),
+            "语言列表里没有「English」"
+        );
+    });
+
+    // 点English：面板关上，设置落盘，界面立刻变英文。
+    step(cx, handle, |window, cx| {
+        window.click("locale:en", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("palette-overlay").is_none(),
+            "换完语言后面板应该关上"
+        );
+        assert_eq!(
+            a11y_label_at(window, "sidebar-places-title"),
+            "Places",
+            "换语言之后侧栏没跟着变——设置改了但界面没重画"
+        );
+    });
+
+    // 落盘：刚点完 English 时就该存下 "en"。
+    //
+    // 放在"改回中文"之前 —— 那一步已经把设置清空了，再读文件只会读到空串，
+    // 断言会变成"清空之后确实是空的"，跟"选中的语言有落盘"毫无关系。
+    let stored =
+        Settings::load_from(&session.path().join("settings.json")).expect("settings.json 应该在");
+    assert_eq!(
+        stored.locale, "en",
+        "选中的语言没写进 settings.json，实际是 {:?}",
+        stored.locale
+    );
+    // 反过来：把语言清空，界面回到中文。
+    //
+    // 两条路都验过界面跟着改了，但**验不到"是谁触发的重画"**：
+    // `settle()` 会无条件重画，所以摘掉 `SetLocale` 里的 `cx.notify()`
+    // 测试照样过——面板路径上 `close_palette` 自己就 notify，关面板那次
+    // 重画把界面刷了一遍，看起来像是语言切换生效了。
+    //
+    // 那句 notify 因此是冗余的，但**不能删**：面板是眼下唯一的调用方，
+    // 下一个调用方（设置界面、语言菜单）不会有 close_palette 帮它重画。
+    // GPUI 的测试接口给不出"这次重画是谁要的"，所以这条只能靠人记着。
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.locale = String::new());
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            a11y_label_at(window, "sidebar-places-title"),
+            "位置",
+            "语言改回中文之后侧栏没跟着变"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn follow_system_language_is_a_separate_choice_from_the_current_one(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    // 先选 English：设置里存的是 "en"。
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+    });
+    // 搜索词要用**此刻界面上的那种语言**：上面已经把界面切成英文了，
+    // 而面板条目也已经是英文——输中文搜不到任何东西。
+    // 这不是"面板搜不了中文"，是搜的就是界面上显示的字。
+    step(cx, handle, |window, cx| {
+        window.input("Interface language", cx);
+    });
+
+    // "跟随系统"此刻**不该**标成"当前"——当前是 English。
+    //
+    // 读的是 hint 而不是行的 label：行只把标题喂给 aria_label，
+    // 状态标记是另一个元素（探针量过：三条的 label 都只有标题）。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("locale:auto").is_some(),
+            "「跟随系统」应该在列表里"
+        );
+        assert_eq!(
+            palette_hint(window, "locale:auto"),
+            "",
+            "选了 English 之后「跟随系统」还标着当前"
+        );
+        assert_eq!(
+            palette_hint(window, "locale:en"),
+            "Current",
+            "选了 English 之后 English 那条才该标着当前"
+        );
+    });
+
+    // 点「跟随系统」：设置里存空串，而不是把解析出来的 en 写回去。
+    //
+    // 这两件事必须分得开：把当前语言写回去的话，"跟随系统"就永远失效了——
+    // 用户换了系统语言也不生效，而界面上还写着"跟随系统"，那是在骗人。
+    step(cx, handle, |window, cx| {
+        window.click("locale:auto", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            Settings::peek(cx, |settings| settings.locale.clone()),
+            String::new(),
+            "选「跟随系统」应该把设置里的语言清空"
+        );
+    });
+}
+
+/// 面板里某条命令标着的 hint（"当前"这类状态标记）；没标记就是空串。
+///
+/// 行的 `aria_label` 只有标题，hint 是另一个元素，只能单独读。
+/// 而 hint 是**按需插入**的——没标记的行压根没有这个元素，
+/// 所以"没标记"表现为查不到，而不是查到一个空串。
+fn palette_hint(window: &mut gpui_kit::Window, command_id: &str) -> String {
+    window
+        .try_find(format!("palette-hint:{command_id}"))
+        .and_then(|element| element.label().map(|label| label.to_string()))
+        .unwrap_or_default()
 }

@@ -130,6 +130,10 @@ enum PaletteAction {
     OpenRemote(String),
     /// 设一个搬运限速（字节每秒，0 = 不限速）。
     SetSpeedLimit(u64),
+    /// 换界面语言。
+    SetLocale(crate::i18n::Locale),
+    /// 界面语言改回"跟随系统"（设置里存空串）。
+    SetLocaleAuto,
 }
 
 /// 连接对话框的当前状态。输入框随开随建、随关随毁，密码不留在别处。
@@ -1876,6 +1880,20 @@ impl WFilesApp {
             PaletteAction::Connect => self.open_connect(window, cx),
             PaletteAction::OpenRemote(id) => self.open_remote(id, window, cx),
             PaletteAction::SetSpeedLimit(rate) => self.set_speed_limit(rate, cx),
+            PaletteAction::SetLocale(locale) => {
+                // 存设置 → 全部界面下一次重画就是新语言。
+                // 不逐个 `cx.refresh()`：设置改了但没立刻重画的话，
+                // 用户会看着半中半英的界面以为是自己按错了什么。
+                Settings::update(cx, |settings| settings.set_locale(locale));
+                cx.notify();
+            }
+            PaletteAction::SetLocaleAuto => {
+                // 存空串而不是"把当前解析出来的语言写回去"：后者会让
+                // "跟随系统"永远失效——用户换了系统语言也不生效，
+                // 而界面上还写着"跟随系统"，那是在骗人。
+                Settings::update(cx, |settings| settings.locale = String::new());
+                cx.notify();
+            }
             PaletteAction::ToggleTerminal => self.toggle_terminal(window, cx),
             PaletteAction::SavedSearch(name) => {
                 let Some(saved) = Settings::read(cx).saved_search(&name).cloned() else {
@@ -2283,6 +2301,50 @@ impl WFilesApp {
             });
         }
 
+        // 界面语言。列出来的名字**用该语言自己写**，跟系统语言选择器一个规矩：
+        // 英文界面里那条写 "English"，用户在找英文时一眼认得出来；
+        // 中文界面里同一条写 "简体中文"，也不需要任何解释。
+        //
+        // "跟随系统"是单独一个动作（`SetLocaleAuto`），不是"把当前语言再设一遍"：
+        // 设置里存空串才是真的回到自动，把语言代码写回去是"就停在英文"，
+        // 哪怕此刻显示的就是 "Current"。这两件事搅在一起的话，
+        // 用户点了跟没点一样，下次装个新语言包也还是英文。
+        let stored = Settings::peek(cx, |settings| settings.locale.clone());
+        items.push(PaletteItem {
+            command: PaletteCommand::new(
+                "locale:auto",
+                crate::i18n::tr(cx, "界面语言：跟随系统"),
+                if stored.is_empty() {
+                    crate::i18n::tr(cx, "当前")
+                } else {
+                    String::new()
+                },
+                crate::i18n::tr(cx, "视图"),
+                "language 语言 界面 跟随系统 system locale i18n",
+            ),
+            action: PaletteAction::SetLocaleAuto,
+        });
+        for option in crate::i18n::Locale::ALL {
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("locale:{}", option.code()),
+                    crate::i18n::tr_args(
+                        cx,
+                        "界面语言：{label}",
+                        &[("label", option.label().to_string())],
+                    ),
+                    if stored == option.code() {
+                        crate::i18n::tr(cx, "当前")
+                    } else {
+                        String::new()
+                    },
+                    crate::i18n::tr(cx, "视图"),
+                    "language 语言 界面 locale i18n english 中文",
+                ),
+                action: PaletteAction::SetLocale(*option),
+            });
+        }
+
         self.push_key_binding_items(&mut items, cx);
 
         items
@@ -2475,6 +2537,18 @@ impl WFilesApp {
                     .when(!item.command.hint.is_empty(), |this| {
                         this.child(
                             div()
+                                // hint 是"当前"这类状态标记，测试要能按命令 id 读到它
+                                // （行的 aria_label 只有标题）。
+                                //
+                                // id 是拼出来的字符串而不是 `("palette-hint", command_id)`
+                                // 元组：元组 id 的第二部分只认 u32 / usize / EntityId，
+                                // **不认 String**，而命令 id 是字符串。
+                                //
+                                // hint 是**按需插入**的：没标记的行压根没这个元素，
+                                // 所以"没标记"= 查不到，而不是查到一个空串。
+                                .id(format!("palette-hint:{}", item.command.id))
+                                .test_support()
+                                .aria_label(item.command.hint.clone())
                                 .flex_shrink_0()
                                 .text_xs()
                                 .text_color(muted)
