@@ -5053,3 +5053,113 @@ fn palette_hint(window: &mut gpui_kit::Window, command_id: &str) -> String {
         .and_then(|element| element.label().map(|label| label.to_string()))
         .unwrap_or_default()
 }
+
+/// 命令面板当前列出的所有条目标题。
+///
+/// **读的是 `WFilesApp` 里的 `palette.items` 而不是渲染树**：面板条目是
+/// `open_palette` 时快照的一份数据（`self.palette.items`），之后输入只是
+/// 过滤这份列表。所以问应用"你现在列了哪些"比在渲染树里翻要准，也省掉了
+/// "怎么按行遍历"这个难题——面板行的 id 是命令 id，而 `.id()` 不叠加，
+/// 另加一个行号 id 会把命令 id 顶掉（实测九条既有面板测试全挂）。
+fn palette_titles(
+    app: &gpui_kit::Entity<crate::app::WFilesApp>,
+    cx: &gpui_kit::App,
+) -> Vec<String> {
+    app.read(cx).palette_titles()
+}
+
+#[gpui_kit::test]
+fn the_command_palette_speaks_english_all_the_way_through(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let (handle, app) = open_app_of_width(cx, 1180.);
+
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+    });
+    let titles = step_value(cx, handle, |_, cx| palette_titles(&app, cx));
+
+    // 这一批把 `describe_pane_command` 那个静态表改成了按需查表，
+    // 也把 `build_palette_items` 里二十多处 `format!` 拼的标题改成了查表。
+    // **漏一处就是"半翻译"面板**——界面上中英混排，用户分不清哪个是原文
+    // 哪个是译文。所以判据是整屏一条中文都不剩，不是抽查某几条。
+    //
+    // 两条豁免，各有理由（都写在 `i18n.rs` 的表尾注释里）：
+    // - `Default Terminal: 终端（Terminal.app）`：终端名是**用户装的那个程序**，
+    //   各平台有各自的本地化版本，这里硬编码一份英文只会跟系统对不上；
+    //   而 Homebrew / App Store 那些名字本来就该按原样显示（iTerm2 就是 iTerm2）。
+    // - `Interface language: 简体中文`：语言名**用该语言自己写**，
+    //   跟系统语言选择器一个规矩——英文界面里那条就该写 "简体中文"。
+    const EXEMPT: [&str; 2] = ["终端（Terminal.app）", "简体中文"];
+    let chinese: Vec<&String> = titles
+        .iter()
+        .filter(|title| {
+            title.chars().any(|c| c as u32 > 0x2E80)
+                && !EXEMPT.iter().any(|word| title.contains(word))
+        })
+        .collect();
+    assert!(
+        chinese.is_empty(),
+        "英文界面里还有 {} 条中文条目：{chinese:?}",
+        chinese.len()
+    );
+
+    // 也不能是空的：面板该列出命令。空数组会让上面那条断言空过。
+    assert!(
+        titles.len() >= 20,
+        "面板只列出了 {} 条，判据就落空了：{titles:?}",
+        titles.len()
+    );
+
+    // 抽查三条具体文案，确认查的是**译文**而不是碰巧没查到的原文回落。
+    //
+    // 挑的是"模板 + 占位符"那几类：它们一个模板要拼出好几条不同的标题，
+    // 查表路径不一样（`tr_args` 而不是 `tr`），只查纯文本的那几条验不到它。
+    assert!(
+        titles.iter().any(|t| t == "Rebind: Move to Trash"),
+        "面板里没有「Rebind: Move to Trash」，实际有：{titles:?}"
+    );
+    assert!(
+        titles.iter().any(|t| t == "Go to Downloads"),
+        "面板里没有「Go to Downloads」，实际有：{titles:?}"
+    );
+    assert!(
+        titles.iter().any(|t| t == "Transfer Speed: No limit"),
+        "面板里没有「Transfer Speed: No limit」，实际有：{titles:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn the_command_palette_stays_chinese_by_default(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let (handle, app) = open_app_of_width(cx, 1180.);
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+    });
+    let titles = step_value(cx, handle, |_, cx| palette_titles(&app, cx));
+
+    assert!(
+        titles.len() >= 20,
+        "面板只列出了 {} 条，判据落空：{titles:?}",
+        titles.len()
+    );
+    // 同上：删除命令没绑快捷键，`pane_command_enabled` 会把它过滤掉，
+    // 所以面板里没有独立的「移到回收站」，只有「改键：移到回收站」。
+    assert!(
+        titles.iter().any(|t| t == "改键：移到回收站"),
+        "中文界面里没有「改键：移到回收站」，实际有：{titles:?}"
+    );
+    assert!(
+        titles.iter().any(|t| t == "前往下载"),
+        "中文界面里没有「前往下载」，实际有：{titles:?}"
+    );
+    // 分组标题也在这一屏里（"文件" / "视图"）——它同样要跟着变。
+    assert!(
+        !titles.iter().any(|t| t == "Files"),
+        "中文界面里出现了英文分组名 Files"
+    );
+}

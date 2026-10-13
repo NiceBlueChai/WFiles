@@ -58,15 +58,19 @@ impl Field {
         Self::Pages,
     ];
 
-    pub fn label(self) -> &'static str {
-        match self {
+    /// 这一列的标题。收 `cx` 是为了按当前语言显示——
+    /// 返回 `&'static str` 就只能永远是中文，而设置里存的是 `id()`
+    /// （不翻），所以翻译这一层不影响落盘格式。
+    pub fn label(self, cx: &gpui_kit::App) -> String {
+        let text = match self {
             Self::Git => "Git 状态",
             Self::Image => "图片尺寸",
             Self::Duration => "媒体时长",
             Self::Exif => "EXIF",
             Self::Id3 => "ID3",
             Self::Pages => "PDF 页数",
-        }
+        };
+        crate::i18n::tr(cx, text)
     }
 
     /// 存进设置与命令面板 id 用的短名。手改配置的人写的是这个。

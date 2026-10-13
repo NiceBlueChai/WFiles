@@ -211,6 +211,88 @@ static EN: &[(&str, &str)] = &[
     ("界面语言：{label}", "Interface language: {label}"),
     ("当前", "Current"),
     ("视图", "View"),
+    ("文件", "Files"),
+    ("快捷键", "Shortcuts"),
+    ("改键：{title}", "Rebind: {title}"),
+    // ---- 命令面板（文件操作）----
+    ("新建文件夹", "New Folder"),
+    ("重命名", "Rename"),
+    ("批量重命名", "Bulk Rename"),
+    ("移到回收站", "Move to Trash"),
+    ("拷贝选中项", "Copy"),
+    ("剪切选中项", "Cut"),
+    ("粘贴到当前目录", "Paste Here"),
+    ("撤销上一步操作", "Undo Last Action"),
+    ("刷新当前目录", "Refresh Folder"),
+    ("前往上一级", "Go Up"),
+    ("复制路径", "Copy Path"),
+    ("复制文件名", "Copy File Name"),
+    ("在这里打开终端", "Open Terminal Here"),
+    ("快速查看", "Quick Look"),
+    ("搜索当前目录", "Search Folder"),
+    ("加标签 / 标颜色", "Tag / Colour"),
+    ("查看压缩包内容", "View Archive"),
+    ("打包成 Zip", "Create Zip"),
+    ("编辑远程文件", "Edit Remote File"),
+    ("列表视图", "List View"),
+    ("网格视图", "Grid View"),
+    ("分列视图", "Columns View"),
+    (
+        "分析：大小 / 重复 / 校验和",
+        "Analyse: Size / Duplicates / Checksums",
+    ),
+    // ---- 命令面板（应用级命令）----
+    // 分组名。英文比中文长，所以面板在英文下右侧留白会多一些——
+    // 这没关系，分组标题本来就是拿来扫一眼的。
+    ("窗口", "Window"),
+    ("分栏显示", "Split Panes"),
+    ("取消分栏", "Unsplit"),
+    ("标签页", "Tab"),
+    ("终端", "Terminal"),
+    ("传输", "Transfer"),
+    ("远程", "Remote"),
+    ("元数据列", "Metadata Column"),
+    ("前往", "Go"),
+    ("保存的搜索", "Saved Searches"),
+    // 命令标题。快捷键一律不译（Cmd+Shift+N 三平台一个样）。
+    ("切换到另一栏", "Switch Pane"),
+    ("双栏同步浏览", "Sync Browsing"),
+    ("关闭双栏同步浏览", "Stop Sync Browsing"),
+    ("拷贝到另一栏：{partner}", "Copy to {partner}"),
+    ("移动到另一栏：{partner}", "Move to {partner}"),
+    ("收起详情板", "Hide Details"),
+    ("展开详情板", "Show Details"),
+    ("收起终端面板", "Hide Terminal Panel"),
+    ("打开终端面板", "Show Terminal Panel"),
+    ("收起侧栏", "Collapse sidebar"),
+    ("展开侧栏", "Expand sidebar"),
+    ("比较这两个文件夹", "Compare These Folders"),
+    (
+        "比较文件内容：{left} ↔ {right}",
+        "Compare Contents: {left} ↔ {right}",
+    ),
+    ("不显示元数据列", "Hide Metadata Column"),
+    ("元数据列：{label}", "Metadata: {label}"),
+    ("切换到标签页：{label}", "Switch to Tab: {label}"),
+    ("新建标签页", "New Tab"),
+    ("关闭标签页", "Close Tab"),
+    ("下一个标签页", "Next Tab"),
+    ("前往{label}", "Go to {label}"),
+    ("连接远程服务器…", "Connect to Server…"),
+    ("默认终端：跟随系统", "Default Terminal: System Default"),
+    ("默认终端：{name}", "Default Terminal: {name}"),
+    ("传输限速：{label}", "Transfer Speed: {label}"),
+    ("不限速", "No limit"),
+    // ---- 嵌在占位符里的值（这些是"值"不是模板，但同样要翻）----
+    ("Git 状态", "Git Status"),
+    ("图片尺寸", "Image Size"),
+    ("媒体时长", "Duration"),
+    ("PDF 页数", "PDF Pages"),
+    // ---- 侧栏的"位置"（`places()` 的第四项是路径，不翻）----
+    // 终端名翻不了：`Option::name` 用来在面板里显示，但它同时是**用户装的那个
+    // 程序的名字**——Windows 上的"Windows Terminal"、Linux 上的"GNOME 终端"
+    // 各有各的本地化版本，这里硬编码一份英文只会跟系统对不上。
+    // 而 App Store / Homebrew 那些名字本身就该按原样显示（iTerm2 就是 iTerm2）。
 ];
 
 /// 英文表里有没有漏掉不该出现的条目：译文等于原文（等于没翻），

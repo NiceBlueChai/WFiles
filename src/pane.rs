@@ -4171,12 +4171,11 @@ impl Pane {
             .into_any_element()
     }
 
-    /// 向缩略图层要一张图；列表里用小图，Quick Look 用大图。
     /// 元数据列的表头：显示的是"当前这一列是什么"。没开就是 `None`（整列不画）。
-    fn meta_label(&mut self, cx: &mut Context<Self>) -> Option<&'static str> {
+    fn meta_label(&mut self, cx: &mut Context<Self>) -> Option<String> {
         self.meta
             .update(cx, |meta, cx| meta.field(cx))
-            .map(|field| field.label())
+            .map(|field| field.label(cx))
     }
 
     /// 这一行元数据那一格写什么。`None` = 这一列现在不显示。
@@ -4184,6 +4183,7 @@ impl Pane {
         self.meta.update(cx, |meta, cx| meta.text(path, is_dir, cx))
     }
 
+    /// 向缩略图层要一张图；列表里用小图，Quick Look 用大图。
     fn thumbnail_of(
         &mut self,
         path: &Path,

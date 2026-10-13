@@ -100,19 +100,25 @@ impl Limiter {
 ///
 /// 档位而不是"随便填一个数字"：限速要的是"别打扰我"，
 /// 让人去心算"8388608 字节每秒是多少"没有意义。
-pub fn presets() -> Vec<(u64, String)> {
+/// 限速档位（字节每秒）。`0` = 不限速，放在第一档。
+///
+/// **只给数字，不给显示名**：档位是数据，显示名是文案，两件事分开之后
+/// 单测能直接查档位而不用先造一个 `App` 上下文（那需要 GPUI 测试运行时）。
+/// 中文环境下的显示名是「不限速」——而"不限速"这三个字本身还会在
+/// 英文界面里出现（它在面板里跟 "4.8 MB/s" 并列），所以那条要单独查表。
+pub fn rates() -> Vec<u64> {
     const MB: u64 = 1_000_000;
-    [0, MB, 5 * MB, 10 * MB, 20 * MB]
-        .into_iter()
-        .map(|rate| {
-            let label = if rate == 0 {
-                "不限速".to_string()
-            } else {
-                crate::format::speed(rate)
-            };
-            (rate, label)
-        })
-        .collect()
+    vec![0, MB, 5 * MB, 10 * MB, 20 * MB]
+}
+
+/// 一档限速的显示名。速率本身是格式化出来的数字，全平台一样；
+/// 只有 `0` 那一档是文字，得查表。
+pub fn rate_label(rate: u64, cx: &gpui_kit::App) -> String {
+    if rate == 0 {
+        crate::i18n::tr(cx, "不限速")
+    } else {
+        crate::format::speed(rate)
+    }
 }
 
 #[cfg(test)]
@@ -198,8 +204,14 @@ mod tests {
 
     #[test]
     fn presets_start_with_no_limit() {
-        let choices = presets();
-        assert_eq!(choices[0].0, 0, "第一档该是不限速：{choices:?}");
+        let choices = rates();
+        assert_eq!(choices[0], 0, "第一档该是不限速：{choices:?}");
         assert!(choices.len() > 1);
+        // 递增：档位排出来的顺序就是用户理解的"越来越快"，
+        // 顺序乱了会让人以为限速越设越慢。
+        assert!(
+            choices.windows(2).all(|pair| pair[0] < pair[1]),
+            "限速档位应该递增：{choices:?}"
+        );
     }
 }

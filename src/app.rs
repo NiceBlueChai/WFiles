@@ -1755,6 +1755,28 @@ impl WFilesApp {
         }
     }
 
+    /// 面板当前列出的条目标题（面板没开就是空列表）。
+    ///
+    /// 给集成测试用：验"整屏一条中文都不剩"这种判据需要读全部条目，
+    /// 而渲染树里没法按行遍历（行的 id 是命令 id，`.id()` 不叠加，
+    /// 另加一个行号 id 会把命令 id 顶掉）。
+    ///
+    /// 返回**快照**而不是引用：调用方在 `App::update` 之外用它，
+    /// 拿借用会跨不过那个边界。
+    #[cfg(test)]
+    pub fn palette_titles(&self) -> Vec<String> {
+        self.palette
+            .as_ref()
+            .map(|state| {
+                state
+                    .items
+                    .iter()
+                    .map(|item| item.command.title.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 别的弹层开着就别再叠一层，先关掉。
         self.ops.update(cx, |ops, cx| ops.dismiss_prompt(cx));
@@ -1953,7 +1975,7 @@ impl WFilesApp {
             if !self.pane_command_enabled(command, cx) {
                 continue;
             }
-            let (title, hint, group, keywords) = Self::describe_pane_command(command);
+            let (title, hint, group, keywords) = Self::describe_pane_command(command, cx);
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     format!("pane:{command:?}"),
@@ -1972,7 +1994,7 @@ impl WFilesApp {
                     format!("saved:{}", saved.name),
                     saved.name.clone(),
                     saved.query.clone(),
-                    "保存的搜索",
+                    crate::i18n::tr(cx, "保存的搜索"),
                     format!("saved 保存的搜索 智能文件夹 {}", saved.query),
                 ),
                 action: PaletteAction::SavedSearch(saved.name.clone()),
@@ -1990,9 +2012,16 @@ impl WFilesApp {
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     format!("go:{}", path.display()),
-                    format!("前往{label}"),
+                    // `label` 也要翻：侧栏已经翻了，这里是同一条路径的另一出口。
+                    // 忘了翻的话侧栏写 "Home"、面板写 "个人文件夹"，
+                    // 同一个地方两个名字。
+                    crate::i18n::tr_args(
+                        cx,
+                        "前往{label}",
+                        &[("label", crate::i18n::tr(cx, label))],
+                    ),
                     String::new(),
-                    "前往",
+                    crate::i18n::tr(cx, "前往"),
                     "go 位置 打开 跳转",
                 ),
                 action: PaletteAction::GoTo(path),
@@ -2005,13 +2034,17 @@ impl WFilesApp {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
-            let hint = if index == self.active { "当前" } else { "" };
+            let hint = if index == self.active {
+                crate::i18n::tr(cx, "当前")
+            } else {
+                String::new()
+            };
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     format!("tab:{index}"),
-                    format!("切换到标签页：{label}"),
+                    crate::i18n::tr_args(cx, "切换到标签页：{label}", &[("label", label.clone())]),
                     hint,
-                    "标签页",
+                    crate::i18n::tr(cx, "标签页"),
                     "tab 切换 窗口",
                 ),
                 action: PaletteAction::SwitchTab(index),
@@ -2023,9 +2056,9 @@ impl WFilesApp {
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     "app:compare",
-                    "比较这两个文件夹",
+                    crate::i18n::tr(cx, "比较这两个文件夹"),
                     "Cmd+Alt+B",
-                    "文件",
+                    crate::i18n::tr(cx, "文件"),
                     "compare diff 比较 差异 同步 sync 两栏",
                 ),
                 action: PaletteAction::App(AppCommand::Compare),
@@ -2037,9 +2070,13 @@ impl WFilesApp {
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     "app:diff",
-                    format!("比较文件内容：{} ↔ {}", name_of(&left), name_of(&right)),
-                    "",
-                    "文件",
+                    crate::i18n::tr_args(
+                        cx,
+                        "比较文件内容：{left} ↔ {right}",
+                        &[("left", name_of(&left)), ("right", name_of(&right))],
+                    ),
+                    String::new(),
+                    crate::i18n::tr(cx, "文件"),
                     "diff 比较 内容 差异 行 十六进制 hex 字节",
                 ),
                 action: PaletteAction::App(AppCommand::Diff),
@@ -2057,9 +2094,9 @@ impl WFilesApp {
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     format!("app:meta-{}", field.id()),
-                    format!("元数据列：{}", field.label()),
-                    "",
-                    "元数据列",
+                    crate::i18n::tr_args(cx, "元数据列：{label}", &[("label", field.label(cx))]),
+                    String::new(),
+                    crate::i18n::tr(cx, "元数据列"),
                     field.keywords(),
                 ),
                 action: PaletteAction::MetaColumn(Some(field)),
@@ -2069,9 +2106,9 @@ impl WFilesApp {
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     "app:meta-off",
-                    "不显示元数据列",
-                    "",
-                    "元数据列",
+                    crate::i18n::tr(cx, "不显示元数据列"),
+                    String::new(),
+                    crate::i18n::tr(cx, "元数据列"),
                     "关掉 关闭 隐藏 不要 元数据列",
                 ),
                 action: PaletteAction::MetaColumn(None),
@@ -2084,9 +2121,9 @@ impl WFilesApp {
         items.push(PaletteItem {
             command: PaletteCommand::new(
                 "app:connect",
-                "连接远程服务器…",
-                "",
-                "远程",
+                crate::i18n::tr(cx, "连接远程服务器…"),
+                String::new(),
+                crate::i18n::tr(cx, "远程"),
                 "remote 远程 连接 webdav 服务器 坚果云 nextcloud 网盘 nas 挂载",
             ),
             action: PaletteAction::Connect,
@@ -2110,12 +2147,12 @@ impl WFilesApp {
             command: PaletteCommand::new(
                 "app:split",
                 if split {
-                    "取消分栏"
+                    crate::i18n::tr(cx, "取消分栏")
                 } else {
-                    "分栏显示"
+                    crate::i18n::tr(cx, "分栏显示")
                 },
                 "Cmd+Alt+D",
-                "窗口",
+                crate::i18n::tr(cx, "窗口"),
                 "split 双栏 分屏 两栏 pane",
             ),
             action: PaletteAction::App(AppCommand::ToggleSplit),
@@ -2125,9 +2162,9 @@ impl WFilesApp {
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     "app:swap-pane",
-                    "切换到另一栏",
+                    crate::i18n::tr(cx, "切换到另一栏"),
                     "Tab",
-                    "窗口",
+                    crate::i18n::tr(cx, "窗口"),
                     "focus 焦点 切换 另一栏",
                 ),
                 action: PaletteAction::App(AppCommand::SwapPane),
@@ -2136,12 +2173,12 @@ impl WFilesApp {
                 command: PaletteCommand::new(
                     "app:sync",
                     if self.sync {
-                        "关闭双栏同步浏览"
+                        crate::i18n::tr(cx, "关闭双栏同步浏览")
                     } else {
-                        "双栏同步浏览"
+                        crate::i18n::tr(cx, "双栏同步浏览")
                     },
                     "Cmd+Alt+S",
-                    "窗口",
+                    crate::i18n::tr(cx, "窗口"),
                     "sync 同步 联动 导航",
                 ),
                 action: PaletteAction::App(AppCommand::ToggleSync),
@@ -2160,9 +2197,13 @@ impl WFilesApp {
                 items.push(PaletteItem {
                     command: PaletteCommand::new(
                         "app:copy-other",
-                        format!("拷贝到另一栏：{partner}"),
+                        crate::i18n::tr_args(
+                            cx,
+                            "拷贝到另一栏：{partner}",
+                            &[("partner", partner.clone())],
+                        ),
                         "F5",
-                        "文件",
+                        crate::i18n::tr(cx, "文件"),
                         "copy 复制 另一栏 目标",
                     ),
                     action: PaletteAction::App(AppCommand::CopyToOther),
@@ -2170,9 +2211,13 @@ impl WFilesApp {
                 items.push(PaletteItem {
                     command: PaletteCommand::new(
                         "app:move-other",
-                        format!("移动到另一栏：{partner}"),
+                        crate::i18n::tr_args(
+                            cx,
+                            "移动到另一栏：{partner}",
+                            &[("partner", partner.clone())],
+                        ),
                         "F6",
-                        "文件",
+                        crate::i18n::tr(cx, "文件"),
                         "move 移动 剪切 另一栏 目标",
                     ),
                     action: PaletteAction::App(AppCommand::MoveToOther),
@@ -2182,12 +2227,12 @@ impl WFilesApp {
                 command: PaletteCommand::new(
                     "app:toggle-sidebar",
                     if self.sidebar_collapsed {
-                        "展开侧栏"
+                        crate::i18n::tr(cx, "展开侧栏")
                     } else {
-                        "收起侧栏"
+                        crate::i18n::tr(cx, "收起侧栏")
                     },
                     "Cmd+B",
-                    "窗口",
+                    crate::i18n::tr(cx, "窗口"),
                     "sidebar 侧栏 收起 展开 折叠 窄",
                 ),
                 action: PaletteAction::App(AppCommand::ToggleSidebar),
@@ -2196,12 +2241,12 @@ impl WFilesApp {
                 command: PaletteCommand::new(
                     "app:toggle-details",
                     if self.details_shown_in_active(cx) {
-                        "收起详情板"
+                        crate::i18n::tr(cx, "收起详情板")
                     } else {
-                        "展开详情板"
+                        crate::i18n::tr(cx, "展开详情板")
                     },
                     "Cmd+Alt+O",
-                    "窗口",
+                    crate::i18n::tr(cx, "窗口"),
                     "details 详情 预览 信息 收起 展开 检查器",
                 ),
                 action: PaletteAction::App(AppCommand::ToggleDetails),
@@ -2211,9 +2256,9 @@ impl WFilesApp {
         items.push(PaletteItem {
             command: PaletteCommand::new(
                 "app:new-tab",
-                "新建标签页",
+                crate::i18n::tr(cx, "新建标签页"),
                 "Cmd+T",
-                "标签页",
+                crate::i18n::tr(cx, "标签页"),
                 "tab 新开",
             ),
             action: PaletteAction::NewTab,
@@ -2221,9 +2266,9 @@ impl WFilesApp {
         items.push(PaletteItem {
             command: PaletteCommand::new(
                 "app:close-tab",
-                "关闭标签页",
+                crate::i18n::tr(cx, "关闭标签页"),
                 "Cmd+W",
-                "标签页",
+                crate::i18n::tr(cx, "标签页"),
                 "tab 关闭",
             ),
             action: PaletteAction::CloseTab,
@@ -2231,9 +2276,9 @@ impl WFilesApp {
         items.push(PaletteItem {
             command: PaletteCommand::new(
                 "app:next-tab",
-                "下一个标签页",
+                crate::i18n::tr(cx, "下一个标签页"),
                 "Ctrl+Tab",
-                "标签页",
+                crate::i18n::tr(cx, "标签页"),
                 "tab 切换",
             ),
             action: PaletteAction::NextTab,
@@ -2243,12 +2288,12 @@ impl WFilesApp {
             command: PaletteCommand::new(
                 "app:toggle-terminal",
                 if self.term.is_some() {
-                    "收起终端面板"
+                    crate::i18n::tr(cx, "收起终端面板")
                 } else {
-                    "打开终端面板"
+                    crate::i18n::tr(cx, "打开终端面板")
                 },
                 "Ctrl+Alt+T",
-                "终端",
+                crate::i18n::tr(cx, "终端"),
                 "terminal 内嵌 面板 shell 命令行 抽屉",
             ),
             action: PaletteAction::ToggleTerminal,
@@ -2259,13 +2304,13 @@ impl WFilesApp {
         items.push(PaletteItem {
             command: PaletteCommand::new(
                 format!("terminal:{}", terminal::AUTO),
-                "默认终端：跟随系统",
+                crate::i18n::tr(cx, "默认终端：跟随系统"),
                 if current == terminal::AUTO {
-                    "当前"
+                    crate::i18n::tr(cx, "当前")
                 } else {
-                    ""
+                    String::new()
                 },
-                "终端",
+                crate::i18n::tr(cx, "终端"),
                 "terminal 默认 自动 shell",
             ),
             action: PaletteAction::SetTerminal(terminal::AUTO.to_string()),
@@ -2277,9 +2322,17 @@ impl WFilesApp {
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     format!("terminal:{}", option.id),
-                    format!("默认终端：{}", option.name),
-                    if current == option.id { "当前" } else { "" },
-                    "终端",
+                    crate::i18n::tr_args(
+                        cx,
+                        "默认终端：{name}",
+                        &[("name", option.name.to_string())],
+                    ),
+                    if current == option.id {
+                        crate::i18n::tr(cx, "当前")
+                    } else {
+                        String::new()
+                    },
+                    crate::i18n::tr(cx, "终端"),
                     "terminal shell 命令行",
                 ),
                 action: PaletteAction::SetTerminal(option.id.to_string()),
@@ -2288,13 +2341,18 @@ impl WFilesApp {
 
         // 限速：一次大拷贝会把整块磁盘吃掉，同一时间想干点别的就全卡住。
         let limit = Settings::read(cx).speed_limit;
-        for (rate, label) in crate::throttle::presets() {
+        for rate in crate::throttle::rates() {
+            let label = crate::throttle::rate_label(rate, cx);
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     format!("speed:{rate}"),
-                    format!("传输限速：{label}"),
-                    if rate == limit { "当前" } else { "" },
-                    "传输",
+                    crate::i18n::tr_args(cx, "传输限速：{label}", &[("label", label.to_string())]),
+                    if rate == limit {
+                        crate::i18n::tr(cx, "当前")
+                    } else {
+                        String::new()
+                    },
+                    crate::i18n::tr(cx, "传输"),
                     "speed limit 限速 带宽 传输 拷贝 慢一点",
                 ),
                 action: PaletteAction::SetSpeedLimit(rate),
@@ -2383,14 +2441,16 @@ impl WFilesApp {
     fn push_key_binding_items(&self, items: &mut Vec<PaletteItem>, cx: &Context<Self>) {
         let map = crate::keymap::KeyMap::read(cx);
         for command in PaneCommand::ALL {
-            let (title, ..) = Self::describe_pane_command(command);
+            let (title, ..) = Self::describe_pane_command(command, cx);
             let key = map.key_for(command);
             items.push(PaletteItem {
                 command: PaletteCommand::new(
                     format!("key:{}", command.id()),
-                    format!("改键：{title}"),
+                    // 带名字的占位符而不是 `{title}` 位置占位：英文的
+                    // "Rebind: Rename" 和"改键：重命名"词序不同，位置占位换不了。
+                    crate::i18n::tr_args(cx, "改键：{title}", &[("title", title.clone())]),
                     key.clone(),
-                    "快捷键",
+                    crate::i18n::tr(cx, "快捷键"),
                     // 关键词里带上"快捷键"这一类词，搜"改键"就能把整组拉出来。
                     command.keywords(),
                 ),
@@ -2399,69 +2459,152 @@ impl WFilesApp {
         }
     }
 
+    /// 一条命令在面板里长什么样：标题、快捷键、分组、面板自己的搜索词。
+    ///
+    /// **前两项要按当前语言查表**，所以这里收 `cx` 并返回 `String`，
+    /// 而不是一个 `&'static str` 常量表——静态表没法翻，语言切换就只对
+    /// 已经写成 `tr()` 的那些调用点生效，面板会变成"半翻译"。
+    ///
+    /// **第四项（搜索词）不翻**，这是有意的：它是给用户搜的东西，不是显示给人看的。
+    /// 英文用户搜 "delete"、中文用户搜 "删除"，两边都得能搜到同一条命令——
+    /// 翻了就有一半人搜不到自己那条命令了。表里那些中英混排的词正是这个用意。
+    ///
+    /// 快捷键（第二项）也不翻：`Cmd+Shift+N` 这种东西全平台一个样。
     fn describe_pane_command(
         command: PaneCommand,
-    ) -> (&'static str, &'static str, &'static str, &'static str) {
+        cx: &gpui_kit::App,
+    ) -> (String, &'static str, String, &'static str) {
+        // 分组只有三个，两个字的中文词，翻成英文占更多地方。
+        let files = crate::i18n::tr(cx, "文件");
+        let view = crate::i18n::tr(cx, "视图");
         match command {
-            PaneCommand::NewFolder => ("新建文件夹", "Cmd+Shift+N", "文件", "folder 创建 目录"),
-            PaneCommand::Rename => ("重命名", "F2", "文件", "rename 改名"),
-            PaneCommand::BulkRename => ("批量重命名", "Cmd+Shift+R", "文件", "batch 序号 模板"),
-            PaneCommand::Trash => ("移到回收站", "Cmd+Backspace", "文件", "delete 删除 trash"),
-            PaneCommand::Copy => ("拷贝选中项", "Cmd+C", "文件", "copy"),
-            PaneCommand::Cut => ("剪切选中项", "Cmd+X", "文件", "cut 移动"),
-            PaneCommand::Paste => ("粘贴到当前目录", "Cmd+V", "文件", "paste"),
-            PaneCommand::Undo => ("撤销上一步操作", "Cmd+Z", "文件", "undo 恢复"),
-            PaneCommand::Refresh => ("刷新当前目录", "Cmd+R", "文件", "refresh 重新读取"),
-            PaneCommand::GoUp => ("前往上一级", "Backspace", "文件", "up parent 上级"),
-            PaneCommand::CopyPath => ("复制路径", "Cmd+Alt+C", "文件", "path 剪贴板"),
-            PaneCommand::CopyFileName => ("复制文件名", "Cmd+Shift+C", "文件", "name 剪贴板"),
+            PaneCommand::NewFolder => (
+                crate::i18n::tr(cx, "新建文件夹"),
+                "Cmd+Shift+N",
+                files,
+                "folder 创建 目录",
+            ),
+            PaneCommand::Rename => (crate::i18n::tr(cx, "重命名"), "F2", files, "rename 改名"),
+            PaneCommand::BulkRename => (
+                crate::i18n::tr(cx, "批量重命名"),
+                "Cmd+Shift+R",
+                files,
+                "batch 序号 模板",
+            ),
+            PaneCommand::Trash => (
+                crate::i18n::tr(cx, "移到回收站"),
+                "Cmd+Backspace",
+                files,
+                "delete 删除 trash",
+            ),
+            PaneCommand::Copy => (crate::i18n::tr(cx, "拷贝选中项"), "Cmd+C", files, "copy"),
+            PaneCommand::Cut => (
+                crate::i18n::tr(cx, "剪切选中项"),
+                "Cmd+X",
+                files,
+                "cut 移动",
+            ),
+            PaneCommand::Paste => (
+                crate::i18n::tr(cx, "粘贴到当前目录"),
+                "Cmd+V",
+                files,
+                "paste",
+            ),
+            PaneCommand::Undo => (
+                crate::i18n::tr(cx, "撤销上一步操作"),
+                "Cmd+Z",
+                files,
+                "undo 恢复",
+            ),
+            PaneCommand::Refresh => (
+                crate::i18n::tr(cx, "刷新当前目录"),
+                "Cmd+R",
+                files,
+                "refresh 重新读取",
+            ),
+            PaneCommand::GoUp => (
+                crate::i18n::tr(cx, "前往上一级"),
+                "Backspace",
+                files,
+                "up parent 上级",
+            ),
+            PaneCommand::CopyPath => (
+                crate::i18n::tr(cx, "复制路径"),
+                "Cmd+Alt+C",
+                files,
+                "path 剪贴板",
+            ),
+            PaneCommand::CopyFileName => (
+                crate::i18n::tr(cx, "复制文件名"),
+                "Cmd+Shift+C",
+                files,
+                "name 剪贴板",
+            ),
             PaneCommand::OpenTerminal => (
-                "在这里打开终端",
+                crate::i18n::tr(cx, "在这里打开终端"),
                 "Cmd+Alt+T",
-                "文件",
+                files,
                 "terminal 终端 shell 命令行",
             ),
-            PaneCommand::QuickLook => ("快速查看", "空格", "文件", "preview 预览 quick look 查看"),
+            PaneCommand::QuickLook => (
+                crate::i18n::tr(cx, "快速查看"),
+                "空格",
+                files,
+                "preview 预览 quick look 查看",
+            ),
             PaneCommand::Search => (
-                "搜索当前目录",
+                crate::i18n::tr(cx, "搜索当前目录"),
                 "Cmd+Shift+F",
-                "文件",
+                files,
                 "search 搜索 查找 find 内容 content grep",
             ),
             PaneCommand::Mark => (
-                "加标签 / 标颜色",
+                crate::i18n::tr(cx, "加标签 / 标颜色"),
                 "Cmd+Alt+M",
-                "文件",
+                files,
                 "mark 标记 标签 颜色 tag color 色标",
             ),
             PaneCommand::ViewArchive => (
-                "查看压缩包内容",
+                crate::i18n::tr(cx, "查看压缩包内容"),
                 "",
-                "文件",
+                files,
                 "zip 压缩包 archive 解压 unzip 浏览",
             ),
             PaneCommand::CreateArchive => (
-                "打包成 Zip",
+                crate::i18n::tr(cx, "打包成 Zip"),
                 "",
-                "文件",
+                files,
                 "zip 压缩包 archive 压缩 打包 compress",
             ),
             PaneCommand::EditRemote => (
-                "编辑远程文件",
+                crate::i18n::tr(cx, "编辑远程文件"),
                 "Cmd+Alt+O",
-                "文件",
+                files,
                 "edit 编辑 remote 远程 回传 上传 upload",
             ),
             // 换视图不作用于文件，归到"视图"组里更好找。
-            PaneCommand::ViewList => ("列表视图", "Cmd+1", "视图", "view list 列表 一行一项"),
-            PaneCommand::ViewGrid => ("网格视图", "Cmd+2", "视图", "view grid 网格 缩略图"),
-            PaneCommand::ViewColumns => {
-                ("分列视图", "Cmd+3", "视图", "view miller 分列 层级 columns")
-            }
+            PaneCommand::ViewList => (
+                crate::i18n::tr(cx, "列表视图"),
+                "Cmd+1",
+                view,
+                "view list 列表 一行一项",
+            ),
+            PaneCommand::ViewGrid => (
+                crate::i18n::tr(cx, "网格视图"),
+                "Cmd+2",
+                view,
+                "view grid 网格 缩略图",
+            ),
+            PaneCommand::ViewColumns => (
+                crate::i18n::tr(cx, "分列视图"),
+                "Cmd+3",
+                view,
+                "view miller 分列 层级 columns",
+            ),
             PaneCommand::Analyze => (
-                "分析：大小 / 重复 / 校验和",
+                crate::i18n::tr(cx, "分析：大小 / 重复 / 校验和"),
                 "Cmd+Alt+I",
-                "文件",
+                files,
                 "analyze 分析 大小 重复 校验和 md5 sha1 sha256 size duplicate checksum",
             ),
         }
@@ -2508,6 +2651,13 @@ impl WFilesApp {
             // 不用去数第几行。
             rows.push(
                 h_flex()
+                    // 命令 id 是**唯一**的 id：面板里不能有两个元素同一个 id，
+                    // 而 `.id()` 不叠加（后写的覆盖先写的）——所以行号观察点
+                    // 不能另加一个 `.id()`，那会把命令 id 顶掉，
+                    // `try_find("pane:Refresh")` 这类定位就全废了。
+                    //
+                    // 要按行遍历靠 `.test_support()` 的路径数组，见 ui_tests
+                    // 里的 `palette_titles`：它扫 `registered_paths()`。
                     .id(item.command.id.clone())
                     // test_support 是 GPUI 的透明观察包装（组件库自己也这么用），
                     // 让集成测试能按元素 id 定位；aria_label 顺带给读屏软件
