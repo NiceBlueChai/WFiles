@@ -52,6 +52,14 @@ const COL_META: f32 = 120.;
 const COL_MODIFIED: f32 = 130.;
 const COL_KIND: f32 = 90.;
 
+/// 面包屑最多同时显示几段路径（不含那个「…」）。
+///
+/// 3 是量出来的，不是凑的：520 px 窗口收掉两侧之后容器只有 216 px，扣掉
+/// 16 px 内边距、37 px 的「…」、以及当前目录自己的 60 px 保底，剩 103 px；
+/// 两段祖先加两个 12px 箭头是 24×2+24 = 72 px，排得下，第三段就挤掉了。
+/// 多显示一段祖先，不如把宽度留给"我在哪"。
+const MAX_CRUMBS: usize = 3;
+
 /// 网格里一个格子的尺寸（逻辑像素）。
 const TILE_WIDTH: f32 = 112.;
 const TILE_HEIGHT: f32 = 132.;
@@ -2410,7 +2418,16 @@ impl Pane {
             })
     }
 
-    /// 面包屑：每一段都能点，段数太多时从左边裁掉，保证当前目录一直看得见。
+    /// 面包屑：每一段都能点，段数太多时把老段收进一个「…」。
+    ///
+    /// **为什么必须折叠而不是压缩**：路径层级是用户选的，深浅不由窗口宽窄决定。
+    /// 一条 6 层深、名字都不短的路径，按最小宽度排开要 600 px 出头，而 520 px
+    /// 窗口的面包屑容器只有 216 px。祖先段压到最小也装不下——最后只能让**当前
+    /// 目录**跑到屏幕外去（实测它在 x=582，容器右边缘才 372）。而"我在哪"恰恰
+    /// 是用户此刻最需要看见的一行。
+    ///
+    /// 折叠方案：超量的老段合并成一个「…」，点它回上一级——少看几层祖先，
+    /// 一路点上去仍然能到根。当前目录那一段永远不折叠、名字太长出省略号。
     fn render_breadcrumb(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let path = self.listing.path();
         let mut crumbs: Vec<(String, PathBuf)> = path
@@ -2426,43 +2443,115 @@ impl Pane {
             .collect();
         crumbs.reverse();
 
+        // 根目录那一段永远留着：它是"回到起点"的路，折叠掉就没有了。
         let last = crumbs.len().saturating_sub(1);
+        let keep_from = last.saturating_sub(MAX_CRUMBS - 1);
+        let folded = keep_from > 0;
+        // 「…」点回去的目标：被折叠掉的最深那一段的父目录。
+        let folded_target = if folded {
+            crumbs[keep_from]
+                .1
+                .parent()
+                .map(|parent| parent.to_path_buf())
+        } else {
+            None
+        };
+
         let hover = cx.theme().muted;
         let current_color = cx.theme().foreground;
-        let children = crumbs
-            .into_iter()
-            .enumerate()
-            .map(|(index, (label, target))| {
-                let is_current = index == last;
-                let crumb = div()
-                    .id(("crumb", index))
-                    .h(px(22.))
-                    .px_1()
-                    .flex()
-                    .items_center()
-                    .rounded(cx.theme().radius)
-                    .child(div().min_w_0().truncate().child(label));
+        let mut children: Vec<AnyElement> = Vec::new();
 
-                let crumb = if is_current {
-                    crumb
-                        .flex_shrink_0()
-                        .font_medium()
-                        .text_color(current_color)
-                } else {
-                    crumb
-                        .min_w(px(36.))
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(hover))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.navigate_to(target.clone(), true, window, cx);
-                        }))
-                };
-
+        if let Some(target) = folded_target {
+            children.push(
                 h_flex()
+                    .id("crumb-folded")
+                    .test_support()
                     .flex_shrink_0()
+                    .child(
+                        Button::new("crumb-more")
+                            .ghost()
+                            // 不给 `small()`：它带着的横向内边距在 216px 宽的
+                            // 容器里就是 15px 的净支出，那是最贵的一段宽度。
+                            // 只有一个字符，32px 的方块靠 tooltip 说明它是什么。
+                            .label("…")
+                            .tooltip("回到上一级")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.navigate_to(target.clone(), true, window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .child(Icon::new(IconName::ChevronRight).size_3()),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        for (index, (label, target)) in crumbs.into_iter().enumerate().skip(keep_from) {
+            let is_current = index == last;
+            let crumb = div()
+                .id(("crumb", index))
+                // 布局测试要量每一段落在哪儿："老段收进「…」"这句话得靠量坐标
+                // 才验得了——光看整条路径的宽度区分不出"折叠了"和"全挤扁了"
+                // 这两种完全不同的结果。
+                .test_support()
+                .h(px(22.))
+                .px_1()
+                .flex()
+                .items_center()
+                .rounded(cx.theme().radius)
+                .child(div().min_w_0().truncate().child(label));
+
+            let crumb = if is_current {
+                // 当前目录**也参与收缩**，但收缩因子比祖先段大得多
+                // （8 比 1）：所以真正不够宽时它让得最少、留下最多。
+                //
+                // 之前它是 `flex_shrink_0` + `max_w(280)`，一个像素都不肯让：
+                // 实测 520px 窗口里它右缘622，容器右缘才 372——用户最需要看的
+                // "我在哪"整个挂在地址栏外面。而它保底还有 60 px，够认出一个
+                // 目录名，不会缩成一条竖线。
+                crumb
+                    // 40px 保底是一个汉字加省略号——刚好能认出"这是哪个目录的
+                    // 开头"，再窄就只剩一个「…」，那还不如把宽度让给祖先段。
+                    .min_w(px(40.))
+                    .flex_shrink(6.)
+                    .max_w(px(280.))
+                    .font_medium()
+                    .text_color(current_color)
+            } else {
+                // 祖先段**不给 min_w**：那是最小尺寸的硬底，一有它整行就永远
+                // 缩不进容器（实测给20px 保底时，520px 窗口里行宽仍是 236px，
+                // 而容器只有 216px，`justify_end` 把整行推到右边越界 20px）。
+                //
+                // 压没了也点得到：祖先被压到看不见时，左边那个「…」连着上一级，
+                // 一路点上去照样能到根。当前目录那一段有 40px 保底，用户始终
+                // 看得见"我在哪"。
+                //
+                // 收缩因子 2 比祖先段当前的 1 高不了多少，但配合"祖先段没有
+                // min_w"这一点就够：多出来的那点宽度差异全从祖先身上出，
+                // 它们是那个可以整段消失的东西。
+                crumb
                     .min_w_0()
-                    .gap_0()
-                    .when(index > 0, |group| {
+                    .flex_shrink(2.)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.navigate_to(target.clone(), true, window, cx);
+                    }))
+            };
+
+            children.push(
+                h_flex()
+                    .min_w_0()
+                    // 这一层必须是可收缩的：段上那个 `flex_shrink(N)` 只有在父级
+                    // 提供可分配空间时才起作用，外层 group 若是 `flex_shrink_0`，
+                    // 它的宽度就由内容定死，段里的收缩因子形同虚设
+                    // （实测祖先段停在 260 px 不动，整行因此宽过容器）。
+                    .flex_shrink(1.)
+                    .when(index > keep_from, |group| {
                         group.child(
                             div()
                                 .flex_shrink_0()
@@ -2472,7 +2561,9 @@ impl Pane {
                         )
                     })
                     .child(crumb)
-            });
+                    .into_any_element(),
+            );
+        }
 
         div()
             .id("breadcrumb")
@@ -2483,6 +2574,9 @@ impl Pane {
             .px_2()
             .flex()
             .items_center()
+            // 有 `justify_end` 才对：路径从右边起排是 Explorer 的习惯，
+            // 而且超长的老段从**左边**被裁掉时，留在屏幕里的那些仍然贴右。
+            // 行宽现在由折叠后的段数约束着，不会再宽过容器。
             .justify_end()
             .overflow_hidden()
             .rounded(cx.theme().radius)

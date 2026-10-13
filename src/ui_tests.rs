@@ -4558,3 +4558,144 @@ fn the_name_header_lines_up_with_the_file_names(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// 路径很深时，面包屑把老段收进「…」，当前目录必须留在容器里。
+///
+/// 实测（520px 窗口、收掉两侧、6 层深且目录名都不短）：
+/// 改之前最后一段落在 x=582，而容器右边缘才372——**用户最需要看的"我在哪"
+/// 在屏幕外**。祖先段压到最小也救不回来：4 段保底 28px 加箭头是 160px，
+/// 而容器只有 216px，剩下的位置装不下超长目录名。
+///
+/// 这条守的是"折叠"这个动作本身：老段收进「…」、当前目录留在容器内、
+/// 而且「…」能点（它连着上一级，不是死装饰）。
+#[gpui_kit::test]
+fn a_deep_path_folds_into_an_ellipsis(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    // 六层深，名字都不短——比任何一档窗口的面包屑都长。
+    let mut deep = dir.path().to_path_buf();
+    for i in 0..5 {
+        deep = deep.join(format!("第{i}层-{}", "很长".repeat(20)));
+        std::fs::create_dir_all(&deep).expect("造深层目录");
+    }
+    std::fs::write(deep.join("leaf.txt"), "x").expect("造文件");
+
+    for width in [1180.0f32, 700.0, 520.0] {
+        let (_isolation, handle) = open_in_at_width(cx, &deep, width);
+        step(cx, handle, settle);
+        // 收掉两侧，把宽度让给面包屑——这一条测的是"内容区够宽时它对不对"。
+        step(cx, handle, |window, cx| {
+            window.press("cmd-b", cx);
+            settle(window, cx);
+        });
+        step(cx, handle, |window, cx| {
+            window.press("cmd-alt-o", cx);
+            settle(window, cx);
+        });
+
+        step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            let bar = window.try_find("breadcrumb").expect("面包屑").bounds();
+            let right = bar.origin.x + bar.size.width;
+
+            // 当前目录（最后一段）必须在容器内。
+            let current = deepest_crumb(window).expect("至少要有一段路径");
+            assert!(
+                current.origin.x >= bar.origin.x && current.origin.x + current.size.width <= right,
+                "窗口 {width}：当前目录那一段落在 x={}~{}，容器是 {}~{right}——\
+                 老段没折叠进去，当前目录被挤出屏幕了",
+                current.origin.x,
+                current.origin.x + current.size.width,
+                bar.origin.x,
+            );
+
+            // 老段收进了「…」，它得能点：点一下回到上一级。
+            assert!(
+                window.try_find("crumb-more").is_some(),
+                "窗口 {width}：路径这么深却没有「…」——老段全留在屏幕上，\
+                 当前目录必然被挤出去",
+            );
+        });
+
+        // 「…」真能往上走一级：当前目录那一段会变窄（它不再是那段超长的
+        // 目录名了）。序号不能写死成"第几层"——路径里还带着 macOS 的
+        // /var/folders 与临时目录，先把当前实际的末段序号读出来。
+        let before = step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            deepest_crumb(window).map(|at| at.size.width)
+        });
+        step(cx, handle, |window, cx| {
+            settle(window, cx);
+            window.click("crumb-more", cx);
+            settle(window, cx);
+        });
+        let after = step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            deepest_crumb(window).map(|at| at.size.width)
+        });
+        assert_ne!(
+            before, after,
+            "窗口 {width}：点了「…」什么都没变——它连着上一级，不是死装饰"
+        );
+    }
+}
+
+/// 面包屑的段落不能整体跑到容器左边之外。
+///
+/// 原来每一段都是 `flex_shrink_0`：整条路径按固有宽度排开，装不下时
+/// `justify_end` 把**整行**推到容器左边界之外（实测 1180px 窗口里第一段落在
+/// x=127，而容器左边缘在 318）。"从左边裁掉"听起来像 `overflow_hidden` 就能办，
+/// 实际上溢出的是行本身，裁只裁得掉已经跑出去的部分。
+#[gpui_kit::test]
+fn no_breadcrumb_escapes_the_address_bar(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let mut deep = dir.path().to_path_buf();
+    for i in 0..4 {
+        deep = deep.join(format!("第{i}层-{}", "很长".repeat(20)));
+        std::fs::create_dir_all(&deep).expect("造深层目录");
+    }
+    std::fs::write(deep.join("leaf.txt"), "x").expect("造文件");
+
+    for width in [1180.0f32, 700.0, 520.0] {
+        let (_isolation, handle) = open_in_at_width(cx, &deep, width);
+        step(cx, handle, settle);
+        step(cx, handle, |window, cx| {
+            window.press("cmd-b", cx);
+            settle(window, cx);
+        });
+        step(cx, handle, |window, cx| {
+            window.press("cmd-alt-o", cx);
+            settle(window, cx);
+        });
+
+        step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            let bar = window.try_find("breadcrumb").expect("面包屑").bounds();
+            for index in 0..8usize {
+                let Some(crumb) = window.try_find(("crumb", index)) else {
+                    continue;
+                };
+                let at = crumb.bounds();
+                assert!(
+                    at.origin.x >= bar.origin.x - px(1.)
+                        && at.origin.x + at.size.width <= bar.origin.x + bar.size.width + px(1.),
+                    "窗口 {width}：crumb{index} 落在 x={}~{}，容器 {}~{}——\
+                     有段落跑到地址栏外面去了",
+                    at.origin.x,
+                    at.origin.x + at.size.width,
+                    bar.origin.x,
+                    bar.origin.x + bar.size.width,
+                );
+            }
+        });
+    }
+}
+
+/// 面包屑里序号最大的那一段，也就是当前目录。
+///
+/// 序号不能写死成"第几层"：临时目录本身带着 `/var/folders/...` 与随机串，
+/// 真实段数比测试自己造出来的层数多好几段。
+fn deepest_crumb(window: &mut gpui_kit::Window) -> Option<Bounds<Pixels>> {
+    (0..24usize)
+        .filter_map(|index| window.try_find(("crumb", index)).map(|it| it.bounds()))
+        .last()
+}
