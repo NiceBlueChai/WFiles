@@ -16,6 +16,7 @@ mod keymap;
 mod marks;
 mod meta;
 mod model;
+mod offline;
 mod ops;
 mod ops_entity;
 mod palette;

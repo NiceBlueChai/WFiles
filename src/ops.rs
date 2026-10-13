@@ -2767,25 +2767,27 @@ mod tests {
             "半截文件不该落在用户的目录里"
         );
 
+        // 断点在暂存文件的实际长度上，别从进度回调猜——回调报的是
+        // "这一趟新读了多少"，那是**第一块的大小**（取决于 socket 缓冲），
+        // 跟断点不是一回事。猜出来的数偶尔正好等于断点，偶尔不等，
+        // 于是这个测试就成了薛定谔的。
+        let staging = resume::journal().staging(&resume::key(
+            &format!("remote://t1/big.bin"),
+            &dest.join("big.bin").to_string_lossy(),
+        ));
+        let resumed_at = fs::metadata(&staging).map(|it| it.len()).unwrap_or(0);
+        assert!(
+            resumed_at > 0 && resumed_at < crate::remote::big_bytes().len() as u64,
+            "该停在半路上：{resumed_at}"
+        );
+
         // 第二趟：服务器该收到一个带 Range 的请求，位置正是上次停下那儿。
-        let mut started_at = None;
         let outcome = copy_entries(
             std::slice::from_ref(&source),
             &dest,
             ConflictPolicy::KeepBoth,
             &sides,
-            &mut |progress| {
-                if progress.bytes_done > 0 && started_at.is_none() {
-                    started_at = Some(progress.bytes_done);
-                }
-                true
-            },
-        );
-
-        let resumed_at = started_at.expect("第二趟该报过进度");
-        assert!(
-            resumed_at > 0 && resumed_at < half * 2,
-            "该接在半路上：{resumed_at}"
+            &mut |_| true,
         );
         assert_eq!(outcome.done, 1);
         assert_eq!(
@@ -2797,7 +2799,7 @@ mod tests {
             seen_requests(&server)
                 .iter()
                 .any(|it| it == &format!("GET /dav/big.bin range={resumed_at}")),
-            "续传要走 Range：{:?}",
+            "续传要走 Range，断点是 {resumed_at}：{:?}",
             seen_requests(&server)
         );
     }
@@ -2839,7 +2841,7 @@ mod tests {
         // 账本得清掉：这一趟不是"停在中途"，没有什么下次要接着传的。
         let key = resume::key(
             &remote_source(client.as_ref(), "small.bin"),
-            &dest.join("small.bin").to_string_lossy().into_owned(),
+            &dest.join("small.bin").to_string_lossy(),
         );
         assert!(
             !resume::journal().staging(&key).exists(),

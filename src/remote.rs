@@ -184,7 +184,10 @@ pub fn forget_password(config: &Config) {
 ///
 /// 字段跟本地的 `FileEntry` 对齐：`is_dir` / `size` / `modified`，
 /// 这样列表视图不必知道它在跟谁说话。
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// 能序列化是为了离线缓存（见 [`crate::offline`]）：目录列表要落盘，
+/// 断网时还能翻出来。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub name: String,
     /// 相对连接根的路径，分隔符是 `/`，开头没有 `/`。
@@ -1018,6 +1021,25 @@ pub(crate) mod fake {
         pub url: String,
         /// 记下最后收到的请求，断言用。
         pub seen: Arc<Mutex<Vec<String>>>,
+        /// 断网模拟：置 true 之后所有请求都回 503。
+        ///
+        /// 为什么不做成"关掉监听"：那会让 `connect()` 直接报"连不上"，
+        /// 而真实的断网是**连得上、答不出**——VPN 断了、NAS 关机了、
+        /// 服务器在重启。离线缓存要救的正是后面这几种，所以假服务器
+        /// 得能演出"人在、话说不出来"。
+        offline: Arc<Mutex<bool>>,
+    }
+
+    impl Server {
+        /// 让这台服务器开始装作答不出来（离线缓存的测试要用）。
+        pub fn go_offline(&self) {
+            *self.offline.lock().unwrap() = true;
+        }
+
+        /// 恢复成能答的。
+        pub fn come_online(&self) {
+            *self.offline.lock().unwrap() = false;
+        }
     }
 
     /// 起一个监听在空闲端口上的服务器；进程退出就随之消失。
@@ -1025,23 +1047,27 @@ pub(crate) mod fake {
         let listener = TcpListener::bind("127.0.0.1:0").expect("该能监听");
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let offline = Arc::new(Mutex::new(false));
         let recorded = seen.clone();
+        let flag = offline.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else {
                     break;
                 };
                 let recorded = recorded.clone();
-                let _ = thread::spawn(move || handle(stream, recorded)).join();
+                let offline = flag.clone();
+                let _ = thread::spawn(move || handle(stream, recorded, offline)).join();
             }
         });
         Server {
             url: format!("http://127.0.0.1:{port}/dav/"),
             seen,
+            offline,
         }
     }
 
-    fn handle(mut stream: TcpStream, recorded: Arc<Mutex<Vec<String>>>) {
+    fn handle(mut stream: TcpStream, recorded: Arc<Mutex<Vec<String>>>, offline: Arc<Mutex<bool>>) {
         let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() {
@@ -1081,6 +1107,15 @@ pub(crate) mod fake {
             note.push_str(&format!(" range={start}"));
         }
         recorded.lock().unwrap().push(note);
+
+        // 断网模拟：人在，但话说不出来。503 而不是断连接——
+        // 后者会让客户端以为是网络层的问题，测不到"服务器答不出"这条路。
+        if *offline.lock().unwrap() {
+            let head = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\noffline!";
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+            return;
+        }
 
         let (status, content_type, payload): (&str, &str, Vec<u8>) = match method.as_str() {
             // 只有服务器"真的有"的这几处才回内容，其余一律 404：

@@ -37,6 +37,11 @@ pub struct Remotes {
     clients: HashMap<String, Client>,
     /// 列过的目录内容，按远程路径存。
     listed: HashMap<PathBuf, Vec<Entry>>,
+    /// 正在显示的这份是磁盘缓存里的旧数据（值是列于何时，Unix 秒）。
+    ///
+    /// 跟 `listed` 分开而不是塞进 `Entry`：同一个 `listed` 里既有刚列来的
+    /// 又有磁盘上翻出来的，得能一眼分清哪些要标"列于 N 前"。
+    stale: HashMap<PathBuf, u64>,
     /// 正在取的，别重复排队。
     pending: HashSet<PathBuf>,
     /// 取失败的：记下来，别每渲染一次就重试一次注定失败的服务器。
@@ -80,6 +85,7 @@ impl Remotes {
         Self {
             clients: HashMap::new(),
             listed: HashMap::new(),
+            stale: HashMap::new(),
             pending: HashSet::new(),
             failed: HashSet::new(),
             editing: Vec::new(),
@@ -122,6 +128,11 @@ impl Remotes {
         self.clients.remove(id);
         self.listed
             .retain(|path, _| remote::parse_location(path).is_none_or(|(it, _)| it != id));
+        self.stale
+            .retain(|path, _| remote::parse_location(path).is_none_or(|(it, _)| it != id));
+        // 磁盘上那份也一起删：连接都没了，留着别人的目录列表没有意义，
+        // 而且下次新建一个同 id 的连接会读到上一世的数据。
+        crate::offline::Store::new().forget(id);
         // 连接都没了，编辑中的那份自然回传不回去：清掉，免得报错弹个不停。
         self.editing.retain(|edit| edit.id != id);
         if self.editing.is_empty() {
@@ -202,28 +213,62 @@ impl Remotes {
 
     /// 求一个远程目录的内容。
     ///
-    /// 有缓存就当场给（滚动、重画不该反复问服务器）；
-    /// 没有就登记一个后台任务并返回 `None`，取回来会发 [`RemotesEvent::Listed`]。
+    /// 三个来源，按优先级：
+    ///
+    /// 1. 内存里有（刚列过）——直接给，滚动重画不该反复问服务器。
+    /// 2. 磁盘上有——**垫上并继续后台问真的**。这一条是关键：
+    ///    断网时用户看到的是上次列的那份，而不是一片空白；
+    ///    而网络通着的时候，后台那一趟回来会把它换成新的。
+    ///    只垫不问是错的：那等于把"离线可用"做成了"永远显示旧的"。
+    /// 3. 两处都没有——只登记后台任务，界面等着。
+    ///
+    /// 垫上的时候记下它有多旧，界面据此写明"列于 3 小时前"。
     pub fn list(&mut self, id: &str, sub: &str, cx: &mut Context<Self>) -> Option<Vec<Entry>> {
         let path = remote::location(id, sub);
         if let Some(cached) = self.listed.get(&path) {
             return Some(cached.clone());
         }
-        if self.pending.contains(&path) || self.failed.contains(&path) {
-            return None;
+        let offline = crate::offline::Store::new().load(id, sub);
+        if let Some((entries, at)) = &offline {
+            self.listed.insert(path.clone(), entries.clone());
+            self.stale.insert(path.clone(), *at);
         }
-        let client = self.client(id, cx)?;
+        // 不管有没有垫上，都去问一次真的服务器（下面那几行）。
+        if self.pending.contains(&path) || self.failed.contains(&path) {
+            return offline.map(|(entries, _)| entries);
+        }
+        let Some(client) = self.client(id, cx) else {
+            return offline.map(|(entries, _)| entries);
+        };
         self.pending.insert(path.clone());
         Self::spawn_list(client, path, sub.to_string(), cx);
-        None
+        offline.map(|(entries, _)| entries)
+    }
+
+    /// 这个目录现在显示的是不是缓存里那份旧的（以及列于何时）。
+    ///
+    /// 界面拿它写"列于 3 小时前"那一行；`None` 就是新鲜的。
+    pub fn staleness(&self, path: &Path) -> Option<u64> {
+        self.stale.get(path).copied()
     }
 
     /// 重新取一次（刷新按钮、文件操作之后）：先丢掉旧的缓存。
+    ///
+    /// 磁盘上那份也得跳过——用户点了刷新就是要最新的，
+    /// 拿一份三小时前的列表顶上等于没点。
     pub fn reload(&mut self, id: &str, sub: &str, cx: &mut Context<Self>) {
         let path = remote::location(id, sub);
         self.listed.remove(&path);
+        self.stale.remove(&path);
         self.failed.remove(&path);
-        let _ = self.list(id, sub, cx);
+        if self.pending.contains(&path) {
+            return;
+        }
+        let Some(client) = self.client(id, cx) else {
+            return;
+        };
+        self.pending.insert(path.clone());
+        Self::spawn_list(client, path, sub.to_string(), cx);
     }
 
     /// 取回来的目录内容（界面重画时用）。
@@ -247,6 +292,10 @@ impl Remotes {
 
     fn spawn_list(client: Client, path: PathBuf, sub: String, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::bounded(1);
+        // 落盘要连连接 id，所以在进线程前就问出来。
+        let id = client.id().to_string();
+        // 列目录那一趟会把 `sub` move 走，落盘那份自己留一份。
+        let for_disk_sub = sub.clone();
         let spawn = std::thread::Builder::new()
             .name("wfiles-remote-list".to_string())
             .spawn(move || {
@@ -266,7 +315,21 @@ impl Remotes {
                 remotes.pending.remove(&path);
                 match result {
                     Ok(entries) => {
+                        // 落盘在后台线程上做：写缓存是一次磁盘 IO，
+                        // 不该让界面线程等它。线程 detach 不等——但存的是
+                        // 可再生的东西，写了一半也只是没有这一份离线缓存，
+                        // 不会让界面上的数据出错。
+                        let keep = entries.clone();
+                        let for_disk = (id.clone(), for_disk_sub.clone());
+                        std::thread::Builder::new()
+                            .name("wfiles-offline-list".to_string())
+                            .spawn(move || {
+                                crate::offline::Store::new().save(&for_disk.0, &for_disk.1, &keep);
+                            })
+                            .ok();
                         remotes.listed.insert(path.clone(), entries);
+                        // 拿到真的了，"这是旧的"那一行就该撤掉。
+                        remotes.stale.remove(&path);
                         cx.emit(RemotesEvent::Listed { path, error: None });
                     }
                     Err(error) => {
@@ -725,5 +788,206 @@ mod tests {
         // 编辑器保存时会"删掉再写回"，那一瞬间文件不在；
         // 这时宁可跳过这一趟，也不能把空文件传上去。
         assert_eq!(fingerprint(Path::new("/绝对/不存在/的地方")), None);
+    }
+
+    // ---- 离线缓存 ----
+
+    /// 把离线缓存指向一个临时目录。返回守卫，掉了就恢复默认。
+    ///
+    /// `Store::new()` 每次都问 `Store::root()`，所以得让 `root()` 能被改——
+    /// 用进程级的覆盖，而不是给 `Store` 加参数（加参数会让生产代码里
+    /// 到处都得传一遍，只为测试方便是不值的）。
+    struct OfflineOverride {
+        // 字段顺序即析构顺序的逆序：`_lock` 最后声明，
+        // 所以它最先被丢掉——覆盖恢复完之后锁才放掉。
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<PathBuf>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl OfflineOverride {
+        fn arm(tag: &str) -> Self {
+            // 拿锁再改覆盖：否则两个测试并行时会互相把对方的覆盖顶掉。
+            let lock = crate::offline::test_guard();
+            let dir = tempfile::tempdir().unwrap();
+            let previous = crate::offline::take_root_override();
+            crate::offline::set_root_override(Some(dir.path().join(tag)));
+            Self {
+                _lock: lock,
+                previous,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for OfflineOverride {
+        fn drop(&mut self) {
+            crate::offline::set_root_override(self.previous.clone());
+        }
+    }
+
+    /// 某个远程目录现在列着什么（按名字）。
+    fn names_in(
+        cx: &mut TestAppContext,
+        remotes: &gpui_kit::Entity<Remotes>,
+        id: &str,
+        sub: &str,
+    ) -> Vec<String> {
+        let path = remote::location(id, sub);
+        cx.update(|cx| {
+            remotes
+                .read(cx)
+                .entries(&path)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// 一直转到这个远程目录这一趟有结果为止（列回来了，或者确认列不回来）。
+    ///
+    /// 只等 `pending`：`failed` 是**终态**不是"在等"。
+    /// 早先把 `failed` 也算进去，结果断网那一段会一直等下去——
+    /// `failed` 一旦进去就再也不会出来。
+    fn settle_list(cx: &mut TestAppContext, remotes: &gpui_kit::Entity<Remotes>, path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let waiting = cx.update(|cx| remotes.read(cx).pending.contains(path));
+            if !waiting {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "这个远程目录一直取不回来：{path:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_listing_is_still_there_after_the_server_stops_answering(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        let _offline = OfflineOverride::arm("断网");
+        let server = crate::remote::fake::start();
+        let remotes = cx.new(|_| Remotes::new());
+
+        // 先在服务器还活着的时候列一次，让缓存落盘。
+        cx.update(|cx| {
+            remotes.update(cx, |remotes, cx| {
+                put_client(remotes, "t1", &server.url);
+                assert!(
+                    remotes.list("t1", "folder", cx).is_none(),
+                    "第一次得去后台问服务器"
+                );
+            });
+        });
+        settle_list(cx, &remotes, &remote::location("t1", "folder"));
+        let online = names_in(cx, &remotes, "t1", "folder");
+        assert!(
+            !online.is_empty(),
+            "服务器在线时该列到 folder 里的东西：{online:?}"
+        );
+        // 落盘是 detach 的后台线程，等它把文件写出来。
+        let store = crate::offline::Store::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.load("t1", "folder").is_none() && Instant::now() < deadline {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 现在断网，换一个干净的 Remotes（相当于重启应用）。
+        server.go_offline();
+        let offline_remotes = cx.new(|_| Remotes::new());
+
+        let listed = cx.update(|cx| {
+            offline_remotes.update(cx, |remotes, cx| {
+                put_client(remotes, "t1", &server.url);
+                remotes.list("t1", "folder", cx)
+            })
+        });
+        let offline = listed
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            offline, online,
+            "服务器答不出来了，那份列表还得原样在——这正是离线缓存的意义"
+        );
+        // 界面上必须写明这是旧的，否则用户会以为这就是现在的样子。
+        let at = cx.update(|cx| {
+            offline_remotes
+                .read(cx)
+                .staleness(&remote::location("t1", "folder"))
+        });
+        assert!(at.is_some(), "得能告诉界面这份有多旧");
+
+        // 后台那一趟仍然要去问：万一只是临时抖了一下，通了就该换成新的。
+        settle_list(cx, &offline_remotes, &remote::location("t1", "folder"));
+        assert!(
+            cx.update(|cx| offline_remotes
+                .read(cx)
+                .failed
+                .contains(&remote::location("t1", "folder"))),
+            "服务器确实没答上来"
+        );
+        assert_eq!(
+            names_in(cx, &offline_remotes, "t1", "folder"),
+            online,
+            "问失败了也不能把用户正在看的内容抢走"
+        );
+
+        // 服务器回来了：刷新一下就该换成新的，"旧的"那层撤掉。
+        server.come_online();
+        cx.update(|cx| {
+            offline_remotes.update(cx, |remotes, cx| remotes.reload("t1", "folder", cx))
+        });
+        settle_list(cx, &offline_remotes, &remote::location("t1", "folder"));
+        assert_eq!(
+            cx.update(|cx| offline_remotes
+                .read(cx)
+                .staleness(&remote::location("t1", "folder"))),
+            None,
+            "拿到真的了就不该再标成旧的"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn forgetting_a_connection_takes_its_offline_listings_too(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        let _offline = OfflineOverride::arm("删连接");
+        let store = crate::offline::Store::new();
+        let entries = vec![crate::remote::Entry {
+            name: "旧文件.txt".to_string(),
+            path: "旧文件.txt".to_string(),
+            is_dir: false,
+            size: 5,
+            modified: None,
+        }];
+        store.save("gone", "x", &entries);
+        assert!(store.load("gone", "x").is_some());
+
+        let remotes = cx.new(|_| Remotes::new());
+        cx.update(|cx| {
+            remotes.update(cx, |remotes, cx| {
+                let mut config = crate::remote::fake::config("http://127.0.0.1:9/dav/");
+                config.id = "gone".to_string();
+                remotes.save(config, "", cx).ok();
+                remotes.forget("gone", cx);
+            });
+        });
+
+        assert!(
+            store.load("gone", "x").is_none(),
+            "连接都没了，它的目录列表该一起没——留着是垃圾，也可能在下次同 id 时串味"
+        );
     }
 }

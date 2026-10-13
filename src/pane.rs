@@ -623,12 +623,35 @@ impl Pane {
                     if *path != this.listing.path() {
                         return;
                     }
-                    if let Some(error) = error {
-                        this.error = Some(error.clone());
-                    } else {
-                        this.fill_remote(path, cx);
+                    match error {
+                        // 取回来了：换新的，"这是旧的"那层也就没意义了。
+                        None => {
+                            this.error = None;
+                            this.fill_remote(path, cx);
+                            this.update_status();
+                        }
+                        // 没取回来：如果屏幕上还留着磁盘上那份，
+                        // 就别把它换成一块错误页——用户要的是"昨天有什么"，
+                        // 那份还在。错误另说，但别把内容抢走。
+                        Some(reason) => {
+                            let stale_at = this
+                                .remotes
+                                .update(cx, |remotes, _| remotes.staleness(path));
+                            match stale_at {
+                                Some(at) => {
+                                    this.status = format!(
+                                        "连不上服务器，显示 {} 列的这份",
+                                        crate::offline::ago(at)
+                                    );
+                                }
+                                // 一份缓存都没有，就老实说连不上。
+                                None => {
+                                    this.error = Some(reason.clone());
+                                    this.update_status();
+                                }
+                            }
+                        }
                     }
-                    this.update_status();
                     cx.notify();
                 }
                 // 回了传：服务器上的大小和时间都变了，正在看的那一栏该重问一次。
@@ -903,8 +926,11 @@ impl Pane {
         let entries = self
             .remotes
             .update(cx, |remotes, cx| remotes.list(&id, &sub, cx));
+        // 有没有垫上磁盘上那份，此刻还不知道——要等后台那一趟回来，
+        // 服务器答了还是没答，"这是旧的"才说得准。所以这里不写状态栏，
+        // 交给 RemotesEvent::Listed 那头定。
         match entries {
-            // 已经列过了（缓存还在）：当场填进去。
+            // 已经列过了（内存或磁盘上有）：当场填进去。
             Some(_) => {
                 self.fill_remote(&path, cx);
                 self.update_status();
