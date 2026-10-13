@@ -2332,7 +2332,14 @@ impl Pane {
                     .ghost()
                     .small()
                     .selected(self.view == mode)
-                    .tooltip(format!("{}视图（{}）", mode.label(), mode.shortcut()))
+                    .tooltip(crate::i18n::tr_args(
+                        cx,
+                        "{view}视图（{shortcut}）",
+                        &[
+                            ("view", crate::i18n::tr(cx, mode.label())),
+                            ("shortcut", mode.shortcut().to_string()),
+                        ],
+                    ))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_view(mode, cx)))
             })
             .collect()
@@ -3097,7 +3104,8 @@ impl Pane {
             self.thumbnail_of_size(&path, thumbnails::GRID_EDGE, cx)
         };
         let caption = if is_dir {
-            "文件夹".to_string()
+            // 图注也是界面文案：英文用户看到的网格里也得写 Folder。
+            crate::i18n::tr(cx, "文件夹")
         } else {
             format::file_size(size)
         };
@@ -3503,7 +3511,7 @@ impl Pane {
     {
         // 这些方法都是吃掉自己、吐回一个新的同类型，所以每次要接回来。
         if let Some(dragged) = dragged {
-            let label = drag::label(&dragged.paths);
+            let label = drag::label(&dragged.paths, cx);
             element = element.on_drag(dragged, move |_, _, _, cx: &mut App| {
                 cx.new(|_| DragPreview {
                     label: label.clone(),
@@ -3608,11 +3616,14 @@ impl Pane {
         self.ops.update(cx, |ops, cx| {
             ops.drop_into(paths.clone(), destination.clone(), cut, cx)
         });
-        self.status = format!(
-            "{} {} 项到 {}",
-            action.label(),
-            paths.len(),
-            destination.display()
+        self.status = crate::i18n::tr_args(
+            cx,
+            "{action} {count} 项到 {target}",
+            &[
+                ("action", crate::i18n::tr(cx, action.label())),
+                ("count", paths.len().to_string()),
+                ("target", destination.display().to_string()),
+            ],
         );
         cx.notify();
     }
@@ -3802,6 +3813,9 @@ impl Pane {
             .selection
             .single()
             .and_then(|path| self.listing.entry(path));
+        // 多选态那两句走 `MultiSelectionSummary`（纯函数，要能被单测），
+        // 所以语言在这里解析一次而不是让那两个函数收 `cx`。
+        let locale = Settings::read(cx).locale();
 
         let content = match selected {
             Some(entry) => v_flex()
@@ -3834,13 +3848,13 @@ impl Pane {
                         .child(entry.name.clone()),
                 )
                 .child(detail_row(
-                    "类型",
+                    "kind",
                     crate::i18n::tr(cx, "类型"),
                     entry.kind_label(),
                     cx,
                 ))
                 .child(detail_row(
-                    "大小",
+                    "size",
                     crate::i18n::tr(cx, "大小"),
                     if entry.is_dir {
                         "—".to_string()
@@ -3850,7 +3864,7 @@ impl Pane {
                     cx,
                 ))
                 .child(detail_row(
-                    "修改",
+                    "modified",
                     crate::i18n::tr(cx, "修改"),
                     format::modified(entry.modified),
                     cx,
@@ -3861,7 +3875,7 @@ impl Pane {
                     crate::cloud::describe(&entry.path, crate::cloud::detected()),
                     |this, (root, state)| {
                         this.child(detail_row(
-                            "云盘",
+                            "cloud",
                             crate::i18n::tr(cx, "云盘"),
                             format!("{} · {}", root.label(), state.label()),
                             cx,
@@ -3871,11 +3885,11 @@ impl Pane {
                 .when_some(
                     mark_text(Settings::read(cx).marks.get(entry.path.as_path())),
                     |this, text| {
-                        this.child(detail_row("标记", crate::i18n::tr(cx, "标记"), text, cx))
+                        this.child(detail_row("marks", crate::i18n::tr(cx, "标记"), text, cx))
                     },
                 )
                 .child(detail_row(
-                    "位置",
+                    "location",
                     crate::i18n::tr(cx, "位置"),
                     entry.path.display().to_string(),
                     cx,
@@ -3883,31 +3897,38 @@ impl Pane {
                 .into_any_element(),
             None if self.selection.len() > 1 => {
                 let selected = self.selection.ordered(&self.listing);
-                let names: Vec<String> = selected
-                    .iter()
-                    .filter_map(|path| self.listing.entry(path))
-                    .take(8)
-                    .map(|entry| entry.name.clone())
-                    .collect();
-                let rest = selected.len().saturating_sub(names.len());
+                let summary = MultiSelectionSummary::of(
+                    selected.len(),
+                    selected
+                        .iter()
+                        .filter_map(|path| self.listing.entry(path))
+                        .map(|entry| entry.name.clone()),
+                );
 
                 v_flex()
                     .gap_3()
                     .child(
                         div()
                             .font_semibold()
-                            .child(format!("已选中 {} 项", selected.len())),
+                            // 读屏软件该报"选了几个"，不然用户只听见一串文件名。
+                            .id("detail-selection")
+                            .test_support()
+                            .aria_label(summary.heading(locale))
+                            .child(summary.heading(locale)),
                     )
                     .child(
                         v_flex()
                             .gap_1()
                             .text_sm()
-                            .children(names.into_iter().map(|name| div().truncate().child(name)))
-                            .when(rest > 0, |list| {
-                                list.child(
-                                    div()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("…… 还有 {rest} 项")),
+                            .children(
+                                summary
+                                    .names
+                                    .iter()
+                                    .map(|name| div().truncate().child(name.clone())),
+                            )
+                            .when_some(summary.more(locale), |this, line| {
+                                this.child(
+                                    div().text_color(cx.theme().muted_foreground).child(line),
                                 )
                             }),
                     )
@@ -4472,6 +4493,58 @@ fn mark_text(mark: Option<&crate::marks::Mark>) -> Option<String> {
     Some(parts.join(" · "))
 }
 
+/// 详情板多选态的文案。
+///
+/// **抽成纯函数是因为它测不到**：多选要 shift 或 Ctrl 点行，而 gpui-kit
+/// 的测试 `mouse_down` 把 `modifiers` 写死成 `Default::default()`——
+/// 造不出带修饰键的那次点击（`window.click` 走的正是它）。缝在这里而不是
+/// 留在渲染函数里，是为了"选 12 个时标题写几个、尾巴写几个"这类性质
+/// 能在单测里验；渲染树里那部分仍然是集成测试的地盘。
+pub struct MultiSelectionSummary {
+    /// 列出来的名字，至多 [`Self::MAX_NAMES`] 个。
+    pub names: Vec<String>,
+    /// 总共选了几个。
+    pub total: usize,
+}
+
+impl MultiSelectionSummary {
+    /// 详情板最多列几个名字，剩下的合成一句"还有 N 项"。
+    ///
+    /// 板子就那么宽，列五十个名字会把别的信息顶出去。
+    pub const MAX_NAMES: usize = 8;
+
+    pub fn of(total: usize, names: impl Iterator<Item = String>) -> Self {
+        Self {
+            names: names.take(Self::MAX_NAMES).collect(),
+            // 名字可能比 `total` 少（`listing` 里查不到的那几个路径），
+            // 那时总数跟着名字走：报一个比列出来的还大的数，
+            // 用户数了数屏幕上的名字，发现对不上。
+            total,
+        }
+    }
+
+    /// 标题："已选中 N 项"。
+    ///
+    /// **按 `locale` 查表而不是收 `cx`**：这个函数存在的理由就是能被单测
+    /// （上面那条注释说为什么渲染树里测不到），收 `cx` 就把单测的可能性
+    /// 又拿走了。渲染那边传 `Settings::read(cx).locale()` 进来。
+    pub fn heading(&self, locale: crate::i18n::Locale) -> String {
+        crate::i18n::tr_args_in(
+            locale,
+            "已选中 {count} 项",
+            &[("count", self.total.to_string())],
+        )
+    }
+
+    /// 没列完时的那句尾巴；全列完了就是 `None`（不渲染这一行）。
+    pub fn more(&self, locale: crate::i18n::Locale) -> Option<String> {
+        let rest = self.total.checked_sub(self.names.len())?;
+        (rest > 0).then(|| {
+            crate::i18n::tr_args_in(locale, "…… 还有 {rest} 项", &[("rest", rest.to_string())])
+        })
+    }
+}
+
 /// 详情面板里的一行：左边标签（类型 / 大小 / 修改…），右边值。
 ///
 /// `label` 收 `String` 而不是 `&str`：它已经查过表了（`tr()` 返回 `String`），
@@ -4504,7 +4577,7 @@ fn detail_row(key: &'static str, label: String, value: String, cx: &App) -> impl
 #[cfg(test)]
 mod tests {
     use crate::model::{FileEntry, Listing, Selection};
-    use crate::pane::Pane;
+    use crate::pane::{MultiSelectionSummary, Pane};
     use std::path::PathBuf;
 
     /// 一个装着远程文件的列表：路径按 `remote://连接 id/服务器上路径` 拼。
@@ -4579,5 +4652,66 @@ mod tests {
         let (listing, _, _) = remote_listing();
         let selection = Selection::default();
         assert_eq!(Pane::editable_remote(&selection, &listing), None);
+    }
+
+    // ---- 详情板多选态的文案 ----
+    //
+    // 渲染树里测不到这一段（gpui-kit 的测试 `mouse_down` 写死
+    // `modifiers: Default::default()`，造不出 shift 多选），所以把它
+    // 缝成纯函数在这里验。
+
+    fn names(count: usize) -> impl Iterator<Item = String> {
+        (1..=count)
+            .map(|n| format!("文件{n}"))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn the_selection_heading_counts_everything_even_past_the_listing_limit() {
+        let summary = MultiSelectionSummary::of(12, names(12));
+        assert_eq!(summary.names.len(), MultiSelectionSummary::MAX_NAMES);
+        assert_eq!(summary.heading(crate::i18n::Locale::ZhHans), "已选中 12 项");
+        // 12 个里只列了 8 个，尾巴该报 4 个，不是 12 个。
+        assert_eq!(
+            summary.more(crate::i18n::Locale::ZhHans),
+            Some("…… 还有 4 项".to_string())
+        );
+    }
+
+    #[test]
+    fn a_selection_that_fits_has_no_trailing_line() {
+        let summary = MultiSelectionSummary::of(3, names(3));
+        assert_eq!(summary.heading(crate::i18n::Locale::ZhHans), "已选中 3 项");
+        assert_eq!(summary.more(crate::i18n::Locale::ZhHans), None);
+    }
+
+    #[test]
+    fn the_selection_heading_follows_the_language() {
+        let summary = MultiSelectionSummary::of(12, names(12));
+        let heading = summary.heading(crate::i18n::Locale::En);
+        assert!(
+            !heading.chars().any(|c| c as u32 > 0x2E80),
+            "英文标题里还有中文：{heading:?}"
+        );
+        assert!(heading.contains("12"), "英文标题该带总数：{heading:?}");
+        let rest = summary.more(crate::i18n::Locale::En).expect("该有尾巴");
+        assert!(
+            !rest.chars().any(|c| c as u32 > 0x2E80),
+            "英文尾巴里还有中文：{rest:?}"
+        );
+        assert!(rest.contains('4'), "英文尾巴该报 4：{rest:?}");
+    }
+
+    #[test]
+    fn names_that_are_missing_from_the_listing_do_not_break_the_count() {
+        // 选了 5 个但只有 2 个还查得到（别的被别处删了）：
+        // 标题照实说 5，尾巴说 3——报 2 会跟"选了几个"对不上。
+        let summary = MultiSelectionSummary::of(5, names(2));
+        assert_eq!(summary.heading(crate::i18n::Locale::ZhHans), "已选中 5 项");
+        assert_eq!(
+            summary.more(crate::i18n::Locale::ZhHans),
+            Some("…… 还有 3 项".to_string())
+        );
     }
 }

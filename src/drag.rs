@@ -86,17 +86,47 @@ pub fn wants_to_expand(is_dir: bool, dragging: bool) -> bool {
 ///
 /// 一个文件报名字（长了截断），多个报数量——
 /// 卡片就那么大，列十个名字反而认不出自己拖的是什么。
-pub fn label(paths: &[PathBuf]) -> String {
-    let name = |path: &Path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
-    };
+pub fn label(paths: &[PathBuf], cx: &gpui_kit::App) -> String {
+    match what(paths) {
+        DragLabel::Name(name) => name,
+        // 空批不写卡片。这条分支实际上到不了（没东西可拖时压根没有拖动），
+        // 但留着比让编译器逼我 `unreachable!()` 好——那样哪天真拖了个空的
+        // 上来就会 panic，而这里只是画一张空卡片。
+        DragLabel::None => String::new(),
+        // 数量那一支查表：这张卡片上的字直接摆在屏幕上，
+        // 英文用户看到 "3 个项目" 是漏翻。
+        DragLabel::Count(count) => {
+            crate::i18n::tr_args(cx, "{count} 个项目", &[("count", count.to_string())])
+        }
+    }
+}
 
+/// 卡片上写什么，**跟语言无关的那一半**。
+///
+/// 分出来是因为"一个报名字、多个报数量"这条性质本身不用查表就能验：
+/// 塞进 [`label`] 的话单测得先造一个 GPUI 测试运行时，而这条性质跟界面
+/// 一点关系都没有（跟 `throttle::presets` 拆成 `rates()` + `rate_label`
+/// 同一个理由）。反过来，多报数量那一支要查表，就留在 [`label`] 里。
+#[derive(Debug, PartialEq, Eq)]
+pub enum DragLabel {
+    /// 空批：卡片什么都不写。
+    None,
+    /// 单个文件：写它的名字。
+    Name(String),
+    /// 一批文件：写数量。
+    Count(usize),
+}
+
+/// 这批路径在卡片上该报什么。
+pub fn what(paths: &[PathBuf]) -> DragLabel {
     match paths {
-        [] => String::new(),
-        [only] => name(only),
-        many => format!("{} 个项目", many.len()),
+        [] => DragLabel::None,
+        [only] => DragLabel::Name(
+            only.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| only.display().to_string()),
+        ),
+        many => DragLabel::Count(many.len()),
     }
 }
 
@@ -160,9 +190,15 @@ mod tests {
 
     #[test]
     fn the_drag_label_names_one_file_and_counts_many() {
-        assert_eq!(label(&paths(&["/a/photo.png"])), "photo.png");
-        assert_eq!(label(&paths(&["/a/1", "/a/2", "/a/3"])), "3 个项目");
-        assert_eq!(label(&[]), "");
+        // 验的是 `what`（跟语言无关的那一半），不是 `label`——
+        // 后者要查表，单测它就得造 GPUI 测试运行时。
+        // 中文那一支由 `i18n::lookup(En, "{count} 个项目", …)` 的用例管着。
+        assert_eq!(
+            what(&paths(&["/a/photo.png"])),
+            DragLabel::Name("photo.png".into())
+        );
+        assert_eq!(what(&paths(&["/a/1", "/a/2", "/a/3"])), DragLabel::Count(3));
+        assert_eq!(what(&[]), DragLabel::None);
     }
 
     #[test]

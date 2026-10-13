@@ -3502,8 +3502,11 @@ fn a_cloud_sync_folder_is_called_out_in_the_sidebar_and_the_details(cx: &mut Tes
     });
     let cloud = step_value(cx, handle, |window, cx| {
         settle(window, cx);
+        // id 里的 `cloud` 是**稳定英文标识**，不是标签：标签跟着界面语言变
+        // （中文叫"云盘"、英文叫"Cloud"），而 id 不能变——否则切到英文之后
+        // 这个元素就找不到了，而那行内容一个字都没变。
         window
-            .try_find("detail-云盘")
+            .try_find("detail-cloud")
             .and_then(|row| row.label().map(|label| label.to_string()))
             .unwrap_or_default()
     });
@@ -5248,4 +5251,9 @@ fn the_pane_chrome_speaks_english(cx: &mut TestAppContext) {
         a11y_label_at(window, "file-list")
     });
     assert_eq!(view, "List view", "列表视图的无障碍名该跟着语言走");
+    // 详情板的多选态（`detail-selection`）**不在这里验**：
+    // 多选要 shift 或 Ctrl 点行，而 gpui-kit 的测试 `mouse_down` 把
+    // `modifiers` 写死成 `Default::default()`——`window.click` 走的正是
+    // 它，造不出带修饰键的那次点击。那两句文案缝成了纯函数
+    // （`pane::MultiSelectionSummary`），在 `pane::tests` 里逐语言验。
 }

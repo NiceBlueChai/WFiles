@@ -151,6 +151,16 @@ pub fn tr_args(cx: &gpui_kit::App, text: &str, args: &[(&str, String)]) -> Strin
     fill(&tr(cx, text), args)
 }
 
+/// [`tr_args`] 的纯函数内核，**只查表不填占位符**。
+///
+/// 给那些"要被单测验文案"的纯函数用：它们没有 `cx`（`cx` 的存在意义就是
+/// 从设置里读语言，纯函数读不到），但仍然不该绕开查表——
+/// 直接写死中文会让"英文界面里一条中文都不剩"这条判据把它们漏过去。
+/// 典型用法见 `pane::MultiSelectionSummary::heading`。
+pub fn tr_args_in(locale: Locale, text: &str, args: &[(&str, String)]) -> String {
+    fill(&lookup(locale, text), args)
+}
+
 /// [`tr_args`] 的纯函数内核：在一句已经查好的话里填占位符。
 ///
 /// 认不出来的占位符**原样留着**（`{foo}` 留在结果里）：填错了要在输出里看得见，
@@ -363,6 +373,26 @@ static EN: &[(&str, &str)] = &[
     ("已复制 {count} 个路径", "Copied {count} paths"),
     ("已复制 {count} 个文件名", "Copied {count} file names"),
     // ---- 窗格：其它 ----
+    // 拖动卡片与拖放状态栏。`{action}` 是"移动/拷贝"那对动词
+    // （`DropAction::label`），它跟文件操作那条线上的是同一个词。
+    ("{count} 个项目", "{count} items"),
+    (
+        "{action} {count} 项到 {target}",
+        "{action} {count} items to {target}",
+    ),
+    ("移动", "Move"),
+    ("拷贝", "Copy"),
+    // 三种视图的名字（`ViewMode::label`，不带"视图"两个字，
+    // 因为要拼进"{view}视图（Cmd+1）"里）。
+    ("列表", "List"),
+    ("网格", "Grid"),
+    ("分列", "Columns"),
+    ("{view}视图（{shortcut}）", "{view} view ({shortcut})"),
+    // 详情板多选态
+    ("已选中 {count} 项", "{count} selected"),
+    ("…… 还有 {rest} 项", "… and {rest} more"),
+    // 网格视图里目录那一格的图注
+    ("文件夹", "Folder"),
     ("上一级", "Up"),
     ("回到上一级", "Go Up"),
     ("关闭（Esc）", "Close (Esc)"),
