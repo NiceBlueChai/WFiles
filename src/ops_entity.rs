@@ -431,6 +431,17 @@ impl Ops {
         self.last_message_is_error
     }
 
+    /// 往状态栏放一句话。
+    ///
+    /// **给的是 `Msg` 不是 `String`**，理由跟 [`Self::last_message`] 一样。
+    /// 应用级的动作（导出日志、换语言）也走这条路，不另设一套上报：
+    /// 状态栏只有一行，两个来源各写各的必然出现"后写的盖掉前一个"。
+    pub fn say(&mut self, message: crate::i18n::Msg, is_error: bool, cx: &mut Context<Self>) {
+        self.last_message = Some(message);
+        self.last_message_is_error = is_error;
+        cx.notify();
+    }
+
     // ---- 发起请求 ----
 
     /// 新建文件夹：不直接动手，先问名字（预填一个没被占用的“未命名文件夹”）。
@@ -1235,6 +1246,7 @@ impl Ops {
 
                 self.last_message = Some(summarize(&outcome, cut, aborted));
                 self.last_message_is_error = !outcome.failed.is_empty();
+                log_transfer(&outcome, cut, aborted);
                 cx.emit(OpsEvent::Changed {
                     removed,
                     changed: outcome.touched,
@@ -1277,6 +1289,37 @@ impl Ops {
 
         // 这个跑完了，队列里排着的下一个该上了。
         self.pump_queue(cx);
+    }
+}
+
+/// 一次搬运的结论，往日志里记一笔。
+///
+/// **跟 [`summarize`] 分开是故意的**：那句是给用户看的界面文案（走 i18n），
+/// 这句是给排查看的（不翻，见 [`crate::logfile`] 模块头）。两者的信息量
+/// 也不同——这里把**每一项失败的原因**都逐条记下来，而界面上只报前几条：
+/// 用户要的是"成了吗"，排查看要的是"第 7 个为什么失败"。
+///
+/// 失败原因用 `to_string()` 是**故意的**：它恒给中文，而这里的读者
+/// 是拿着日志来问我们的人，我们看的就是中文句子。翻成英文反而多一层
+/// "这说的是不是我传的那个错"。
+fn log_transfer(outcome: &Outcome, cut: bool, aborted: bool) {
+    use crate::logfile::{self, Level};
+    let what = if cut { "移动" } else { "拷贝" };
+    let mut head = format!(
+        "{what} 结束：完成 {} 项，跳过 {} 项",
+        outcome.done, outcome.skipped
+    );
+    if aborted {
+        head.push_str("，被用户中止");
+    }
+    if outcome.failed.is_empty() {
+        logfile::log(Level::Info, &head);
+    } else {
+        head.push_str(&format!("，失败 {} 项", outcome.failed.len()));
+        logfile::log(Level::Error, &head);
+        for (path, why) in &outcome.failed {
+            logfile::log(Level::Error, &format!("  失败 {}：{why}", path.display()));
+        }
     }
 }
 

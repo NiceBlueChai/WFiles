@@ -677,6 +677,18 @@ static EN: &[(&str, &str)] = &[
     ("连接远程服务器…", "Connect to Server…"),
     ("默认终端：跟随系统", "Default Terminal: System Default"),
     ("默认终端：{name}", "Default Terminal: {name}"),
+    // ---- 日志导出 ----
+    // 这几句是**界面上**的话（面板里那一条、状态栏里那两句），
+    // 所以要翻。被导出的日志文件内容不翻——那是排查看的现场，
+    // 理由写在 src/logfile.rs 的模块头里。
+    ("导出日志到桌面", "Export Log to Desktop"),
+    ("排查问题", "Troubleshooting"),
+    ("日志已导出到 {path}", "Log exported to {path}"),
+    ("导出日志失败：{error}", "Couldn’t export the log: {error}"),
+    (
+        "还没有日志可导出：这次运行没记下任何东西",
+        "Nothing to export yet — this session hasn’t logged anything",
+    ),
     ("传输限速：{label}", "Transfer Speed: {label}"),
     ("不限速", "No limit"),
     // ---- 嵌在占位符里的值（这些是"值"不是模板，但同样要翻）----

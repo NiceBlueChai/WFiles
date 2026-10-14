@@ -227,6 +227,10 @@ impl SearchPanel {
         cx.notify();
 
         let generation = self.generation;
+        // 记日志要的是用户**当初打进去的那句**，不是解析后的结构：
+        // 用户报"搜不到"时说的是他打的那句话，而 `Query` 解析完
+        // 就没有原文了（没实现 `Display`，也不该为此实现）。
+        let logged_text = text.clone();
         let (tx, rx) = async_channel::unbounded::<search::Event>();
         let mut search = Search::new(self.root.clone(), query)
             .with_limit(PANEL_LIMIT)
@@ -260,6 +264,20 @@ impl SearchPanel {
                                 this.running = false;
                                 this.stats = Some(stats);
                                 this.cancel = None;
+                                // 一轮扫完的统计进日志：用户报"搜索很慢"
+                                // 的时候，能拿出来的只有"扫了多少项、命中几个、
+                                // 有没有撞上限"这几个数——界面上那句
+                                // 「找到 12 个」答不了这个问题。
+                                crate::logfile::info(&format!(
+                                    "搜索「{logged_text}」：扫了 {} 项，命中 {} 个{}",
+                                    stats.visited,
+                                    this.hits.len(),
+                                    if stats.truncated {
+                                        "，撞到上限"
+                                    } else {
+                                        ""
+                                    },
+                                ));
                                 this.sync_rows();
                             }
                         }

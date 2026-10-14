@@ -14,6 +14,7 @@ mod format;
 mod ftp;
 mod i18n;
 mod keymap;
+mod logfile;
 mod marks;
 mod meta;
 mod model;

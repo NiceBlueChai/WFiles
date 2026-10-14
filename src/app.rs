@@ -134,6 +134,8 @@ enum PaletteAction {
     SetLocale(crate::i18n::Locale),
     /// 界面语言改回"跟随系统"（设置里存空串）。
     SetLocaleAuto,
+    /// 把日志导出到桌面（缓存目录里那份用户自己找不到）。
+    ExportLog,
 }
 
 /// 连接对话框的当前状态。输入框随开随建、随关随毁，密码不留在别处。
@@ -1445,6 +1447,63 @@ impl WFilesApp {
         cx.notify();
     }
 
+    /// 把日志复制一份到桌面，状态栏报出路径。
+    ///
+    /// **落到桌面而不是让用户自己去缓存目录找**：日志文件一直在那儿写，
+    /// 而用户既不知道路径在哪、也不该去那种地方翻。导出这一步就是
+    /// "把程序里的现场变成一个能拖进聊天窗口的文件"。
+    ///
+    /// 桌面取不到（Linux 上没有 XDG 桌面目录、无头环境）就退回用户主目录：
+    /// 拿不到时跟用户说"存到主目录了"，别只说失败——
+    /// 那份日志他多半还是想要的。
+    fn export_log(&mut self, cx: &mut Context<Self>) {
+        // 记一笔"用户导出过"本身也有用：排查时能看出
+        // 用户看到的问题发生在导出之前还是之后。
+        crate::logfile::info("用户导出日志");
+        // `path()` 顺带把「这次运行有没有日志文件」这件事判了：
+        // 一次 `log()` 都还没发生的话它是 `None`，而此时报
+        // "导出失败"是误导——没有东西可导，不是导不出来。
+        if crate::logfile::path().is_none() {
+            self.ops.update(cx, |ops, cx| {
+                ops.say(
+                    crate::i18n::Message::msg("还没有日志可导出：这次运行没记下任何东西"),
+                    true,
+                    cx,
+                );
+            });
+            return;
+        }
+        let where_to = dirs::desktop_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(std::env::temp_dir);
+        // 文件名带时间戳：用户导出一次、过一会儿再导一次，
+        // 两份得能分清，否则第二份盖掉第一份而他还在拿旧那份说事。
+        let name = format!("wfiles-{}.log", crate::format::stamp_for_file_name());
+        let dest = where_to.join(name);
+        match crate::logfile::export_to(&dest) {
+            Ok(path) => self.ops.update(cx, |ops, cx| {
+                ops.say(
+                    crate::i18n::Message::args(
+                        "日志已导出到 {path}",
+                        &[("path", path.display().to_string())],
+                    ),
+                    false,
+                    cx,
+                );
+            }),
+            Err(error) => self.ops.update(cx, |ops, cx| {
+                ops.say(
+                    crate::i18n::Message::args(
+                        "导出日志失败：{error}",
+                        &[("error", error.to_string())],
+                    ),
+                    true,
+                    cx,
+                );
+            }),
+        }
+    }
+
     /// 打开连接对话框。
     fn open_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.connect.is_some() {
@@ -2092,6 +2151,7 @@ impl WFilesApp {
                 cx.notify();
             }
             PaletteAction::ToggleTerminal => self.toggle_terminal(window, cx),
+            PaletteAction::ExportLog => self.export_log(cx),
             PaletteAction::SavedSearch(name) => {
                 let Some(saved) = Settings::read(cx).saved_search(&name).cloned() else {
                     // 存过又被删掉了：命令面板是打开时快照的，这一条已经过期。
@@ -2473,6 +2533,19 @@ impl WFilesApp {
                 "terminal 内嵌 面板 shell 命令行 抽屉",
             ),
             action: PaletteAction::ToggleTerminal,
+        });
+
+        // 导日志没绑快捷键：它是低频动作（出了事才用），
+        // 而快捷键表是要抢的——占一个键位不值，见 keymap.rs 的占用表。
+        items.push(PaletteItem {
+            command: PaletteCommand::new(
+                "app:export-log",
+                crate::i18n::tr(cx, "导出日志到桌面"),
+                "",
+                crate::i18n::tr(cx, "排查问题"),
+                "log 日志 导出 排查 问题 崩溃 crash 现场 logfile",
+            ),
+            action: PaletteAction::ExportLog,
         });
 
         // 换默认终端：只列装了的，免得选一个按下去报错的。

@@ -5076,6 +5076,54 @@ fn palette_titles(
     app.read(cx).palette_titles()
 }
 
+/// 命令面板里有一条「导出日志」，按下去状态栏报出落地路径。
+///
+/// **判据落在状态栏那句话上**，不是"文件真的出现了"：导出目标在
+/// 桌面（`dirs::desktop_dir()`），而测试环境不该往用户的桌面写东西。
+/// 这条验的是"命令接通了、并且把路径说给用户听了"——那正是用户
+/// 按这一下要得到的东西。
+#[gpui_kit::test]
+fn exporting_the_log_says_where_it_landed(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let (handle, app) = open_app_of_width(cx, 1180.);
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("导出日志", cx);
+        settle(window, cx);
+    });
+    let titles = step_value(cx, handle, |_, cx| palette_titles(&app, cx));
+    step(cx, handle, |window, _cx| {
+        assert!(
+            window.try_find("app:export-log").is_some(),
+            "命令面板里该有「导出日志」这一条，实际列出：{titles:?}"
+        );
+    });
+
+    step(cx, handle, |window, cx| {
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let said = window
+            .try_find("status-message")
+            .and_then(|element| element.label().map(|label| label.to_string()))
+            .unwrap_or_default();
+        // 三种可能：导出成功（报路径）、还没有日志（报"没记下任何东西"）、
+        // 导出失败（报失败原因）。**三种都算这条命令通了**——
+        // 测试环境能不能真写出一个文件不归这条判据管，
+        // 归 `logfile::tests` 里的那几条管。
+        assert!(
+            said.contains("日志已导出到")
+                || said.contains("还没有日志可导出")
+                || said.contains("导出日志失败"),
+            "执行后状态栏该说出结果，实际：{said:?}"
+        );
+    });
+}
+
 #[gpui_kit::test]
 fn the_command_palette_speaks_english_all_the_way_through(cx: &mut TestAppContext) {
     let _session = isolate_session();
@@ -5321,6 +5369,66 @@ fn an_empty_command_palette_says_so_in_the_chosen_language(cx: &mut TestAppConte
     assert!(
         !empty.chars().any(|c| c as u32 > 0x2E80),
         "英文面板的空态提示里还有中文：{empty:?}"
+    );
+}
+
+/// 真走一次搬运，日志文件里就该有那一笔。
+///
+/// **这条是为了堵一个真实的洞**：`logfile` 自己的 9 条测试全是直接调
+/// `logfile::log()`，**没有一条走搬运链路**。所以把
+/// `ops_entity::log_transfer` 那行删掉，9 条全绿——
+/// 而真实运行时后台搬运出了事，日志里一个字都没有。
+///
+/// 判据落在「搬运完成后去读日志文件」这一层，才能真的守住那行接线。
+/// 顺带守住了「日志文件落在临时目录」：读不到文件的话这里就红，
+/// 而真机缓存目录被测试写脏这件事**不会有任何测试变红**。
+#[gpui_kit::test]
+fn a_real_transfer_leaves_a_line_in_the_log(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let src = root.path().join("src");
+    many_files(&src);
+    std::fs::create_dir(root.path().join("dest")).unwrap();
+
+    let (_session, handle) = open_in(cx, root.path());
+    cx.background_executor.allow_parking();
+
+    // 选中 src、复制，进 dest 粘贴 —— 走完整一条搬运链路。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 目录优先，所以 dest(0) 在 src(1) 前。
+        window.click(("row-name", 1usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-c", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.click(("row-name", 0usize), cx);
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-v", cx);
+    });
+
+    // 等搬运真正落地（日志是任务结束时才写的那一笔）。
+    assert!(wait_for(cx, handle, "status-detail"), "搬运该跑起来");
+    wait_until_gone(cx, handle, "status-detail");
+
+    let text = step_value(cx, handle, |_, _| {
+        crate::logfile::flush();
+        let Some(path) = crate::logfile::path() else {
+            return String::new();
+        };
+        std::fs::read_to_string(path).unwrap_or_default()
+    });
+    assert!(
+        text.contains("拷贝 结束"),
+        "搬运完成后日志里该有一笔「拷贝 结束…」，实际读到：{text:?}"
+    );
+    // 日志是排查看用的现场，而密码进日志等于把钥匙串抄给任何
+    // 拿到日志文件的人。这一条守着远程连接那条埋点不把 secret 带进去。
+    assert!(
+        !text.contains("password") && !text.contains("密码"),
+        "日志里不该出现凭据字样，实际读到：{text:?}"
     );
 }
 

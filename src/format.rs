@@ -88,6 +88,26 @@ pub fn timestamp(time: Option<SystemTime>) -> String {
     )
 }
 
+/// 文件名里用的紧凑时间戳：`YYYYMMDD-HHMM`。
+///
+/// **给导出日志的文件名用**，别处不需要。它跟 [`timestamp`] 分开是
+/// 因为分隔符不一样（`-` 在文件名里跟日期混在一起不好读），但
+/// 日期换算共用 [`civil_from_days`]——同一件事只该有一份实现，
+/// 两份算法迟早会在某个闰年上分道扬镳。
+pub fn stamp_for_file_name() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    let minute_of_day = seconds.rem_euclid(86_400) / 60;
+    format!(
+        "{year}{month:02}{day:02}-{:02}{:02}",
+        minute_of_day / 60,
+        minute_of_day % 60
+    )
+}
+
 /// Howard Hinnant 的 days_from_civil 逆变换，避免为了一个日期引入 chrono。
 fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let z = days_since_epoch + 719_468;

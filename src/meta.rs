@@ -1022,7 +1022,12 @@ impl Metadata {
         if let Err(error) = spawn {
             // 起不了线程（进程里线程太多）就当场算一次：
             // 慢一点，但这一格不会永远空着。
-            eprintln!("元数据：起不了后台线程（{error}），就地算一次");
+            //
+            // 记进日志而不是 `eprintln!`：从文件管理器启动的进程
+            // 根本没有终端可写，那行字只进 devtools 的 stderr，
+            // 用户那边一个字也看不到——而"这一格一直空着"
+            // 正是靠这句话才能定位。
+            crate::logfile::warn(&format!("元数据：起不了后台线程（{error}），就地算一次"));
             let text = probe(field, &path, is_dir);
             self.finish(path, stamp, text, cx);
             return;
@@ -1104,7 +1109,10 @@ impl Metadata {
                 tx.try_send(git_status(&worker)).ok();
             });
         if let Err(error) = spawn {
-            eprintln!("Git 状态：起不了后台线程（{error}），就地算一次");
+            crate::logfile::warn(&format!(
+                "Git 状态（{}）：起不了后台线程（{error}），就地算一次",
+                root.display()
+            ));
             let states = git_status(&root);
             self.finish_git(root, states, cx);
             return;

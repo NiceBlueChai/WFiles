@@ -187,6 +187,10 @@ impl Remotes {
                 tx.try_send(result).ok();
             });
         if let Err(error) = spawn {
+            crate::logfile::error(&format!(
+                "连接 {}（{}）：起不了后台线程：{error}",
+                config.name, config.url
+            ));
             cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
                 "起不了后台线程：{error}",
                 &[("error", error.to_string())],
@@ -309,6 +313,7 @@ impl Remotes {
                 tx.try_send(result).ok();
             });
         if let Err(error) = spawn {
+            crate::logfile::error(&format!("列 {id} 的目录：起不了后台线程：{error}"));
             cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
                 "起不了后台线程：{error}",
                 &[("error", error.to_string())],
@@ -408,6 +413,7 @@ impl Remotes {
                 tx.try_send(result).ok();
             });
         if let Err(error) = spawn {
+            crate::logfile::error(&format!("下载 {owner} 的 {sub}：起不了后台线程：{error}"));
             cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
                 "起不了后台线程：{error}",
                 &[("error", error.to_string())],
