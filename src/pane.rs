@@ -126,6 +126,7 @@ gpui_kit::actions!(
         CreateArchive,
         Analyze,
         EditRemote,
+        ToggleHidden,
     ]
 );
 
@@ -194,6 +195,7 @@ fn key_binding_for(
         PaneCommand::CreateArchive => KeyBinding::new(key, CreateArchive, context),
         PaneCommand::Analyze => KeyBinding::new(key, Analyze, context),
         PaneCommand::EditRemote => KeyBinding::new(key, EditRemote, context),
+        PaneCommand::ToggleHidden => KeyBinding::new(key, ToggleHidden, context),
     })
 }
 
@@ -243,11 +245,13 @@ pub enum PaneCommand {
     ViewColumns,
     /// 编辑远程文件：下载到本地、系统打开，保存自动回传。
     EditRemote,
+    /// 显示 / 隐藏以 `.` 开头的那些项。
+    ToggleHidden,
 }
 
 impl PaneCommand {
     /// 全部命令。配置层与命令面板都靠它枚举，加一条命令只改这一处。
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::NewFolder,
         Self::Rename,
         Self::BulkRename,
@@ -271,6 +275,7 @@ impl PaneCommand {
         Self::ViewColumns,
         Self::Analyze,
         Self::EditRemote,
+        Self::ToggleHidden,
     ];
 
     /// 配置文件里用的名字。
@@ -302,6 +307,7 @@ impl PaneCommand {
             Self::ViewColumns => "view_columns",
             Self::Analyze => "analyze",
             Self::EditRemote => "edit_remote",
+            Self::ToggleHidden => "toggle_hidden",
         }
     }
 
@@ -336,8 +342,20 @@ impl PaneCommand {
             Self::ViewColumns => "view miller 分列 层级 快捷键 按键 keybinding",
             Self::Analyze => "analyze 分析 大小 重复 校验和 md5 sha 快捷键 按键 keybinding",
             Self::EditRemote => "edit 编辑 remote 远程 回传 上传 快捷键 按键 keybinding",
+            Self::ToggleHidden => "hidden dotfile 点文件 隐藏 显示 dot 快捷键 按键 keybinding",
         }
     }
+}
+
+/// 设置里那个「显示隐藏项」现在是什么。
+///
+/// 单独一个函数而不是每处 `Settings::read(cx).show_hidden`：
+/// 这个值要被读五六次（四个 `Listing::read`/`from_entries_showing`
+/// 调用点加祖先列那一处），而它是**会被用户改的全局状态**——
+/// 分散读的话哪一次读了改后的值、哪一次读了改前的值，
+/// 差异会表现成"某些窗格跟着变、某些不变"，极难定位。
+fn shows_hidden(cx: &gpui_kit::App) -> bool {
+    crate::settings::Settings::read(cx).show_hidden
 }
 
 /// 分列视图里一行的全部信息。
@@ -558,7 +576,7 @@ impl Pane {
         let filter = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(cx, "筛选当前文件夹"))
         });
-        let (listing, error) = match Listing::read(&path) {
+        let (listing, error) = match Listing::read(&path, shows_hidden(cx)) {
             Ok(listing) => (listing, None),
             Err(error) => (Listing::empty(path.clone()), Some(error)),
         };
@@ -1001,7 +1019,7 @@ impl Pane {
             self.go_remote(path, remember, take_focus, window, cx);
             return;
         }
-        match Listing::read(&path) {
+        match Listing::read(&path, shows_hidden(cx)) {
             Ok(listing) => {
                 if remember && path != self.listing.path() {
                     self.back.push(self.listing.path().to_path_buf());
@@ -1103,7 +1121,8 @@ impl Pane {
                 FileEntry::remote(child, &entry.name, entry.is_dir, entry.size, modified)
             })
             .collect();
-        let mut listing = Listing::from_entries(path.to_path_buf(), items);
+        let mut listing =
+            Listing::from_entries_showing(path.to_path_buf(), items, shows_hidden(cx));
         listing.set_sort(sort);
         listing.set_query(&query);
         self.listing = listing;
@@ -1160,7 +1179,7 @@ impl Pane {
         let query = self.listing.query().to_string();
         let sort = self.listing.sort();
 
-        match Listing::read(&path) {
+        match Listing::read(&path, shows_hidden(cx)) {
             Ok(mut listing) => {
                 listing.set_sort(sort);
                 listing.set_query(&query);
@@ -2104,7 +2123,34 @@ impl Pane {
             PaneCommand::ViewColumns => self.set_view(ViewMode::Columns, cx),
             PaneCommand::Analyze => self.toggle_analyze(window, cx),
             PaneCommand::EditRemote => self.edit_remote(cx),
+            PaneCommand::ToggleHidden => self.toggle_hidden(cx),
         }
+    }
+
+    /// 显示 / 隐藏以 `.` 开头的那些项。
+    ///
+    /// **存进 `Settings` 而不是留在窗格里**：它是全局偏好——
+    /// 两个窗格、两根标签栏、退出再打开，都该是同一个状态。
+    /// 写进设置时 `Settings::update` 顺手落盘，重开还在。
+    ///
+    /// 落在**当前这个窗格**立即生效而不是等它重画：切换时只重筛，
+    /// 不重读盘（[`crate::model::Listing::set_show_hidden`]），
+    /// 而祖先列那一趟读盘挂在 [`Self::listing_version`] 上，
+    /// 所以版本号要动 —— 否则分列视图里左列还是旧的过滤结果。
+    pub fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
+        let next = !self.listing.shows_hidden();
+        if self.listing.set_show_hidden(next) {
+            self.selection.retain_existing(&self.listing);
+            self.sync_row_sizes();
+            self.listing_version += 1;
+        }
+        // 设置写在切完之后：写的是 `next`，不是反过来读
+        // `self.listing.shows_hidden()`（那已经是改完的值了，
+        // 两次读之间没有别的写入，但把"状态在哪"讲成一个字面量更不容易搞错）。
+        let show = next;
+        crate::settings::Settings::update(cx, |settings| settings.show_hidden = show);
+        self.update_status(cx);
+        cx.notify();
     }
 
     // ---- 目录监听与外部变更 ----
@@ -2296,6 +2342,37 @@ impl Pane {
             .child(self.render_more_menu(cx))
             .child(div().flex_1())
             .children(self.render_view_buttons(cx))
+            // 隐藏开关紧挨着视图按钮：两个都是"怎么看这个目录"，
+            // 不改变任何文件，也不影响别的窗格。放在「更多」里也有一份，
+            // 那是给已经习惯去菜单里翻的人留的。
+            //
+            // 外面套一层 div 只为挂无障碍名：`Button` 没有 `aria_label`
+            // 方法（只有 `Div` 有），而它的 tooltip **不进快照**——
+            // 没有这层的话，读屏软件念不出这颗按钮，测试也读不到它。
+            .child({
+                let action = self.hidden_switch_title(cx);
+                div()
+                    .id("toggle-hidden-label")
+                    .test_support()
+                    .aria_label(action.clone())
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("toggle-hidden")
+                            .icon(IconName::EyeOff)
+                            .ghost()
+                            .small()
+                            // 亮着 = 正在显示隐藏项。这是那一组里唯一
+                            // **亮着跟"没生效"意思相反**的按钮——所以 tooltip
+                            // 特意写"按下之后"的动作，不写状态。
+                            .selected(self.listing.shows_hidden())
+                            .tooltip(crate::i18n::tr_args(
+                                cx,
+                                "{action}（Cmd+Shift+.）",
+                                &[("action", action)],
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_hidden(cx))),
+                    )
+            })
             .child(
                 Button::new("toggle-details")
                     .icon(IconName::PanelRight)
@@ -2433,6 +2510,7 @@ impl Pane {
                 let me_look = me.clone();
                 let me_term = me.clone();
                 let me_archive = me.clone();
+                let me_hidden = me.clone();
 
                 menu.item(
                     PopupMenuItem::new(crate::i18n::tr(cx, "重命名"))
@@ -2508,6 +2586,25 @@ impl Pane {
                                 pane.create_archive(cx)
                             }
                         });
+                    }),
+                )
+                .separator()
+                // **菜单上写的是"按下之后会变成什么"**：现在开着就写
+                // 「隐藏隐藏项」，跟 Finder 那一套一致。写当前状态的话，
+                // 用户按下之后文字没变，会以为菜单项坏了。
+                //
+                // `shows_hidden(cx)` 要在**闭包体内**读：这个闭包每帧
+                // 重建一次，写在外面就变成了"打开菜单那一刻的状态"，
+                // 开着菜单去别处切换的话这一项还是旧的。
+                .item(
+                    PopupMenuItem::new(if shows_hidden(cx) {
+                        crate::i18n::tr(cx, "隐藏隐藏项")
+                    } else {
+                        crate::i18n::tr(cx, "显示隐藏项")
+                    })
+                    .icon(IconName::EyeOff)
+                    .on_click(move |_, _, cx| {
+                        run_on_pane(&me_hidden, cx, |pane, cx| pane.toggle_hidden(cx));
                     }),
                 )
             })
@@ -3301,8 +3398,11 @@ impl Pane {
             return (Some(rows.clone()), sizes.clone());
         }
 
-        let mut listing =
-            Listing::read(path).unwrap_or_else(|_| Listing::empty(path.to_path_buf()));
+        // 祖先列跟着当前目录的隐藏开关走：**用户看到不一致才是问题**
+        // （左边列出 `.git`，右边那列却不列）。用当前目录那个值而不是
+        // 再去读一次设置——这一列是给当前目录做陪衬的，两者本该一致。
+        let mut listing = Listing::read(path, self.listing.shows_hidden())
+            .unwrap_or_else(|_| Listing::empty(path.to_path_buf()));
         // 跟着当前目录的排序走：不然两列之间顺序不一致，看着像换了内容。
         listing.set_sort(sort);
         let rows: Vec<ColumnRow> = (0..listing.visible_count())
@@ -3796,6 +3896,7 @@ impl Pane {
             .on_action(cx.listener(|this, _: &EditRemote, window, cx| {
                 this.run_command(PaneCommand::EditRemote, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleHidden, _, cx| this.toggle_hidden(cx)))
             .child(self.render_width_probe())
             .when(self.view == ViewMode::List, |body| {
                 body.child(self.render_header(cx))
@@ -4098,6 +4199,27 @@ impl Pane {
             PaneCommand::ViewColumns => "分列视图",
             PaneCommand::Analyze => "分析：大小 / 重复 / 校验和",
             PaneCommand::EditRemote => "编辑远程文件（保存即回传）",
+            // 这一条在 `command_title` 里给不出正确的字：它是**切换**，
+            // 文案取决于现在是什么状态。`command_title` 只收 `cx`，
+            // 拿不到窗格的 `listing`，所以这一处先给个中性的说法，
+            // 真正上屏的那两处（工具栏 tooltip、命令面板）走
+            // [`Self::hidden_switch_title`]，那一处能读状态。
+            PaneCommand::ToggleHidden => "显示 / 隐藏隐藏项",
+        };
+        crate::i18n::tr(cx, text)
+    }
+
+    /// 「显示隐藏项」这个开关当前的文案：按下**之后**会变成什么。
+    ///
+    /// **按钮上写的是"按下之后"**，不是"现在是什么"——跟 Finder 的
+    /// 视图切换一致（你看到的是「列表」，按下变网格）。
+    /// 写成"当前状态"的话，用户按下之后字没变，
+    /// 会以为按钮坏了。
+    pub fn hidden_switch_title(&self, cx: &gpui_kit::App) -> String {
+        let text = if self.listing.shows_hidden() {
+            "隐藏隐藏项"
+        } else {
+            "显示隐藏项"
         };
         crate::i18n::tr(cx, text)
     }
@@ -4587,12 +4709,13 @@ mod tests {
         let dir = crate::remote::location("t1", "folder");
         let file = crate::remote::location("t1", "folder/notes.txt");
         let sub = crate::remote::location("t1", "folder/sub");
-        let listing = Listing::from_entries(
+        let listing = Listing::from_entries_showing(
             dir.clone(),
             vec![
                 FileEntry::remote(file.clone(), "notes.txt", false, 1234, None),
                 FileEntry::remote(sub, "sub", true, 0, None),
             ],
+            false,
         );
         (listing, dir, file)
     }

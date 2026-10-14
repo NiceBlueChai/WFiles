@@ -88,7 +88,7 @@ fn entries(count: usize) -> Vec<FileEntry> {
 }
 
 fn a_listing(count: usize) -> Listing {
-    Listing::from_entries(PathBuf::from("/bench"), entries(count))
+    Listing::from_entries_showing(PathBuf::from("/bench"), entries(count), false)
 }
 
 /// 跑 `f`，返回它花了多久。跑三遍取快的那个：
@@ -419,7 +419,7 @@ fn reading_a_ten_thousand_entry_directory_is_warm() {
     }
 
     let start = Instant::now();
-    let listing = Listing::read(dir.path()).expect("读得动");
+    let listing = Listing::read(dir.path(), false).expect("读得动");
     let took = start.elapsed();
     assert_eq!(listing.total_count(), 10_000, "该看到一万项");
 

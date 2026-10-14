@@ -1989,6 +1989,7 @@ impl WFilesApp {
             PaneCommand::ViewGrid,
             PaneCommand::ViewColumns,
             PaneCommand::Analyze,
+            PaneCommand::ToggleHidden,
         ] {
             if !self.pane_command_enabled(command, cx) {
                 continue;
@@ -2491,141 +2492,202 @@ impl WFilesApp {
     fn describe_pane_command(
         command: PaneCommand,
         cx: &gpui_kit::App,
-    ) -> (String, &'static str, String, &'static str) {
+    ) -> (String, String, String, &'static str) {
         // 分组只有三个，两个字的中文词，翻成英文占更多地方。
         let files = crate::i18n::tr(cx, "文件");
         let view = crate::i18n::tr(cx, "视图");
         match command {
             PaneCommand::NewFolder => (
                 crate::i18n::tr(cx, "新建文件夹"),
-                "Cmd+Shift+N",
+                Self::shortcut_of(command, cx),
                 files,
                 "folder 创建 目录",
             ),
-            PaneCommand::Rename => (crate::i18n::tr(cx, "重命名"), "F2", files, "rename 改名"),
+            PaneCommand::Rename => (
+                crate::i18n::tr(cx, "重命名"),
+                Self::shortcut_of(command, cx),
+                files,
+                "rename 改名",
+            ),
             PaneCommand::BulkRename => (
                 crate::i18n::tr(cx, "批量重命名"),
-                "Cmd+Shift+R",
+                Self::shortcut_of(command, cx),
                 files,
                 "batch 序号 模板",
             ),
             PaneCommand::Trash => (
                 crate::i18n::tr(cx, "移到回收站"),
-                "Cmd+Backspace",
+                Self::shortcut_of(command, cx),
                 files,
                 "delete 删除 trash",
             ),
-            PaneCommand::Copy => (crate::i18n::tr(cx, "拷贝选中项"), "Cmd+C", files, "copy"),
+            PaneCommand::Copy => (
+                crate::i18n::tr(cx, "拷贝选中项"),
+                Self::shortcut_of(command, cx),
+                files,
+                "copy",
+            ),
             PaneCommand::Cut => (
                 crate::i18n::tr(cx, "剪切选中项"),
-                "Cmd+X",
+                Self::shortcut_of(command, cx),
                 files,
                 "cut 移动",
             ),
             PaneCommand::Paste => (
                 crate::i18n::tr(cx, "粘贴到当前目录"),
-                "Cmd+V",
+                Self::shortcut_of(command, cx),
                 files,
                 "paste",
             ),
             PaneCommand::Undo => (
                 crate::i18n::tr(cx, "撤销上一步操作"),
-                "Cmd+Z",
+                Self::shortcut_of(command, cx),
                 files,
                 "undo 恢复",
             ),
             PaneCommand::Refresh => (
                 crate::i18n::tr(cx, "刷新当前目录"),
-                "Cmd+R",
+                Self::shortcut_of(command, cx),
                 files,
                 "refresh 重新读取",
             ),
             PaneCommand::GoUp => (
                 crate::i18n::tr(cx, "前往上一级"),
-                "Backspace",
+                Self::shortcut_of(command, cx),
                 files,
                 "up parent 上级",
             ),
             PaneCommand::CopyPath => (
                 crate::i18n::tr(cx, "复制路径"),
-                "Cmd+Alt+C",
+                Self::shortcut_of(command, cx),
                 files,
                 "path 剪贴板",
             ),
             PaneCommand::CopyFileName => (
                 crate::i18n::tr(cx, "复制文件名"),
-                "Cmd+Shift+C",
+                Self::shortcut_of(command, cx),
                 files,
                 "name 剪贴板",
             ),
             PaneCommand::OpenTerminal => (
                 crate::i18n::tr(cx, "在这里打开终端"),
-                "Cmd+Alt+T",
+                Self::shortcut_of(command, cx),
                 files,
                 "terminal 终端 shell 命令行",
             ),
             PaneCommand::QuickLook => (
                 crate::i18n::tr(cx, "快速查看"),
-                "空格",
+                Self::shortcut_of(command, cx),
                 files,
                 "preview 预览 quick look 查看",
             ),
             PaneCommand::Search => (
                 crate::i18n::tr(cx, "搜索当前目录"),
-                "Cmd+Shift+F",
+                Self::shortcut_of(command, cx),
                 files,
                 "search 搜索 查找 find 内容 content grep",
             ),
             PaneCommand::Mark => (
                 crate::i18n::tr(cx, "加标签 / 标颜色"),
-                "Cmd+Alt+M",
+                Self::shortcut_of(command, cx),
                 files,
                 "mark 标记 标签 颜色 tag color 色标",
             ),
             PaneCommand::ViewArchive => (
                 crate::i18n::tr(cx, "查看压缩包内容"),
-                "",
+                Self::shortcut_of(command, cx),
                 files,
                 "zip 压缩包 archive 解压 unzip 浏览",
             ),
             PaneCommand::CreateArchive => (
                 crate::i18n::tr(cx, "打包成 Zip"),
-                "",
+                Self::shortcut_of(command, cx),
                 files,
                 "zip 压缩包 archive 压缩 打包 compress",
             ),
             PaneCommand::EditRemote => (
                 crate::i18n::tr(cx, "编辑远程文件"),
-                "Cmd+Alt+O",
+                Self::shortcut_of(command, cx),
                 files,
                 "edit 编辑 remote 远程 回传 上传 upload",
             ),
             // 换视图不作用于文件，归到"视图"组里更好找。
             PaneCommand::ViewList => (
                 crate::i18n::tr(cx, "列表视图"),
-                "Cmd+1",
+                Self::shortcut_of(command, cx),
                 view,
                 "view list 列表 一行一项",
             ),
             PaneCommand::ViewGrid => (
                 crate::i18n::tr(cx, "网格视图"),
-                "Cmd+2",
+                Self::shortcut_of(command, cx),
                 view,
                 "view grid 网格 缩略图",
             ),
             PaneCommand::ViewColumns => (
                 crate::i18n::tr(cx, "分列视图"),
-                "Cmd+3",
+                Self::shortcut_of(command, cx),
                 view,
                 "view miller 分列 层级 columns",
             ),
             PaneCommand::Analyze => (
                 crate::i18n::tr(cx, "分析：大小 / 重复 / 校验和"),
-                "Cmd+Alt+I",
+                Self::shortcut_of(command, cx),
                 files,
                 "analyze 分析 大小 重复 校验和 md5 sha1 sha256 size duplicate checksum",
             ),
+            // 面板里给的是**中性说法**（不是"按下之后会变成什么"）：
+            // 面板条目走的是 `palette_titles` 那条纯函数路径，拿不到
+            // 窗格的 `listing`，报不出当前状态。工具栏按钮上才是
+            // `Pane::hidden_switch_title` 那一版。
+            PaneCommand::ToggleHidden => (
+                crate::i18n::tr(cx, "显示 / 隐藏隐藏项"),
+                Self::shortcut_of(command, cx),
+                view,
+                "hidden dotfile 点文件 隐藏 显示 dot 隐式",
+            ),
         }
+    }
+
+    /// 一条命令在面板上显示的快捷键。
+    ///
+    /// **从 [`crate::keymap::defaults`] 取，不手写字面量**：
+    /// 原来是 22 个手写串，加一条命令就得再抄一个——抄错不报编译错误，
+    /// 只是面板上写着一个按不出来的键。已经栽过：
+    /// 「编辑远程文件」那里写的是 `Cmd+Alt+O`（那是详情板的键），
+    /// 而实际绑的是 `cmd-alt-e`。
+    ///
+    /// `cmd-shift-.` 这种写法显示成 `Cmd+Shift+.`（去掉 `cmd-` 前缀、
+    /// 首字母大写），而 `space` / `f2` 显示成中文「空格」「F2」——
+    /// 后者跟面板里其他条目的写法一致。
+    fn shortcut_of(command: PaneCommand, cx: &gpui_kit::App) -> String {
+        let key = crate::keymap::KeyMap::read(cx).key_for(command);
+        if key.is_empty() {
+            return String::new();
+        }
+        if key == "space" {
+            // 空格在面板里一直写中文（跟"取消""完成"那些同一条街上），
+            // 而这个函数收得到 `cx` 却**故意不查表**：面板里其余地方
+            // 已经把快捷键排除在翻译之外了（见上面的注释），
+            // 这里翻了就只有这一条是英文。
+            return crate::i18n::tr(cx, "空格");
+        }
+        let pretty = key
+            .strip_prefix("cmd-")
+            .unwrap_or(key.as_str())
+            .split('-')
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("+");
+        // `cmd-` 前缀全平台一样（`super` / `control` 是同一层意思），
+        // 所以显示成 `Cmd+…` 而不是按平台改写。
+        format!("Cmd+{pretty}")
     }
 
     /// 命令面板：顶部居中的搜索框 + 分组结果列表。

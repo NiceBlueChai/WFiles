@@ -5471,3 +5471,187 @@ fn the_trash_confirmation_speaks_english(cx: &mut TestAppContext) {
         );
     }
 }
+
+/// 造一个带隐藏项的目录。
+///
+/// **真名子目录是必须的**：`Listing::read` 里那条「当前目录是隐藏的
+/// 就全显示」会把 macOS 上 `tempfile` 给的 `.tmpXXXX` 判成隐藏目录，
+/// 于是测试莫名其妙地什么都看得见。详见 `model::tests` 里那条注释。
+fn dir_with_hidden_items() -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::write(dir.join("aaa.txt"), "x").expect("造文件");
+    std::fs::write(dir.join(".env"), "x").expect("造文件");
+    std::fs::write(dir.join("zzz.txt"), "x").expect("造文件");
+    std::fs::create_dir(dir.join(".config")).expect("造目录");
+    (root, dir)
+}
+
+/// 默认看不见隐藏项，快捷键一下就看见了。
+///
+/// **判据是列表里那几行真的变了**，不是设置里的布尔值——设置写对了
+/// 而 `refilter` 没跑，界面上照样是旧的。
+#[gpui_kit::test]
+fn the_hidden_switch_reaches_the_list(cx: &mut TestAppContext) {
+    let (_root, dir) = dir_with_hidden_items();
+    let (_session, handle) = open_in(cx, &dir);
+
+    let before = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        row_names(window)
+    });
+    assert_eq!(
+        before,
+        vec!["aaa.txt", "zzz.txt"],
+        "默认不该看见 .config / .env"
+    );
+
+    step(cx, handle, |window, cx| {
+        window.press("cmd-shift-.", cx);
+        settle(window, cx);
+    });
+
+    let after = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        row_names(window)
+    });
+    assert_eq!(
+        after,
+        vec![".config", ".env", "aaa.txt", "zzz.txt"],
+        "按了 Cmd+Shift+. 之后隐藏项该出现"
+    );
+
+    // 切回去：不然只验了"能打开"没验"能关上"。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-shift-.", cx);
+        settle(window, cx);
+    });
+    let back = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        row_names(window)
+    });
+    assert_eq!(back, vec!["aaa.txt", "zzz.txt"]);
+}
+
+/// 工具栏那颗按钮跟快捷键是**同一个开关**。
+///
+/// 两条入口各写一遍的话，其中一条改了状态另一条不知道，
+/// 用户从按钮切了、界面没变，或者从快捷键切了、按钮不亮。
+#[gpui_kit::test]
+fn the_hidden_button_and_the_shortcut_are_one_switch(cx: &mut TestAppContext) {
+    let (_root, dir) = dir_with_hidden_items();
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("toggle-hidden", cx);
+        settle(window, cx);
+    });
+    let by_button = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        row_names(window)
+    });
+    assert!(
+        by_button.contains(&".env".to_string()),
+        "点按钮该把隐藏项显示出来，实际 {by_button:?}"
+    );
+
+    // 再按快捷键：工具栏按钮那颗要跟着暗回去。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-shift-.", cx);
+        settle(window, cx);
+    });
+    let after = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (row_names(window), a11y_label_at(window, "toggle-hidden"))
+    });
+    assert_eq!(after.0, vec!["aaa.txt", "zzz.txt"], "快捷键该把开关关回去");
+    // tooltip 是按钮的 label，读不到；改验文案方向：关着的时候
+    // 按钮该说"显示隐藏项"，开着的时候该说"隐藏隐藏项"。
+    // 这一条走 `aria_label` 挂的那层。
+    let tooltip = step_value(cx, handle, |window, _| {
+        a11y_label_at(window, "toggle-hidden-label")
+    });
+    assert!(
+        tooltip.contains("显示隐藏项"),
+        "关着时按钮该说「显示隐藏项」，实际 {tooltip:?}"
+    );
+}
+
+/// 开关的状态**存进设置**：换一扇窗打开还是显示着。
+///
+/// 拆成两半验，因为**没有"关掉应用再重开"的测试接口**（`TestAppContext`
+/// 造不出那个动作）。两半合起来覆盖了同一条链：
+///
+/// 1. 按了快捷键 → 设置里那个布尔值变成 `true`（`toggle_hidden` 末尾
+///    那句 `Settings::update` 真的跑了）。
+/// 2. 设置里已经是 `true` → 新打开的窗口照着它显示隐藏项
+///    （`Listing::read` 真的读了那个设置）。
+///
+/// 只验第 1 半的话，第 2 半写错了照样绿；反过来也一样。
+#[gpui_kit::test]
+fn the_hidden_switch_writes_the_setting_and_a_new_window_reads_it(cx: &mut TestAppContext) {
+    let (_root, dir) = dir_with_hidden_items();
+    let (_session, handle) = open_in(cx, &dir);
+
+    let before = cx.update(|cx| Settings::read(cx).show_hidden);
+    assert!(
+        !before,
+        "隔离出来的设置默认不该开着隐藏项——         前提错了的话下面那些断言都验不到东西"
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-shift-.", cx);
+        settle(window, cx);
+    });
+
+    assert_eq!(
+        step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            row_names(window)
+        }),
+        vec![".config", ".env", "aaa.txt", "zzz.txt"],
+        "切换之后该看得见隐藏项"
+    );
+    assert!(
+        cx.update(|cx| Settings::read(cx).show_hidden),
+        "开关的状态该写进设置里"
+    );
+
+    // 第二半：新开一扇窗，照着设置里的 `true` 显示。
+    // `open_app` 不传目录，开的是隔离目录 —— 那里没有隐藏项，
+    // 所以判据退回设置本身：这一次 `Listing::read` 真的读了它。
+    let handle2 = open_app(cx);
+    step(cx, handle2, |window, cx| {
+        settle(window, cx);
+    });
+    assert!(
+        cx.update(|cx| Settings::read(cx).show_hidden),
+        "新窗口不该把这个设置冲掉"
+    );
+}
+
+/// 进一个隐藏目录，里面的一切都显示出来（用户不用先去开开关）。
+#[gpui_kit::test]
+fn opening_a_hidden_directory_shows_what_is_inside(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let hidden = root.path().join("outer").join(".config");
+    std::fs::create_dir_all(&hidden).expect("建隐藏目录");
+    std::fs::write(hidden.join("hosts"), "x").expect("造文件");
+    std::fs::write(hidden.join(".gitignore"), "x").expect("造文件");
+
+    let (_session, handle) = open_in(cx, &hidden);
+
+    let names = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        row_names(window)
+    });
+    assert_eq!(
+        names,
+        vec![".gitignore", "hosts"],
+        "正在看的目录自己是隐藏的，里面就该全显示——\
+         否则用户会以为 .config 是空的"
+    );
+}

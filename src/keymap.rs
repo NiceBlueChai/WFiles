@@ -104,6 +104,10 @@ pub fn defaults(command: PaneCommand) -> &'static [&'static str] {
         PaneCommand::ViewColumns => &["cmd-3"],
         PaneCommand::Analyze => &["cmd-alt-i"],
         PaneCommand::EditRemote => &["cmd-alt-e"],
+        // Cmd+Shift+. 是 macOS 与 Linux 上人人都会的那个键（Finder、
+        // GNOME Files、Nautilus 都是它）。Windows 习惯 Ctrl+H，但全项目
+        // 的键位都用 `cmd-` 前缀描述，跟那一套保持一致更省解释。
+        PaneCommand::ToggleHidden => &["cmd-shift-."],
     }
 }
 

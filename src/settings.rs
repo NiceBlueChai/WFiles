@@ -69,6 +69,16 @@ pub struct Settings {
     /// 认不出来的串在 [`Settings::locale`] 里被当成"没设"。
     #[serde(default)]
     pub locale: String,
+    /// 显示以 `.` 开头的隐藏项。
+    ///
+    /// **默认 `false`**，跟 Finder / 资源管理器 / GNOME Files 一致：
+    /// 新手看到一堆 `.DS_Store`、`.git` 会以为文件管理器出问题了。
+    ///
+    /// 存成布尔而不是"三态"：正在看的那个目录自己是不是隐藏的，是另一回事
+    /// —— 见 [`crate::model::Listing::read`]，它在读盘时单独处理
+    /// （进了 `.config` 就把它里面的全显示出来），不写进这份设置。
+    #[serde(default)]
+    pub show_hidden: bool,
 }
 
 /// 一个存下来的搜索。
@@ -156,6 +166,7 @@ impl Default for Settings {
             remotes: Vec::new(),
             meta_column: String::new(),
             speed_limit: 0,
+            show_hidden: false,
             // 空串 = "跟着系统走"。不是直接写死中文：一份英文系统上刚装好
             // 就该是英文，让用户自己去设置里挑语言是把默认值做成了默认值。
             locale: String::new(),

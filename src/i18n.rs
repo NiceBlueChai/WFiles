@@ -1384,6 +1384,19 @@ static EN: &[(&str, &str)] = &[
         "Move {count} items to the Trash? This can still be undone.",
     ),
     ("连接远程服务器", "Connect to Server"),
+    // ---- 隐藏项开关 ----
+    //
+    // 两条的中文一样但**用途不同**，所以不合并成一条：
+    // `显示 / 隐藏隐藏项` 是命令面板里那个中性说法（那条路径拿不到
+    // 窗格当前的 `listing`，报不出状态）；另两条是工具栏按钮与
+    // 更多菜单上的"按下之后"，靠 `Pane::hidden_switch_title` 选。
+    // 英文面板里写 "Show / hide hidden items" 那一条**不用动脑子**，
+    // 但混进一个英文界面里就扎眼——所以分开翻。
+    ("显示 / 隐藏隐藏项", "Show / Hide Hidden Items"),
+    ("显示隐藏项", "Show Hidden Items"),
+    ("隐藏隐藏项", "Hide Hidden Items"),
+    // 工具栏那颗按钮把动作跟快捷键拼在一起。
+    ("{action}（Cmd+Shift+.）", "{action} (Cmd+Shift+.)"),
 ];
 
 /// 英文表里有没有漏掉不该出现的条目：译文等于原文（等于没翻），

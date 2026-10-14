@@ -22,9 +22,30 @@ pub struct FileEntry {
     sort_name: String,
     /// 预计算的小写扩展名。
     sort_kind: String,
+    /// 这项是不是隐藏项（文件名以 `.` 开头）。
+    ///
+    /// **判断在读盘时做一次，不在渲染时算**：`Listing::refilter`
+    /// 每敲一个过滤字母就要扫一遍全部条目，而 `starts_with('.')`
+    /// 虽然便宜，十 万次字符串切片在一帧里仍能感觉到。
+    hidden: bool,
 }
 
 impl FileEntry {
+    /// 名字以 `.` 开头就算隐藏项。
+    ///
+    /// **三个平台同一把尺子，没有 `#[cfg]`**。Windows 上确实有
+    /// 「隐藏属性」（`attrib +h`），但那个属性绝大多数用户从没用过，
+    /// 而 `.git` / `.env` / `node_modules` 这些是天天要看的——
+    /// 按属性判的话，Windows 用户按了快捷键还是什么都看不到，
+    /// 那才是真的坏。所以一律按名字判。
+    ///
+    /// `.` 与 `..` 是目录的两条内建入口，不在 `read_dir` 的结果里，
+    /// 碰不到这里（万一真进来了，`name` 就是这两个之一，
+    /// 会被当成隐藏项——那种情况下它本来也不该作为一个文件出现）。
+    fn is_hidden_name(name: &str) -> bool {
+        name.starts_with('.')
+    }
+
     /// 只给测试用：造一批条目，不碰磁盘。
     #[cfg(test)]
     pub(crate) fn for_test(path: PathBuf, name: String, is_dir: bool, size: u64) -> Self {
@@ -35,6 +56,7 @@ impl FileEntry {
             .unwrap_or_default();
         Self {
             path,
+            hidden: Self::is_hidden_name(&name),
             name,
             is_dir,
             size,
@@ -58,6 +80,7 @@ impl FileEntry {
 
         Some(Self {
             sort_name: name.to_lowercase(),
+            hidden: Self::is_hidden_name(&name),
             path,
             name,
             is_dir: metadata.is_dir(),
@@ -101,6 +124,7 @@ impl FileEntry {
                     .map(|extension| extension.to_string_lossy().to_lowercase())
                     .unwrap_or_default()
             },
+            hidden: Self::is_hidden_name(name),
             path,
             name: name.to_string(),
             is_dir,
@@ -235,10 +259,17 @@ pub struct Listing {
     rank: Vec<usize>,
     query: String,
     sort: Sort,
+    /// 要不要显示隐藏项（见 [`FileEntry::hidden`]）。
+    show_hidden: bool,
 }
 
 impl Listing {
-    pub fn read(path: &Path) -> Result<Self, crate::i18n::Msg> {
+    /// 读一个本地目录。
+    ///
+    /// `show_hidden` 由调用方给（它读的是 `Settings`）：这一层
+    /// 不该知道设置存在哪儿，`Settings` 是 GPUI 的全局槽位，
+    /// 而这一层刻意不依赖任何 UI 类型。
+    pub fn read(path: &Path, show_hidden: bool) -> Result<Self, crate::i18n::Msg> {
         let read_dir = fs::read_dir(path).map_err(crate::i18n::Message::from)?;
         let mut entries = Vec::new();
         for dir_entry in read_dir.flatten() {
@@ -246,14 +277,42 @@ impl Listing {
                 entries.push(entry);
             }
         }
-        Ok(Self::from_entries(path.to_path_buf(), entries))
+        // **用户正在看的这个目录自己是隐藏的，就把它里面的东西全显示出来。**
+        // 不这么做的话，从命令行 `cd ~/.config` 进来会看到一个空目录——
+        // 而那个空目录只是"所有内容都被过滤掉了"，
+        // 用户会以为 `.config` 是空的。这条跟 Finder / 资源管理器一致。
+        let show_hidden = show_hidden || Self::path_is_hidden(path);
+        Ok(Self::from_entries_showing(
+            path.to_path_buf(),
+            entries,
+            show_hidden,
+        ))
+    }
+
+    /// 这个**目录自己**是不是隐藏目录。
+    ///
+    /// 只看 `file_name()` 的第一个字符，不看整条路径——否则 `~/.config/foo`
+    /// 这种深路径下的普通目录也会被判成隐藏，`~` 底下的 `.ssh`、`.aws`
+    /// 会在用户关着开关时冒出来。
+    ///
+    /// **`.` 与 `..` 也算，但它们到不了这里**：`fs::read_dir` 的结果里
+    /// 没有这两条（那是目录的入口，不是目录里的项）。
+    fn path_is_hidden(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(FileEntry::is_hidden_name)
     }
 
     /// 把一批条目装成目录内容。
     ///
     /// 远程目录走的就是这条路：那一批条目是后台线程从服务器上取回来的，
     /// 之后排序、过滤、选中与本地目录一模一样。
-    pub fn from_entries(path: PathBuf, entries: Vec<FileEntry>) -> Self {
+    ///
+    /// `show_hidden` 一起收进来而不是让调用方在构造之后
+    /// `set_show_hidden`：那个方法走 `refilter`，而这里紧接着
+    /// 就要排一次序——分开写的话中间那一瞬的可见列表是错的，
+    /// 而那种错只在"先建再筛"这一条路上出现，测试很难碰到。
+    pub fn from_entries_showing(path: PathBuf, entries: Vec<FileEntry>, show_hidden: bool) -> Self {
         let index = entries
             .iter()
             .enumerate()
@@ -268,6 +327,7 @@ impl Listing {
             rank: Vec::new(),
             query: String::new(),
             sort: Sort::default(),
+            show_hidden,
         };
         listing.resort();
         listing
@@ -284,6 +344,7 @@ impl Listing {
             rank: Vec::new(),
             query: String::new(),
             sort: Sort::default(),
+            show_hidden: false,
         }
     }
 
@@ -311,18 +372,21 @@ impl Listing {
     /// 在既有顺序上筛只是线性扫描，代价是排序的一个零头。
     ///
     /// `self.sorted` 留着**没筛过**的全序：过滤框清空时不必再排一次。
+    ///
+    /// **隐藏项在这里一起筛掉**（第二个条件），不单独一趟：
+    /// 两个条件都是"在既有顺序上按一个布尔筛"，分成两趟要多扫一遍
+    /// 10 万个 `usize`，而合成一个 `.filter()` 让分支预测器也省一次。
     fn refilter(&mut self) {
         let entries = &self.entries;
         let query = self.query.trim().to_lowercase();
-        let order = if query.is_empty() {
-            self.sorted.clone()
-        } else {
-            self.sorted
-                .iter()
-                .copied()
-                .filter(|&ix| entries[ix].sort_name.contains(&query))
-                .collect()
-        };
+        let show_hidden = self.show_hidden;
+        let order: Vec<usize> = self
+            .sorted
+            .iter()
+            .copied()
+            .filter(|&ix| show_hidden || !entries[ix].hidden)
+            .filter(|&ix| query.is_empty() || entries[ix].sort_name.contains(&query))
+            .collect();
         // `rank` 的重建只占 0.4 ms（10 万个 `usize` 的 memset），
         // 而真瓶颈是上面那趟字符串搜索（7.4 ms）。为 0.4 ms 把
         // `position_of` 改成 `&mut self` 要动 11 处调用点，不划算——
@@ -353,6 +417,30 @@ impl Listing {
 
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// 现在显不显示隐藏项。
+    pub fn shows_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    /// 切换隐藏项。返回是否真的改了，调用方据此决定要不要重建行高缓存。
+    ///
+    /// **只重筛，不重读盘**：`entries` 里那些项一直都在，
+    /// 只是刚才没进 `order`。所以这个开关在 10 万项目录里也是
+    /// 一次线性扫描（实测 7 ms 量级），而不是重新读一遍目录。
+    ///
+    /// 连带的好处：状态栏那句「N / M 个项目」里的 `M`
+    /// 走的是 [`Self::total_count`]（磁盘上真实总数），
+    /// 所以按下开关能**看见** M 变不变——把隐藏项在读盘时就丢掉的话，
+    /// 两个数字永远相等，用户会以为开关没生效。
+    pub fn set_show_hidden(&mut self, show: bool) -> bool {
+        if self.show_hidden == show {
+            return false;
+        }
+        self.show_hidden = show;
+        self.refilter();
+        true
     }
 
     pub fn sort(&self) -> Sort {
@@ -578,7 +666,9 @@ mod tests {
     use super::*;
 
     fn listing_of(dir: &Path) -> Listing {
-        Listing::read(dir).expect("read temp dir")
+        // 隐藏项默认不显示，跟真实设置一致（`Settings::default` 那个 false）。
+        // 要看隐藏项的测试走 [`Listing::set_show_hidden`]。
+        Listing::read(dir, false).expect("read temp dir")
     }
 
     fn names(listing: &Listing) -> Vec<String> {
@@ -612,6 +702,152 @@ mod tests {
             serde_json::from_str::<Holder>("{}").unwrap().view,
             ViewMode::List
         );
+    }
+
+    /// 造一个带隐藏项的目录：`.env` 一个文件、`.config` 一个目录，
+    /// 外加两个普通项。文件夹排在前面，所以期望值是有序的。
+    ///
+    /// **返回 `path` 而不是那个 `TempDir`**：macOS 上 `tempfile::tempdir()`
+    /// 给的目录名是 `.tmpXXXX`（以点开头），而 [`Listing::read`] 里那条
+    /// 「当前目录是隐藏的就全显示」会把它当成隐藏目录——
+    /// 于是每个用这个夹具的测试都会莫名其妙地"看得见隐藏项"。
+    /// 所以真正被读的那个目录放在一层真名字的子目录底下。
+    fn dir_with_hidden_items() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("plain");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("aaa.txt"), "x").unwrap();
+        fs::write(dir.join(".env"), "x").unwrap();
+        fs::write(dir.join("zzz.txt"), "x").unwrap();
+        fs::create_dir(dir.join(".config")).unwrap();
+        (root, dir)
+    }
+
+    #[test]
+    fn hidden_items_are_out_of_the_way_until_you_ask_for_them() {
+        let (_keep, dir) = dir_with_hidden_items();
+
+        // 默认升序（`Sort::default`），文件夹永远在前。
+        let hidden = Listing::read(&dir, false).expect("读得动");
+        assert_eq!(
+            names(&hidden),
+            ["aaa.txt", "zzz.txt"],
+            "默认不该看见 .config / .env"
+        );
+        // 开着的时候 `.config`（文件夹）排最前，其余按**小写**名升序——
+        // `.` 的字节 0x2E 小于 `a` 的 0x61，所以 `.env` 紧跟着它。
+        let shown = Listing::read(&dir, true).expect("读得动");
+        assert_eq!(names(&shown), [".config", ".env", "aaa.txt", "zzz.txt"]);
+    }
+
+    /// **总数不变，只有可见数变。**
+    ///
+    /// 这条是那个设计决定的判据：状态栏那句「N / M 个项目」里的
+    /// `M` 走 [`Listing::total_count`]。如果隐藏项在读盘时就被丢掉，
+    /// 两个数字永远相等——用户按下开关看见 M 一点没变，
+    /// 会以为开关坏了。
+    #[test]
+    fn switching_the_hidden_switch_moves_only_the_visible_count() {
+        let (_keep, dir) = dir_with_hidden_items();
+        let mut listing = Listing::read(&dir, false).expect("读得动");
+
+        assert_eq!(listing.visible_count(), 2);
+        assert_eq!(listing.total_count(), 4);
+
+        assert!(listing.set_show_hidden(true), "第一次切要报告改了");
+        assert_eq!(listing.visible_count(), 4);
+        assert_eq!(listing.total_count(), 4, "磁盘上有几个就是几个");
+
+        assert!(listing.set_show_hidden(false), "切回去也要报告改了");
+        assert_eq!(listing.visible_count(), 2);
+        // 再切一次同样的值不该报告任何改动——调用方靠这个返回值
+        // 决定要不要重建行高缓存，报错了就是白白重建一次。
+        assert!(!listing.set_show_hidden(false), "值没变就不该报告改了");
+    }
+
+    /// 切开关**不重读盘**：条目一直都在，只是没进可见列表。
+    ///
+    /// 判据是 `entry()`——它查的是 `entries`（磁盘上真实那份），
+    /// 所以切完之后仍然能按路径查到那些项。顺手把 `position_of`
+    /// 也钉一下：它查 `rank`，切完应该从 `None` 变成 `Some`。
+    #[test]
+    fn switching_does_not_lose_the_entries_themselves() {
+        let (_keep, dir) = dir_with_hidden_items();
+        let mut listing = Listing::read(&dir, false).expect("读得动");
+        let env = dir.join(".env");
+
+        assert!(listing.entry(&env).is_some(), "项一直都在");
+        assert_eq!(listing.position_of(&env), None, "只是没显示");
+
+        listing.set_show_hidden(true);
+
+        assert!(listing.entry(&env).is_some());
+        assert!(
+            listing.position_of(&env).is_some(),
+            "显示出来之后就该有位置了"
+        );
+    }
+
+    /// 进了隐藏目录，里面的一切都显示出来。
+    ///
+    /// 不这么做的话，从命令行 `cd ~/.config` 进来会看到一个空目录——
+    /// 而那个空目录只是"全被过滤掉了"。用户会以为 `.config` 是空的。
+    /// 跟 Finder / 资源管理器一致。
+    #[test]
+    fn opening_a_hidden_directory_shows_what_is_inside_it() {
+        let root = tempfile::tempdir().unwrap();
+        // 藏在真名子目录底下：tempfile 在 macOS 上给的是 `.tmpXXXX`，
+        // 那本身就是隐藏目录，测的就不是「隐藏目录里的东西可见」了。
+        let hidden_dir = root.path().join("outer").join(".config");
+        fs::create_dir_all(&hidden_dir).unwrap();
+        fs::write(hidden_dir.join(".gitignore"), "x").unwrap();
+        fs::write(hidden_dir.join("hosts"), "x").unwrap();
+
+        let listing = Listing::read(&hidden_dir, false).expect("读得动");
+        assert!(
+            listing.shows_hidden(),
+            "正在看的目录自己是隐藏的，就得全显示"
+        );
+        assert_eq!(names(&listing), [".gitignore", "hosts"]);
+    }
+
+    /// 但**兄弟目录**不该跟着一起显示。
+    ///
+    /// 上一条容易被写成一个"凡是路径里有 `.` 就全显示"的实现，
+    /// 那样从 `~` 进来就会冒出 `.ssh`、`.aws`——用户关着的开关就白关了。
+    /// 判据只认**当前目录自己**的名字。
+    #[test]
+    fn a_normal_directory_still_hides_its_dot_entries() {
+        let (_keep, dir) = dir_with_hidden_items();
+        let listing = Listing::read(&dir, false).expect("读得动");
+        assert!(!listing.shows_hidden());
+        assert_eq!(names(&listing), ["aaa.txt", "zzz.txt"]);
+    }
+
+    /// 隐藏过滤与关键词过滤**同时作用**，而且是可交换的。
+    ///
+    /// 两个条件都在 [`Listing::refilter`] 的同一个 `.filter()` 链上，
+    /// 这条防止"改成两趟，第二趟把第一趟的结果覆盖了"。
+    #[test]
+    fn the_hidden_filter_and_the_query_filter_both_apply() {
+        let (_keep, dir) = dir_with_hidden_items();
+        let mut listing = Listing::read(&dir, false).expect("读得动");
+
+        // 关着隐藏 + 搜 "txt"：只有两个普通项，隐藏项照样不见。
+        listing.set_query("txt");
+        assert_eq!(names(&listing), ["aaa.txt", "zzz.txt"]);
+
+        // 开着隐藏 + 同样搜 "txt"：`.env` 不匹配，`.config` 也不匹配。
+        listing.set_show_hidden(true);
+        assert_eq!(names(&listing), ["aaa.txt", "zzz.txt"]);
+
+        // 搜 "e"：`.env` 现在能匹配了——它靠的是隐藏开关，不是查询。
+        listing.set_query("e");
+        assert_eq!(names(&listing), [".env"]);
+
+        // 关掉隐藏，同一个查询立刻把它藏回去。
+        listing.set_show_hidden(false);
+        assert!(names(&listing).is_empty());
     }
 
     #[test]
@@ -895,7 +1131,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("does-not-exist");
 
-        assert!(Listing::read(&missing).is_err());
+        assert!(Listing::read(&missing, false).is_err());
 
         let listing = Listing::empty(missing.clone());
         assert_eq!(listing.path(), missing.as_path());
