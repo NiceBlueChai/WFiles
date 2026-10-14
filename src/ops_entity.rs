@@ -52,12 +52,17 @@ pub struct Clipboard {
 }
 
 /// 待确认的破坏性操作。
+///
+/// **`title` / `message` / `ok_label` 都是 `Msg`**：这三样直接上屏，
+/// 而「确定撤销“{what}”吗？」内层还包着一个 `Msg`（[`crate::i18n::Message`]）。
+/// 存 `String` 就得在构造那一刻 `format!`，内层的 key 当场没了，
+/// 英文界面里显示成 `Undo “重命名 a 为 b”?`。
 #[derive(Clone, Debug)]
 pub struct Confirm {
-    pub title: String,
-    pub message: String,
+    pub title: crate::i18n::Msg,
+    pub message: crate::i18n::Msg,
     /// 确认按钮的文案，删除类是“移到回收站”。
-    pub ok_label: String,
+    pub ok_label: crate::i18n::Msg,
     pub ok_dangerous: bool,
     pub action: PendingAction,
 }
@@ -87,8 +92,10 @@ pub struct Conflict {
 /// 待填写的输入对话框（新建文件夹、重命名）。
 #[derive(Clone, Debug)]
 pub struct Prompt {
-    pub title: String,
-    pub label: String,
+    /// 标题（"新建文件夹"）与输入框上方的说明（"名称"）都上屏，
+    /// 所以都是 `Msg`。`initial` 不是文案，是用户输入框里已有的内容，原样。
+    pub title: crate::i18n::Msg,
+    pub label: crate::i18n::Msg,
     pub initial: String,
     /// 上一次提交被拒的原因，显示在输入框下方。
     pub error: Option<crate::i18n::Msg>,
@@ -255,7 +262,8 @@ enum JobResult {
     Undone {
         history: History,
         involved: Vec<PathBuf>,
-        result: Result<String, crate::i18n::Msg>,
+        /// 成功时是被撤销操作的描述（一个 `Msg`，供「已撤销{what}」包住）。
+        result: Result<crate::i18n::Msg, crate::i18n::Msg>,
     },
 }
 
@@ -275,7 +283,14 @@ pub struct Ops {
     prompt: Option<Prompt>,
     bulk: Option<BulkState>,
     /// 最近一次操作的结论，显示在底部状态栏。
-    last_message: Option<String>,
+    ///
+    /// **存 `Msg` 不存 `String`**：这一栏里的话有好几种来路——
+    /// 「已创建“报告.txt”」是我们自己的措辞，「撤销失败：{error}」内层包着
+    /// 一个 `Msg`（上一批刚把它结构化）。存 `String` 就得在赋值那一句里
+    /// `format!` 一次，那一刻内层被 `to_string()` 冻成中文死符——
+    /// 英文界面里显示成 `Undo failed: 撤销失败：…`，
+    /// 而 `Display` 恒给中文这个约定**没有帮上忙**，反而成了漏翻译的源头。
+    last_message: Option<crate::i18n::Msg>,
     /// 远程连接注册表：只在主线程上用——取客户端，然后把客户端搬进后台线程。
     remotes: Option<Entity<Remotes>>,
     /// 限速用的令牌桶。搬进后台线程的只是这一个 `Arc`：
@@ -329,9 +344,12 @@ impl Ops {
     }
 
     /// “重试”按钮的文案；没有失败项时返回 None。
-    pub fn retry_label(&self) -> Option<String> {
+    pub fn retry_label(&self) -> Option<crate::i18n::Msg> {
         let retry = self.retry.as_ref()?;
-        Some(format!("重试 {} 项", retry.sources.len()))
+        Some(crate::i18n::Message::args(
+            "重试 {count} 项",
+            &[("count", retry.sources.len().to_string())],
+        ))
     }
 
     // ---- 任务控制：暂停 / 继续 / 中止 / 重试 ----
@@ -367,7 +385,7 @@ impl Ops {
         if let Some(running) = self.running.as_mut() {
             running.state = ControlState::Aborting;
         }
-        self.last_message = Some("正在中止…".to_string());
+        self.last_message = Some(crate::i18n::Message::msg("正在中止…"));
         self.last_message_is_error = false;
         cx.notify();
     }
@@ -398,12 +416,15 @@ impl Ops {
     }
 
     /// “撤销”按钮的文案；没有可撤销操作时返回 None。
-    pub fn undo_label(&self) -> Option<String> {
+    pub fn undo_label(&self) -> Option<crate::i18n::Msg> {
         self.history.last_describe()
     }
 
-    pub fn last_message(&self) -> Option<&str> {
-        self.last_message.as_deref()
+    /// 状态栏那句话。**给的是 `Msg` 不是 `&str`**：上屏那一刻才翻，
+    /// 用 `to_string()` 的话界面上一律中文——`Display` 恒给中文这个约定
+    /// 在这里正是漏翻译的源头。
+    pub fn last_message(&self) -> Option<&crate::i18n::Msg> {
+        self.last_message.as_ref()
     }
 
     pub fn last_message_is_error(&self) -> bool {
@@ -419,8 +440,8 @@ impl Ops {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "未命名文件夹".to_string());
         self.prompt = Some(Prompt {
-            title: "新建文件夹".to_string(),
-            label: "名称".to_string(),
+            title: crate::i18n::Message::msg("新建文件夹"),
+            label: crate::i18n::Message::msg("名称"),
             initial,
             error: None,
             action: PendingAction::CreateFolder { parent },
@@ -436,8 +457,8 @@ impl Ops {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         self.prompt = Some(Prompt {
-            title: "重命名".to_string(),
-            label: "新名称".to_string(),
+            title: crate::i18n::Message::msg("重命名"),
+            label: crate::i18n::Message::msg("新名称"),
             initial,
             error: None,
             action: PendingAction::Rename { path },
@@ -453,9 +474,12 @@ impl Ops {
         }
         let count = paths.len();
         self.confirm = Some(Confirm {
-            title: "移到回收站".to_string(),
-            message: format!("确定把 {count} 个项目移到回收站吗？之后还可以撤销。"),
-            ok_label: "移到回收站".to_string(),
+            title: crate::i18n::Message::msg("移到回收站"),
+            message: crate::i18n::Message::args(
+                "确定把 {count} 个项目移到回收站吗？之后还可以撤销。",
+                &[("count", count.to_string())],
+            ),
+            ok_label: crate::i18n::Message::msg("移到回收站"),
             ok_dangerous: true,
             action: PendingAction::Trash { paths },
         });
@@ -476,9 +500,15 @@ impl Ops {
         }
         self.clipboard = Clipboard { paths, cut };
         self.last_message = Some(if cut {
-            format!("已剪切 {} 项，到目标文件夹粘贴", self.clipboard.paths.len())
+            crate::i18n::Message::args(
+                "已剪切 {count} 项，到目标文件夹粘贴",
+                &[("count", self.clipboard.paths.len().to_string())],
+            )
         } else {
-            format!("已复制 {} 项，到目标文件夹粘贴", self.clipboard.paths.len())
+            crate::i18n::Message::args(
+                "已复制 {count} 项，到目标文件夹粘贴",
+                &[("count", self.clipboard.paths.len().to_string())],
+            )
         });
         self.last_message_is_error = false;
         cx.notify();
@@ -513,7 +543,7 @@ impl Ops {
 
     pub fn request_undo(&mut self, cx: &mut Context<Self>) {
         if self.history.is_empty() {
-            self.last_message = Some("没有可撤销的操作".to_string());
+            self.last_message = Some(crate::i18n::Message::msg("没有可撤销的操作"));
             self.last_message_is_error = false;
             cx.notify();
             return;
@@ -521,11 +551,11 @@ impl Ops {
         let describe = self
             .history
             .last_describe()
-            .unwrap_or_else(|| "上一步操作".to_string());
+            .unwrap_or_else(|| crate::i18n::Message::msg("上一步操作"));
         self.confirm = Some(Confirm {
-            title: "撤销".to_string(),
-            message: format!("确定撤销“{describe}”吗？"),
-            ok_label: "撤销".to_string(),
+            title: crate::i18n::Message::msg("撤销"),
+            message: crate::i18n::Message::caused("确定撤销“{what}”吗？", describe),
+            ok_label: crate::i18n::Message::msg("撤销"),
             ok_dangerous: false,
             action: PendingAction::Undo,
         });
@@ -572,7 +602,7 @@ impl Ops {
         };
         let count = bulk_rename::executable_count(&bulk.previews);
         if count == 0 {
-            self.last_message = Some("没有可执行的重命名".to_string());
+            self.last_message = Some(crate::i18n::Message::msg("没有可执行的重命名"));
             self.last_message_is_error = true;
             cx.notify();
             return;
@@ -659,7 +689,7 @@ impl Ops {
 
     pub fn cancel_conflict(&mut self, cx: &mut Context<Self>) {
         self.conflict = None;
-        self.last_message = Some("已取消粘贴".to_string());
+        self.last_message = Some(crate::i18n::Message::msg("已取消粘贴"));
         self.last_message_is_error = false;
         cx.notify();
     }
@@ -672,7 +702,10 @@ impl Ops {
                 self.prompt = None;
                 self.history
                     .push(ops::HistoryEntry::Created { path: path.clone() });
-                self.last_message = Some(format!("已创建“{}”", display_name(&path)));
+                self.last_message = Some(crate::i18n::Message::args(
+                    "已创建“{name}”",
+                    &[("name", display_name(&path))],
+                ));
                 self.last_message_is_error = false;
                 cx.emit(OpsEvent::PromptChanged { open: false });
                 cx.notify();
@@ -696,7 +729,10 @@ impl Ops {
                     from: path.clone(),
                     to: renamed.clone(),
                 });
-                self.last_message = Some(format!("已重命名为“{}”", display_name(&renamed)));
+                self.last_message = Some(crate::i18n::Message::args(
+                    "已重命名为“{name}”",
+                    &[("name", display_name(&renamed))],
+                ));
                 self.last_message_is_error = false;
                 cx.emit(OpsEvent::PromptChanged { open: false });
                 cx.notify();
@@ -759,7 +795,7 @@ impl Ops {
     ) {
         match self.history.pop_undo(clients) {
             Ok(describe) => {
-                self.last_message = Some(format!("已撤销{describe}"));
+                self.last_message = Some(crate::i18n::Message::caused("已撤销{what}", describe));
                 self.last_message_is_error = false;
                 cx.notify();
                 cx.emit(OpsEvent::Changed {
@@ -769,7 +805,7 @@ impl Ops {
                 });
             }
             Err(error) => {
-                self.last_message = Some(format!("撤销失败：{error}"));
+                self.last_message = Some(crate::i18n::Message::caused("撤销失败：{error}", error));
                 self.last_message_is_error = true;
                 cx.notify();
             }
@@ -978,9 +1014,12 @@ impl Ops {
             limiter.set_rate(bytes_per_second);
         }
         self.last_message = Some(if bytes_per_second == 0 {
-            "已取消限速".to_string()
+            crate::i18n::Message::msg("已取消限速")
         } else {
-            format!("限速 {}", crate::format::speed(bytes_per_second))
+            crate::i18n::Message::args(
+                "限速 {speed}",
+                &[("speed", crate::format::speed(bytes_per_second))],
+            )
         });
         self.last_message_is_error = false;
         cx.notify();
@@ -1079,7 +1118,7 @@ impl Ops {
         match result {
             JobResult::Trashed(trashed) => {
                 if trashed.is_empty() {
-                    self.last_message = Some("没有项目能移进回收站".to_string());
+                    self.last_message = Some(crate::i18n::Message::msg("没有项目能移进回收站"));
                     self.last_message_is_error = true;
                 } else {
                     // 删除会让更早的“新建/复制”记录失效，先清理再压栈。
@@ -1091,7 +1130,10 @@ impl Ops {
                     });
                     let removed: Vec<PathBuf> =
                         trashed.iter().map(|(path, _)| path.clone()).collect();
-                    self.last_message = Some(format!("已移到回收站 {} 项", trashed.len()));
+                    self.last_message = Some(crate::i18n::Message::args(
+                        "已移到回收站 {count} 项",
+                        &[("count", trashed.len().to_string())],
+                    ));
                     self.last_message_is_error = false;
                     cx.emit(OpsEvent::Changed {
                         removed,
@@ -1110,9 +1152,19 @@ impl Ops {
                         moves: renamed.clone(),
                     });
                 }
-                let mut message = format!("已重命名 {} 项", renamed.len());
-                if !failed.is_empty() {
-                    message.push_str(&format!("，{} 项失败（{}）", failed.len(), failed[0].1));
+                let mut message = crate::i18n::Message::args(
+                    "已重命名 {count} 项",
+                    &[("count", renamed.len().to_string())],
+                );
+                if let Some((path, reason)) = failed.first() {
+                    message = message.then_caused_clause(
+                        "{count} 项失败（{name}：{error}）",
+                        &[
+                            ("count", failed.len().to_string()),
+                            ("name", display_name(path)),
+                        ],
+                        reason.clone(),
+                    );
                 }
                 self.last_message = Some(message);
                 self.last_message_is_error = !failed.is_empty();
@@ -1204,7 +1256,8 @@ impl Ops {
                 self.history = history;
                 match result {
                     Ok(describe) => {
-                        self.last_message = Some(format!("已撤销{describe}"));
+                        self.last_message =
+                            Some(crate::i18n::Message::caused("已撤销{what}", describe));
                         self.last_message_is_error = false;
                         cx.emit(OpsEvent::Changed {
                             removed: Vec::new(),
@@ -1213,7 +1266,8 @@ impl Ops {
                         });
                     }
                     Err(error) => {
-                        self.last_message = Some(format!("撤销失败：{error}"));
+                        self.last_message =
+                            Some(crate::i18n::Message::caused("撤销失败：{error}", error));
                         self.last_message_is_error = true;
                     }
                 }
@@ -1226,26 +1280,47 @@ impl Ops {
     }
 }
 
-fn summarize(outcome: &Outcome, cut: bool, aborted: bool) -> String {
-    let verb = if cut { "移动" } else { "拷贝" };
-    let mut text = if aborted {
-        format!("已中止：{verb}完成 {} 项", outcome.done)
+/// 一次搬运的结论，主句加若干**条件出现**的子句。
+///
+/// 返回 `Msg` 而不是 `String`：子句里的失败原因本身是一个 `Msg`
+/// （上一批刚把它结构化），拼成字符串就把它冻成中文了。
+/// 英文那边动词是过去式、子句是分词短语，语序跟中文不同——
+/// 所以主句与子句各自一条 key，渲染时 [`Message::then_clause`] 按语言接起来。
+fn summarize(outcome: &Outcome, cut: bool, aborted: bool) -> crate::i18n::Msg {
+    use crate::i18n::Message;
+    let done = outcome.done.to_string();
+    let mut message = if aborted {
+        Message::args(
+            if cut {
+                "已中止：移动完成 {count} 项"
+            } else {
+                "已中止：拷贝完成 {count} 项"
+            },
+            &[("count", done)],
+        )
+    } else if cut {
+        Message::args("移动完成 {count} 项", &[("count", done)])
     } else {
-        format!("{verb}完成 {} 项", outcome.done)
+        Message::args("拷贝完成 {count} 项", &[("count", done)])
     };
+    // 中止时报跳过没有意义：那些是被用户叫停的，不是"跳过了"。
     if outcome.skipped > 0 && !aborted {
-        text.push_str(&format!("，跳过 {} 项", outcome.skipped));
-    }
-    if !outcome.failed.is_empty() {
-        let first = &outcome.failed[0];
-        text.push_str(&format!(
-            "，{} 项失败（{}：{}）",
-            outcome.failed.len(),
-            display_name(&first.0),
-            first.1
+        message = message.then_clause(Message::args(
+            "跳过 {count} 项",
+            &[("count", outcome.skipped.to_string())],
         ));
     }
-    text
+    if let Some((path, reason)) = outcome.failed.first() {
+        message = message.then_caused_clause(
+            "{count} 项失败（{name}：{error}）",
+            &[
+                ("count", outcome.failed.len().to_string()),
+                ("name", display_name(path)),
+            ],
+            reason.clone(),
+        );
+    }
+    message
 }
 
 fn display_name(path: &std::path::Path) -> String {

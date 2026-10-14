@@ -1502,26 +1502,35 @@ impl HistoryEntry {
     }
 
     /// 撤销按钮上的文案。
-    pub fn describe(&self) -> String {
+    ///
+    /// **返回 `Msg` 不返回 `String`**：调用点把它嵌进「已撤销{what}」
+    /// 那一句里（`Message::caused`）。返回 `String` 的话，那一层就得
+    /// `to_string()`，内层的 key 当场没了——撤销按钮的文案在英文界面里
+    /// 会显示成 `Undo undone: 重命名“a”为“b”`。
+    pub fn describe(&self) -> crate::i18n::Msg {
+        use crate::i18n::Message;
         match self {
             Self::Created { path } => {
-                format!("新建“{}”", display_name(path))
+                Message::args("新建“{name}”", &[("name", display_name(path))])
             }
-            Self::Renamed { from, to } => {
-                format!("重命名“{}”为“{}”", display_name(from), display_name(to))
-            }
+            Self::Renamed { from, to } => Message::args(
+                "重命名“{from}”为“{to}”",
+                &[("from", display_name(from)), ("to", display_name(to))],
+            ),
             Self::Copied { created } => {
-                format!("复制 {} 项", created.len())
+                Message::args("复制 {count} 项", &[("count", created.len().to_string())])
             }
             Self::Moved { moves } => {
-                format!("移动 {} 项", moves.len())
+                Message::args("移动 {count} 项", &[("count", moves.len().to_string())])
             }
-            Self::BulkRenamed { moves } => {
-                format!("批量重命名 {} 项", moves.len())
-            }
-            Self::Trashed { originals } => {
-                format!("移到回收站 {} 项", originals.len())
-            }
+            Self::BulkRenamed { moves } => Message::args(
+                "批量重命名 {count} 项",
+                &[("count", moves.len().to_string())],
+            ),
+            Self::Trashed { originals } => Message::args(
+                "移到回收站 {count} 项",
+                &[("count", originals.len().to_string())],
+            ),
         }
     }
 
@@ -1678,7 +1687,7 @@ impl History {
     }
 
     /// 栈顶操作的描述，用于“撤销 XXX”按钮。
-    pub fn last_describe(&self) -> Option<String> {
+    pub fn last_describe(&self) -> Option<crate::i18n::Msg> {
         self.entries.last().map(HistoryEntry::describe)
     }
 
@@ -1694,7 +1703,7 @@ impl History {
     pub fn pop_undo(
         &mut self,
         clients: &HashMap<String, Client>,
-    ) -> Result<String, crate::i18n::Msg> {
+    ) -> Result<crate::i18n::Msg, crate::i18n::Msg> {
         let entry = self
             .entries
             .pop()
@@ -2494,13 +2503,14 @@ mod tests {
         history.push(HistoryEntry::Created {
             path: folder.clone(),
         });
+        // 判 `Msg` 的显示文案（`Display` 恒给中文，与语言无关）。
         assert_eq!(
-            history.last_describe(),
+            history.last_describe().map(|it| it.to_string()),
             Some("新建“未命名文件夹”".to_string())
         );
 
         assert_eq!(
-            history.pop_undo(&HashMap::new()).unwrap(),
+            history.pop_undo(&HashMap::new()).unwrap().to_string(),
             "新建“未命名文件夹”"
         );
         assert!(!folder.exists());
@@ -2704,7 +2714,7 @@ mod tests {
 
         history.note_removed(&gone);
         assert_eq!(
-            history.last_describe(),
+            history.last_describe().map(|it| it.to_string()),
             Some("复制 1 项".to_string()),
             "只删失效的那条"
         );

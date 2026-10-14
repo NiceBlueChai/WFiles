@@ -792,11 +792,16 @@ fn wait_until_idle(cx: &mut TestAppContext, ops: &gpui_kit::Entity<Ops>) {
     }
 }
 
+/// 状态栏那句话（中文形态）。
+///
+/// **用 `to_string()` 不是 `say(cx)`**：`Display` 恒给中文，
+/// 所以这个读法跟语言无关——切到英文的测试另有
+/// `the_status_bar_speaks_english` 那类用例在管。
 fn message_of(cx: &mut TestAppContext, ops: &gpui_kit::Entity<Ops>) -> String {
     cx.update(|cx| {
         ops.read(cx)
             .last_message()
-            .map(str::to_string)
+            .map(ToString::to_string)
             .unwrap_or_default()
     })
 }
@@ -940,7 +945,7 @@ fn a_failed_item_can_be_retried(cx: &mut TestAppContext) {
 
     assert!(!dest.join("locked.txt").exists());
     assert_eq!(
-        cx.update(|cx| ops.read(cx).retry_label()),
+        cx.update(|cx| ops.read(cx).retry_label().map(|it| it.to_string())),
         Some("重试 1 项".to_string())
     );
 
@@ -5250,7 +5255,14 @@ fn the_pane_chrome_speaks_english(cx: &mut TestAppContext) {
         settle(window, cx);
         a11y_label_at(window, "file-list")
     });
-    assert_eq!(view, "List view", "列表视图的无障碍名该跟着语言走");
+    // **断言的是 `List View`（每个词首字母大写），不是 `List view`。**
+    // 英文表里这三个 key 曾经各写两条：菜单那份 Title Case、
+    // 无障碍名那份小写。因为表按 key 索引成 `HashMap`，
+    // **后写的那条静默赢**——所以界面上一直显示的是小写那份，
+    // 而菜单里那个字也就跟着成了 "List view"。
+    // 现在表里只留 Title Case（读屏念出来大小写没差别，菜单里规整要紧），
+    // 所以这里跟着变。改动它会挂的就是这条。
+    assert_eq!(view, "List View", "列表视图的无障碍名该跟着语言走");
     // 详情板的多选态（`detail-selection`）**不在这里验**：
     // 多选要 shift 或 Ctrl 点行，而 gpui-kit 的测试 `mouse_down` 把
     // `modifiers` 写死成 `Default::default()`——`window.click` 走的正是
@@ -5310,4 +5322,152 @@ fn an_empty_command_palette_says_so_in_the_chosen_language(cx: &mut TestAppConte
         !empty.chars().any(|c| c as u32 > 0x2E80),
         "英文面板的空态提示里还有中文：{empty:?}"
     );
+}
+
+/// 状态栏那一句在英文界面下也得说英文。
+///
+/// **这条守的是 `say(cx)` 与 `to_string()` 的差别**：状态栏那句话是
+/// `Msg`（结构化错误），而 `Msg` 的 `Display` 恒给中文——它是"还没上屏的
+/// 中间态有个能看的字符串"这个约定留下的。写 `.to_string()` 的话，
+/// 中文界面下所有测试都绿（`Display` 给的就是中文），
+/// 英文界面下整栏不变。一句话里混着两种语言是最难被发现的那种漏翻。
+#[gpui_kit::test]
+fn the_status_bar_message_speaks_english(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, dir.path());
+
+    // 选中 → F2 → 改名 → 回车。做完状态栏上就有「已重命名为「…」」。
+    //
+    // **改名是插入不是替换**：prompt 预填了原名，而 `input` 从光标处
+    // 逐字符往里打，光标在开头，所以 `-second` 插到了 `a.txt` 前面。
+    // 这不影响判据——要验的是「这句话在英文界面下变没变」，
+    // 不是文件叫什么名字。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+        settle(window, cx);
+        window.press("f2", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("-second", cx);
+        window.press("enter", cx);
+        settle(window, cx);
+    });
+
+    let chinese = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "status-message")
+    });
+    assert!(
+        chinese.contains("已重命名为"),
+        "中文状态栏该说「已重命名为…」，实际是 {chinese:?}"
+    );
+
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+
+    let english = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "status-message")
+    });
+    assert_eq!(english, "Renamed to “-seconda.txt”");
+    assert!(
+        !english.chars().any(|c| c as u32 > 0x2E80),
+        "英文状态栏里还有中文：{english:?}"
+    );
+}
+
+/// 撤销按钮的文案在英文界面下也得说英文。
+///
+/// 这一句是 `HistoryEntry::describe()` 拼出来的，而它**套在两处**：
+/// 按钮标签、tooltip「撤销：{what}（Cmd+Z）」。两处都得跟着语言走。
+#[gpui_kit::test]
+fn the_undo_button_speaks_english(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, dir.path());
+
+    // 一次改名就够：这条验的是「按钮上那句话在英文界面下变没变」，
+    // 一个文件名足够说明问题。（两次改名才出现的「X 为 Y」那种长文案
+    // 是 `a_long_undo_label_cannot_push_the_status_bar_off_screen`
+    // 在管的事——那条量的宽度，不是语言。
+    // 实测第二次 F2 之后 prompt 没再打开，所以这里只有一次改名。）
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+        settle(window, cx);
+        window.press("f2", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("-second", cx);
+        window.press("enter", cx);
+        settle(window, cx);
+    });
+    let chinese = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "undo-label")
+    });
+    assert!(
+        chinese.contains("重命名"),
+        "中文撤销按钮该说「重命名 X 为 Y」，实际是 {chinese:?}"
+    );
+
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+
+    let english = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "undo-label")
+    });
+    assert_eq!(english, "Renamed “a.txt” to “-seconda.txt”");
+    assert!(
+        !english.chars().any(|c| c as u32 > 0x2E80),
+        "英文撤销按钮上还有中文：{english:?}"
+    );
+}
+
+/// 确认框的标题与正文在英文界面下也得说英文。
+///
+/// 正文那句「确定把 N 个项目移到回收站吗？之后还可以撤销。」是**整句带
+/// 从句**，不能拆成两条 key——拆了英文那边就是
+/// `Move 1 items to the Trash?` 后面跟一句孤立的中文，
+/// 夹在英文句子中间的那半句恰恰最显眼。
+#[gpui_kit::test]
+fn the_trash_confirmation_speaks_english(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| settings.set_locale(crate::i18n::Locale::En));
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+        settle(window, cx);
+        // 回收站是破坏性操作，Cmd+Backspace（不是 Delete）。
+        window.press("cmd-backspace", cx);
+        settle(window, cx);
+    });
+
+    let (title, body) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            a11y_label_at(window, "overlay-title"),
+            a11y_label_at(window, "confirm-message"),
+        )
+    });
+    assert_eq!(title, "Move to Trash");
+    assert_eq!(body, "Move 1 items to the Trash? This can still be undone.");
+    for (what, text) in [("标题", &title), ("正文", &body)] {
+        assert!(
+            !text.chars().any(|c| c as u32 > 0x2E80),
+            "英文确认框的{what}里还有中文：{text:?}"
+        );
+    }
 }

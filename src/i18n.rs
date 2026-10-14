@@ -109,6 +109,18 @@ impl Locale {
             Locale::En => Some(EN_INDEX.get_or_init(|| index_of(EN))),
         }
     }
+
+    /// 同一句话里几段之间的分隔符。
+    ///
+    /// 写死「，」的话，英文界面里会出现 `Copied 5 items，skipped 2 items`
+    /// ——全角逗号夹在两个英文句子中间，一眼就看出是没收工的。
+    fn clause_joiner(self) -> &'static str {
+        match self {
+            // 中文用全角逗号且不留空格；英文用半角逗号加一个空格。
+            Locale::ZhHans => "，",
+            Locale::En => ", ",
+        }
+    }
 }
 
 fn index_of(table: &[(&'static str, &'static str)]) -> HashMap<&'static str, &'static str> {
@@ -191,6 +203,23 @@ pub struct Message {
     ///
     /// 留在结构里、内层自己到上屏那一刻才渲染，这两件事才都成立。
     cause: Option<Box<Message>>,
+    /// 主句后面的补充句，每句各自查表。
+    ///
+    /// **为的是什么形状的问题**：状态栏那句「拷贝完成 5 项，跳过 2 项，
+    /// 1 项失败（a.txt：Permission denied）」有两个麻烦——
+    ///
+    /// 1. **子句是条件出现**的（没有失败就不显示那半句），所以不能
+    ///    把它塞进一条 key 的占位符：填不出来时那句还挂在界面上。
+    /// 2. **英文的动词是过去式**（移动完成 → Moved），而子句是分词短语
+    ///    （skipped 2 / 1 failed）。两种语言的语序不同，硬编成一条 key
+    ///    就得给 2×2×2 种组合各留一条——组合一多，漏一条就是一个只在
+    ///    某一种操作下才露出来的中英混排。
+    ///
+    /// 所以拆开：主句一条 key，子句各一条 key，渲染时按当前语言
+    /// 各自查表再用该语言的分句符接起来。
+    /// 分句符不存这儿，渲染时问 [`Locale::clause_joiner`] 要：
+    /// 它是标点不是文案，跟着语言走，不该由消息自己定。
+    clauses: Vec<Message>,
 }
 
 impl Message {
@@ -201,6 +230,7 @@ impl Message {
             args: Vec::new(),
             verbatim: None,
             cause: None,
+            clauses: Vec::new(),
         }
     }
 
@@ -212,6 +242,7 @@ impl Message {
             args: args.to_vec(),
             verbatim: None,
             cause: None,
+            clauses: Vec::new(),
         }
     }
 
@@ -223,6 +254,7 @@ impl Message {
             args: Vec::new(),
             verbatim: Some(text.into()),
             cause: None,
+            clauses: Vec::new(),
         }
     }
 
@@ -254,7 +286,45 @@ impl Message {
             args: args.to_vec(),
             verbatim: None,
             cause: Some(Box::new(cause.into_message())),
+            clauses: Vec::new(),
         }
+    }
+
+    /// 在主句后面**挂一句补充**：渲染时按语言各自查表，
+    /// 再用该语言的分句符接起来。
+    ///
+    /// 典型是状态栏那句「拷贝完成 5 项，跳过 2 项」——「跳过 N 项」
+    /// 只在真跳过了的时候出现，塞进主句的占位符里会出现
+    /// 「拷贝完成 5 项，跳过  项」（占位符留着还是被填成空，
+    /// 两种都不对）。用整句查表也有同样的毛病：得为
+    /// 「有/无跳过 × 有/无失败 × 移动/拷贝」留 8 条 key，
+    /// 漏一条就只在某一种操作下露出来。
+    ///
+    /// 子句**不带前导标点**——分句符由 [`Locale::clause_joiner`] 给，
+    /// 中文和英文的标点不一样。
+    ///
+    /// ```ignore
+    /// Message::msg("拷贝完成 5 项")
+    ///     .then_clause(Message::args("跳过 {count} 项", &[("count", "2".into())]))
+    /// ```
+    pub fn then_clause(mut self, clause: impl Cause) -> Self {
+        self.clauses.push(clause.into_message());
+        self
+    }
+
+    /// 挂一句包着别的错误的补充（「1 项失败（a.txt：权限不足）」那种）。
+    ///
+    /// 跟 [`Self::then_clause`] 一样的形状，只是内层也是一条 `Msg`，
+    /// 所以走 [`Self::caused_with`] 那条路——**不能**写成
+    /// `Message::args("…（{error}）", error.to_string())`，那会把内层
+    /// 冻成中文死符。
+    pub fn then_caused_clause(
+        self,
+        key: &'static str,
+        args: &[(&'static str, String)],
+        cause: impl Cause,
+    ) -> Self {
+        self.then_clause(Message::caused_with(key, args, cause))
     }
 
     /// 这句话是不是透传的原文（不是我们自己的措辞）。
@@ -304,7 +374,7 @@ impl Message {
     /// 到这一刻才渲染，所以英文界面里不会出现
     /// 「Download: write failed: 已中止」这种半中半英。
     pub fn say_in(&self, locale: Locale) -> String {
-        match &self.verbatim {
+        let head = match &self.verbatim {
             Some(text) => text.clone(),
             None => match &self.cause {
                 Some(cause) => {
@@ -314,7 +384,17 @@ impl Message {
                 }
                 None => fill(&lookup(locale, self.key), &self.args),
             },
+        };
+        if self.clauses.is_empty() {
+            return head;
         }
+        let joiner = locale.clause_joiner();
+        let mut out = head;
+        for clause in &self.clauses {
+            out.push_str(joiner);
+            out.push_str(&clause.say_in(locale));
+        }
+        out
     }
 }
 
@@ -582,8 +662,6 @@ static EN: &[(&str, &str)] = &[
     ("展开详情板", "Show Details"),
     ("收起终端面板", "Hide Terminal Panel"),
     ("打开终端面板", "Show Terminal Panel"),
-    ("收起侧栏", "Collapse sidebar"),
-    ("展开侧栏", "Expand sidebar"),
     ("比较这两个文件夹", "Compare These Folders"),
     (
         "比较文件内容：{left} ↔ {right}",
@@ -707,18 +785,11 @@ static EN: &[(&str, &str)] = &[
     ("收起详情板（Cmd+Alt+O）", "Hide Details (Cmd+Alt+O)"),
     ("展开详情板（Cmd+Alt+O）", "Show Details (Cmd+Alt+O)"),
     ("正在取这个目录…", "Reading folder…"),
-    // 三种视图的无障碍名。读屏软件靠它报"现在是列表还是网格"，
-    // 所以这三个词也算界面文案，不是纯测试用的钩子。
-    ("列表视图", "List view"),
-    ("网格视图", "Grid view"),
-    ("分列视图", "Columns view"),
     // ---- 侧栏的三个分区标题 ----
     // 它们是 `render_volumes_section` / `render_cloud_section` /
     // `render_remote_section` 里那三行 `.child("…")`，字号一样、位置一样，
     // 英文下面对不齐会很显眼，所以放在一组。
     ("磁盘", "Disks"),
-    ("云盘", "Cloud"),
-    ("远程", "Remote"),
     // ---- 连接入口（侧栏「远程」那一节下面那一行）----
     ("连接服务器", "Connect to Server"),
     ("连接服务器…", "Connect to Server…"),
@@ -777,7 +848,6 @@ static EN: &[(&str, &str)] = &[
     ("坚果云", "坚果云"),
     ("正在连接…", "Connecting…"),
     ("连接", "Connect"),
-    ("关闭（Esc）", "Close (Esc)"),
     // ---- 侧栏的"位置"（`places()` 的第四项是路径，不翻）----
     // 终端名翻不了：`Option::name` 用来在面板里显示，但它同时是**用户装的那个
     // 程序的名字**——Windows 上的"Windows Terminal"、Linux 上的"GNOME 终端"
@@ -1084,16 +1154,11 @@ static EN: &[(&str, &str)] = &[
         "关不掉远程文件：{error}",
         "Couldn't close the remote file: {error}",
     ),
-    ("先选中一个远程文件", "Select a remote file first"),
     (
         "切二进制模式失败：{error}",
         "Couldn't switch to binary mode: {error}",
     ),
     ("正则写错了：{error}", "The pattern is wrong: {error}"),
-    (
-        "地址要写成 https://… 这样",
-        "Write the address like https://…",
-    ),
     (
         "起不了网络运行时：{error}",
         "Couldn't start the network runtime: {error}",
@@ -1164,7 +1229,6 @@ static EN: &[(&str, &str)] = &[
         "颜色只认 {names}，不是“{bare}”",
         "Colors are only {names}, not “{bare}”",
     ),
-    ("没有“{field}:”这个字段", "There's no “{field}:” field"),
     // ---- 协议层零散 ----
     ("无法解析原文件名", "Can't work out the original name"),
     (
@@ -1235,6 +1299,91 @@ static EN: &[(&str, &str)] = &[
         "文件太大，只比了前 {size}",
         "File too large, only the first {size} were compared",
     ),
+    // ---- 状态栏的结论 / 对话框 ----
+    //
+    // **这一段里有两个动作名，形态故意不同，别顺手改成一致**：
+    //
+    // 1. `HistoryEntry::describe()` 是个**动宾短语**（"重命名 a 为 b"），
+    //    它是给「已撤销{what}」「确定撤销“{what}”吗？」当内层用的，
+    //    英文那边要当 "Undone: …" 的宾语，所以也是过去式分词。
+    // 2. `summarize()` 是个**完成态句子**（"移动完成 5 项"），
+    //    英文过去式自己就把动词说完了，不需要 "completed" 之类垫料。
+    //
+    // 两条凑巧都译成 `Moved {count} items`，但它们是两行表项：
+    // 中文 key 不同就是不同的句子，将来有一边改了措辞另一边不用跟。
+    ("新建“{name}”", "Created “{name}”"),
+    ("重命名“{from}”为“{to}”", "Renamed “{from}” to “{to}”"),
+    ("复制 {count} 项", "Copied {count} items"),
+    ("移动 {count} 项", "Moved {count} items"),
+    ("批量重命名 {count} 项", "Bulk-renamed {count} items"),
+    ("移到回收站 {count} 项", "Moved {count} items to the Trash"),
+    ("移动完成 {count} 项", "Moved {count} items"),
+    ("拷贝完成 {count} 项", "Copied {count} items"),
+    (
+        "已中止：移动完成 {count} 项",
+        "Stopped: moved {count} items",
+    ),
+    (
+        "已中止：拷贝完成 {count} 项",
+        "Stopped: copied {count} items",
+    ),
+    //
+    // 下面两条是 `summarize()` 的**子句**，它们跟在主句后面当分词短语用。
+    // 主句是过去式（"Copied 5 items"），子句跟着也得是，
+    // 否则 "Copied 5 items, 2 items were skipped" 读着像两句拼的。
+    ("跳过 {count} 项", "skipped {count}"),
+    (
+        "{count} 项失败（{name}：{error}）",
+        "{count} failed ({name}: {error})",
+    ),
+    ("已重命名 {count} 项", "Renamed {count} items"),
+    ("没有可执行的重命名", "Nothing to rename"),
+    ("批量重命名（{total} 项）", "Bulk Rename ({total} items)"),
+    ("已创建“{name}”", "Created “{name}”"),
+    ("已重命名为“{name}”", "Renamed to “{name}”"),
+    (
+        "已移到回收站 {count} 项",
+        "Moved {count} items to the Trash",
+    ),
+    (
+        "没有项目能移进回收站",
+        "Nothing could be moved to the Trash",
+    ),
+    //
+    // 剪贴板：中文用逗号接一句提示，英文不能照抄逗号。
+    // 用破折号，因为这里的"提示"在两种语言里都是插进去的旁白。
+    (
+        "已剪切 {count} 项，到目标文件夹粘贴",
+        "Cut {count} items — paste in the destination folder",
+    ),
+    (
+        "已复制 {count} 项，到目标文件夹粘贴",
+        "Copied {count} items — paste in the destination folder",
+    ),
+    ("已取消粘贴", "Paste cancelled"),
+    ("已取消限速", "Speed limit off"),
+    ("限速 {speed}", "Speed limit {speed}"),
+    ("正在中止…", "Stopping…"),
+    ("重试 {count} 项", "Retry {count} items"),
+    // ---- 撤销 ----
+    //
+    // `{what}` 里塞的是上面 `describe()` 那些动宾短语。
+    // 「已撤销」用冒号而不是像中文那样直接接：
+    // 英文动词已经过去式了，后面再接一个过去式分词会读成两个动作。
+    ("已撤销{what}", "Undone: {what}"),
+    ("撤销失败：{error}", "Undo failed: {error}"),
+    ("确定撤销“{what}”吗？", "Undo “{what}”?"),
+    ("撤销", "Undo"),
+    // 没有历史记录时的兜底描述。正常走不到这里（确认框只在有历史时弹），
+    // 但万一走到了也不能显示成空白。
+    ("上一步操作", "the last action"),
+    // ---- 对话框 ----
+    ("新名称", "New name"),
+    (
+        "确定把 {count} 个项目移到回收站吗？之后还可以撤销。",
+        "Move {count} items to the Trash? This can still be undone.",
+    ),
+    ("连接远程服务器", "Connect to Server"),
 ];
 
 /// 英文表里有没有漏掉不该出现的条目：译文等于原文（等于没翻），
@@ -1346,6 +1495,37 @@ mod tests {
         );
     }
 
+    /// **同一个 key 在表里只能有一条。**
+    ///
+    /// 表是按 key 索引的（[`index_of`] 建 `HashMap`），重复条目**不会
+    /// 报错**——后写的静默覆盖先写的，界面上显示哪一个取决于它们在源码里
+    /// 的物理位置。改代码时挪一下位置，译文就变了，没有任何东西会拦住你。
+    ///
+    /// 顺带说明这个洞原本装了什么：中文 key「列表视图」在表里出现两次，
+    /// 一次译 `List View`（菜单项，Title Case 是英语菜单词的规矩），
+    /// 一次译 `List view`（切换动作的句子中段）。**两条各有各的道理，
+    /// 而 key-indexed 表只能给一个答案。**
+    /// 现在留下的是 `List View`——菜单那一处是用户直接点的字，
+    /// 无障碍名那处读出来是 "list view"，大小写差别听不出来。
+    /// 如果哪天菜单改成小写，这条会挡住你，那才是该重新想 key 的时候。
+    #[test]
+    fn no_key_appears_twice_in_the_english_table() {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut repeated = Vec::new();
+        for (key, _) in EN {
+            if seen.contains(key) {
+                repeated.push(*key);
+            } else {
+                seen.push(key);
+            }
+        }
+        assert!(
+            repeated.is_empty(),
+            "英文表里这些 key 出现了不止一次：{repeated:?}\
+             （HashMap 会让后写的静默覆盖先写的）"
+        );
+    }
+
     #[test]
     fn named_arguments_are_filled_in_and_the_order_is_the_translation_s() {
         // 英文把两个实参换了位置——这正是不用 `{}` 顺序占位符的理由。
@@ -1395,9 +1575,10 @@ mod tests {
     /// 单独列在 [`EXEMPT_KEYS`] 里，每条写清为什么。
     #[test]
     fn every_message_key_has_an_english_entry() {
+        let found = message_keys_in_src();
         let mut missing = Vec::new();
-        for (key, where_) in message_keys_in_src() {
-            if !EN.iter().any(|(k, _)| *k == key) && !EXEMPT_KEYS.contains(&key) {
+        for (key, where_) in &found {
+            if !EN.iter().any(|(k, _)| k == key) && !EXEMPT_KEYS.contains(key) {
                 missing.push(format!("{key}（{where_}）"));
             }
         }
@@ -1405,6 +1586,19 @@ mod tests {
             missing.is_empty(),
             "这些错误信息还没有英文译文：\n  {}",
             missing.join("\n  ")
+        );
+        // **下限断言是这个测试自己的护栏**。上面那条只查「扫到的都翻了」，
+        // 扫描器一旦坏了（改了形式名、括号配对写错、正则不再匹配中文），
+        // 扫到 0 条，上面照样绿——「扫不到」和「都翻好了」长得一模一样。
+        // 跟 `the_abort_phrase_is_translated` 那条一样：这个测试自己也会有洞。
+        //
+        // 185 是 2026-10-14 实测数（去掉重复的）。以后真加了新 key，
+        // 这个数只会变大；**变小**就是扫描器出问题了，别直接改小它。
+        assert!(
+            found.len() >= 185,
+            "只扫到 {} 条 key，比已知的 185 条还少——扫描器多半坏了，\
+             「扫到的都有译文」这条正在空转",
+            found.len()
         );
     }
 
@@ -1462,6 +1656,59 @@ mod tests {
         );
     }
 
+    /// 主句 + 条件子句：中文用「，」，英文用 ", "。
+    ///
+    /// **分句符是跟着语言走的，不是消息自己带的**。写死中文逗号的话，
+    /// 英文界面里会出现 `Copied 5 items，skipped 2`——一眼就是没收工。
+    /// 而 `clause_joiner` 若返回同一个值，这条测试立刻报出来。
+    #[test]
+    fn a_clause_is_joined_with_the_punctuation_of_its_language() {
+        let message = Message::args("拷贝完成 {count} 项", &[("count", "5".into())])
+            .then_clause(Message::args("跳过 {count} 项", &[("count", "2".into())]));
+        assert_eq!(message.say_in(Locale::ZhHans), "拷贝完成 5 项，跳过 2 项");
+        assert_eq!(message.say_in(Locale::En), "Copied 5 items, skipped 2");
+    }
+
+    /// 子句里的内层错误也跟着翻。
+    ///
+    /// 「1 项失败（a.txt：权限不足）」的内层是 `Msg`，走
+    /// `then_caused_clause` 而不是 `args`——写成 `args` 就把内层
+    /// 冻成中文死符，英文界面里那半句还是中文。
+    #[test]
+    fn a_clause_translates_its_own_inner_error_too() {
+        let message = Message::args("拷贝完成 {count} 项", &[("count", "5".into())])
+            .then_caused_clause(
+                "{count} 项失败（{name}：{error}）",
+                &[("count", "1".into()), ("name", "a.txt".into())],
+                Message::msg("已中止"),
+            );
+        assert_eq!(
+            message.say_in(Locale::En),
+            "Copied 5 items, 1 failed (a.txt: Stopped)"
+        );
+        // 中文下三段全中文。
+        assert_eq!(
+            message.say_in(Locale::ZhHans),
+            "拷贝完成 5 项，1 项失败（a.txt：已中止）"
+        );
+    }
+
+    /// 子句可以有多个，按挂上去的顺序接。
+    #[test]
+    fn several_clauses_keep_the_order_they_were_attached_in() {
+        let message = Message::args("已重命名 {count} 项", &[("count", "3".into())])
+            .then_clause(Message::args("跳过 {count} 项", &[("count", "1".into())]))
+            .then_caused_clause(
+                "{count} 项失败（{name}：{error}）",
+                &[("count", "1".into()), ("name", "a.txt".into())],
+                Message::verbatim("Permission denied"),
+            );
+        assert_eq!(
+            message.say_in(Locale::En),
+            "Renamed 3 items, skipped 1, 1 failed (a.txt: Permission denied)"
+        );
+    }
+
     /// 中止哨兵穿过 `io::Error` 那一跳之后，key 还在。
     ///
     /// **为什么值得单测**：`ops::Reporting` 实现的是 `std::io::Read`，
@@ -1512,22 +1759,31 @@ mod tests {
         );
     }
 
-    /// 扫源码里所有 `Message::{msg,args,caused,caused_with}` 的第一个字符串参数。
+    /// 扫源码里所有 `Message::{msg,args,caused,caused_with}` /
+    /// `then_caused_clause` 调用**括号内**的中文字面量。
     ///
     /// 返回 (key, 位置) —— 位置进报错信息，让人能直接跳过去补。
+    ///
+    /// **为什么扫「括号内的全部字面量」而不是「括号后紧跟的第一个」**：
+    /// 第一版只取形式名紧跟的那一个字面量，于是漏掉了
+    /// `summarize()` 里 `if cut { "已中止：移动完成…" } else { … }`
+    /// 这种形状——4 条分支字面量一条都扫不到，测试照样绿。
+    /// 「扫不到」和「扫到了但没翻」在测试里长得一模一样，都是绿。
+    /// 括号里出现的每个中文字面量都是 key（`verbatim` 单独排除，
+    /// 它按约定就是原文），所以宁可多扫。
     fn message_keys_in_src() -> Vec<(&'static str, String)> {
-        // 用 `include_str!` 把源码读进来：`cargo test` 时 CWD 不保证是
-        // 项目根，靠相对路径读文件会时灵时不灵。`env!("CARGO_MANIFEST_DIR")`
-        // 才是编译器给的可信路径。
+        // 用 `env!("CARGO_MANIFEST_DIR")` 定位源码：`cargo test` 时 CWD
+        // 不保证是项目根，靠相对路径读文件会时灵时不灵。编译器给的路径可信。
         let root = env!("CARGO_MANIFEST_DIR");
         let src = format!("{root}/src");
         let mut out = Vec::new();
-        // 构造方式名 → 认它的第几个参数是关键。
-        let forms = [
-            ("Message::msg(", 1),
-            ("Message::args(", 1),
-            ("Message::caused(", 1),
-            ("Message::caused_with(", 1),
+        // 第一个参数是 key 的构造方式。
+        const FORMS: &[&str] = &[
+            "Message::msg(",
+            "Message::args(",
+            "Message::caused(",
+            "Message::caused_with(",
+            ".then_caused_clause(",
         ];
         for name in fs::read_dir(&src).expect("读得到 src 目录") {
             let path = name.expect("目录项").path();
@@ -1550,44 +1806,114 @@ mod tests {
                 continue;
             }
             let text = fs::read_to_string(&path).expect("源码是 UTF-8");
-            for (line_no, line) in text.lines().enumerate() {
-                for (form, arity) in forms {
-                    let Some(at) = line.find(form) else { continue };
-                    // 取 form 之后第一个字符串字面量——这些构造的第一个参数
-                    // 一定是 key（`caused` 的第 2 参才是 cause）。
-                    let rest = &line[at + form.len()..];
-                    let rest = rest.trim_start();
-                    let Some(rest) = rest.strip_prefix('"') else {
-                        continue;
-                    };
-                    let mut key = String::new();
-                    let mut escaped = false;
-                    let mut closed = false;
-                    for c in rest.chars() {
-                        if escaped {
-                            key.push(c);
-                            escaped = false;
-                            continue;
-                        }
-                        match c {
-                            '\\' => escaped = true,
-                            '"' => {
-                                closed = true;
-                                break;
-                            }
-                            _ => key.push(c),
-                        }
-                    }
-                    if !closed {
+            // `verbatim` 按约定就是别人的原话，不查表。它们的调用范围
+            // 先标出来，扫别的形式时落在里面的一律跳过——
+            // `Message::caused("…", Message::verbatim("服务器说了句中文"))`
+            // 这种写法里，那句中文是内层原话，不该被要求有译文。
+            let verbatim_spans: Vec<(usize, usize)> = occurrences(&text, VERBATIM_FORM)
+                .map(|at| (at, call_end(&text, at + VERBATIM_FORM.len() - 1)))
+                .collect();
+            for form in FORMS {
+                for at in occurrences(&text, form) {
+                    if verbatim_spans
+                        .iter()
+                        .any(|(from, to)| *from <= at && at < *to)
+                    {
                         continue;
                     }
-                    let _ = arity;
-                    let leaked: &'static str = Box::leak(key.into_boxed_str());
-                    out.push((leaked, format!("{file}:{}", line_no + 1)));
+                    let end = call_end(&text, at + form.len() - 1);
+                    for literal in chinese_literals(&text, at, end) {
+                        let leaked: &'static str = Box::leak(literal.to_string().into_boxed_str());
+                        out.push((leaked, format!("{file}:{}", line_of(&text, at))));
+                    }
                 }
             }
         }
         out
+    }
+
+    const VERBATIM_FORM: &str = "Message::verbatim(";
+
+    /// `needle` 在 `hay` 里的所有**字节**下标。
+    ///
+    /// 返回字节下标而不是字符下标：后面要拿它去切 `&str`，
+    /// 拿字符下标切会 panic 在非字符边界上。
+    fn occurrences<'a>(hay: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+        hay.match_indices(needle).map(|(at, _)| at)
+    }
+
+    /// 从 `open`（一个左括号的字节下标）开始，找到配对的右括号之后的位置。
+    ///
+    /// 跳过字符串字面量里的括号：`Message::args("已完成（{count} 项）", …)`
+    /// 里那个全角括号不是问题，但 `Message::verbatim("a) b")` 里的半角括号是——
+    /// 不跳过就会数错配对，把后面一大段源码当成调用内容扫进来。
+    fn call_end(text: &str, open: usize) -> usize {
+        let bytes = text.as_bytes();
+        let mut depth = 0usize;
+        let mut i = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        match bytes[i] {
+                            b'\\' => i += 2,
+                            b'"' => break,
+                            _ => i += 1,
+                        }
+                    }
+                }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        text.len()
+    }
+
+    /// `from..to` 区间里所有**含中文**的字符串字面量（已解转义）。
+    ///
+    /// 只收含中文的：key 恒为中文原文，纯英文的实参不是 key
+    /// （比如 `("name", display_name(path))` 里的格式名）。
+    fn chinese_literals(text: &str, from: usize, to: usize) -> Vec<&str> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = from;
+        while i < to {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' => break,
+                    _ => i += 1,
+                }
+            }
+            let end = i.min(bytes.len());
+            if end <= to {
+                let raw = &text[start..end];
+                if raw.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+                    out.push(raw);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// 字节下标所在行的**一基**行号，报错信息里给人看的。
+    fn line_of(text: &str, at: usize) -> usize {
+        text[..at.min(text.len())].matches('\n').count() + 1
     }
 
     /// 扫不出来的 key，及原因。

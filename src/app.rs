@@ -3132,6 +3132,14 @@ impl WFilesApp {
                 .into_any_element()
         } else if let Some(message) = self.ops.read(cx).last_message() {
             div()
+                // 这句是 i18n 的最后一道关口：`.say(cx)` 而不是
+                // `.to_string()`（后者恒给中文，英文界面下整栏不变）。
+                // 挂着 id + `test_support` 是因为**没有它们就没人能验它**——
+                // 「进度栏在英文界面下说英文」这条判据需要一个能读到的入口，
+                // 而这是唯一一处能把那句话原样取出来的元素。
+                .id("status-message")
+                .test_support()
+                .aria_label(message.say(cx))
                 .flex_1()
                 .min_w_0()
                 .truncate()
@@ -3141,7 +3149,7 @@ impl WFilesApp {
                 } else {
                     muted
                 })
-                .child(message.to_string())
+                .child(message.say(cx))
                 .into_any_element()
         } else {
             div().flex_1().into_any_element()
@@ -3205,7 +3213,7 @@ impl WFilesApp {
                 .ghost()
                 .small()
                 .icon(IconName::RotateCw)
-                .tooltip(label)
+                .tooltip(label.say(cx))
                 .on_click(
                     cx.listener(|this, _, _, cx| this.ops.update(cx, |ops, cx| ops.retry(cx))),
                 )
@@ -3248,16 +3256,30 @@ impl WFilesApp {
             // "能撤什么"，不负责读全。
             .max_w(px(260.))
             .tooltip(match &undo_label {
-                Some(label) => format!("撤销：{label}（Cmd+Z）"),
-                None => "暂无可撤销的操作".to_string(),
+                Some(label) => {
+                    crate::i18n::tr_args(cx, "撤销：{what}（Cmd+Z）", &[("what", label.say(cx))])
+                }
+                None => crate::i18n::tr(cx, "暂无可撤销的操作"),
             })
             .disabled(!has_undo)
             .when(has_undo, |button| {
-                button.label(undo_label.clone().unwrap_or_default())
+                button.label(Self::undo_text(&undo_label, cx))
             })
             .on_click(
                 cx.listener(|this, _, _, cx| this.ops.update(cx, |ops, cx| ops.request_undo(cx))),
             );
+
+        // 按钮的可见标签不进无障碍名（`ElementSnapshot::label()` 对带 tooltip
+        // 的按钮一律返回 None），所以外面套一层 div 把无障碍名挂上去：
+        // 撤销按钮的文案是 `describe()` 拼出来的完整描述，
+        // 「英文界面下它说英文」这条判据得有入口才能验。
+        let undo_button: AnyElement = div()
+            .id("undo-label")
+            .test_support()
+            .aria_label(Self::undo_text(&undo_label, cx))
+            .flex_shrink_0()
+            .child(undo_button)
+            .into_any_element();
 
         h_flex()
             .id("status-bar")
@@ -3276,6 +3298,15 @@ impl WFilesApp {
             .child(undo_button)
     }
 
+    /// 撤销按钮的文案。有历史才给 `Some`。
+    ///
+    /// 单独一个函数是因为同一句话要在两处用：`Button::label` 拿可见文案，
+    /// 外层 div 的 `aria_label` 拿无障碍名——两处得是同一句，
+    /// 所以不能让它们各自调一次 `say`（万一有人只改一处就漏了）。
+    fn undo_text(label: &Option<crate::i18n::Msg>, cx: &App) -> String {
+        label.as_ref().map(|it| it.say(cx)).unwrap_or_default()
+    }
+
     /// 半透明遮罩 + 居中卡片。确认、冲突、输入、批量重命名、连接五类对话框共用。
     ///
     /// 点遮罩等于取消；卡片内部的点击不会传到遮罩上。
@@ -3292,7 +3323,7 @@ impl WFilesApp {
     ///   做法是正文那一段自己滚，页脚留在卡片底部——**"确认/取消"永远在、
     ///   永远点得到**，这是对话框唯一不能缺的东西。
     fn overlay_card(
-        title: String,
+        title: crate::i18n::Msg,
         width: Pixels,
         cx: &mut Context<Self>,
         body: AnyElement,
@@ -3354,7 +3385,19 @@ impl WFilesApp {
                     // 都会"漏"到遮罩上把对话框关掉（连接失败那句话刚写进去就没了）。
                     // 这里在卡片上收住：按钮先执行，卡片把事件掐断，遮罩收不到。
                     .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
-                    .child(div().font_semibold().flex_shrink_0().child(title))
+                    .child(
+                        div()
+                            // 标题也是文案，`say(cx)` 不是 `to_string()`。
+                            // id + `test_support` 让「对话框在英文界面下说英文」
+                            // 这条判据有入口可读——五类对话框共用这张卡，
+                            // 改一处就同时改了五处，得能验。
+                            .id("overlay-title")
+                            .test_support()
+                            .aria_label(title.say(cx))
+                            .font_semibold()
+                            .flex_shrink_0()
+                            .child(title.say(cx)),
+                    )
                     // 正文是唯一会自己变长的一段，所以滚动放在它身上：
                     // 标题与页脚留在原地，页脚里的按钮永远不会被滚走。
                     .child(
@@ -3384,8 +3427,11 @@ impl WFilesApp {
         };
 
         let body = div()
+            .id("confirm-message")
+            .test_support()
+            .aria_label(confirm.message.say(cx))
             .text_sm()
-            .child(confirm.message.clone())
+            .child(confirm.message.say(cx))
             .into_any_element();
         let cancel = Button::new("confirm-cancel")
             .label(crate::i18n::tr(cx, "取消"))
@@ -3394,7 +3440,7 @@ impl WFilesApp {
                 cx.listener(|this, _, _, cx| this.ops.update(cx, |ops, cx| ops.confirm_cancel(cx))),
             )
             .into_any_element();
-        let mut ok = Button::new("confirm-ok").label(confirm.ok_label.clone());
+        let mut ok = Button::new("confirm-ok").label(confirm.ok_label.say(cx));
         ok = if confirm.ok_dangerous {
             ok.danger()
         } else {
@@ -3469,7 +3515,7 @@ impl WFilesApp {
                 .into_any_element();
 
         Self::overlay_card(
-            "名称冲突".to_string(),
+            crate::i18n::Message::msg("名称冲突"),
             px(460.),
             cx,
             body,
@@ -3503,7 +3549,7 @@ impl WFilesApp {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(prompt.label.clone()),
+                    .child(prompt.label.say(cx)),
             )
             .child(Input::new(&input).w_full());
 
@@ -3698,7 +3744,7 @@ impl WFilesApp {
             .into_any_element();
 
         Self::overlay_card(
-            format!("批量重命名（{total} 项）"),
+            crate::i18n::Message::args("批量重命名（{total} 项）", &[("total", total.to_string())]),
             px(620.),
             cx,
             body,
@@ -3855,7 +3901,7 @@ impl WFilesApp {
             .into_any_element();
 
         Self::overlay_card(
-            "连接远程服务器".to_string(),
+            crate::i18n::Message::msg("连接远程服务器"),
             px(460.),
             cx,
             body.into_any_element(),
