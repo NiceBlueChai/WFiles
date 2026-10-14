@@ -5655,3 +5655,249 @@ fn opening_a_hidden_directory_shows_what_is_inside(cx: &mut TestAppContext) {
          否则用户会以为 .config 是空的"
     );
 }
+
+/// 一个有目录也有文件的夹子，用来做收藏测试。
+///
+/// 真名子目录：macOS 上 `tempfile::tempdir()` 给的是 `.tmpXXXX`，
+/// 而"正在看的目录自己是隐藏的就全显示"那条规则会让它整个漏进来。
+/// 里面的**行序**是 `projects`(0) / `aaa.txt`(1) / `notes.md`(2)——
+/// 目录排在文件前面，不是纯按字母序。写行号期望值时按这个来。
+fn dir_to_favorite() -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::create_dir(dir.join("projects")).expect("建目录");
+    std::fs::write(dir.join("notes.md"), "x").expect("造文件");
+    std::fs::write(dir.join("aaa.txt"), "x").expect("造文件");
+    (root, dir)
+}
+
+/// 侧栏「收藏」段列出的那些名字。
+fn sidebar_favorites(window: &mut gpui_kit::Window) -> Vec<String> {
+    let mut names = Vec::new();
+    for index in 0usize..16 {
+        let Some(row) = window.try_find(("favorite", index)) else {
+            break;
+        };
+        names.push(row.label().unwrap_or_default().to_string());
+    }
+    names
+}
+
+/// 按 Cmd+D 把选中的那一项收进侧栏，再按一次拿掉。
+///
+/// 判据是**侧栏里真的多了一行**、再按一次真的少了一行，不是设置里的
+/// 数组长度：设置写对了而 `PaneEvent::FavoritesChanged` 没接上，
+/// 数组照样变长，界面却纹丝不动。
+#[gpui_kit::test]
+fn cmd_d_puts_the_selection_in_the_sidebar_and_takes_it_back_out(cx: &mut TestAppContext) {
+    let (_root, dir) = dir_to_favorite();
+    let (_session, handle) = open_in(cx, &dir);
+
+    let before = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 一项都没收藏时整段都不该在（空分组比没有更烦人）。
+        (
+            sidebar_favorites(window),
+            a11y_label_at(window, "sidebar-favorites"),
+        )
+    });
+    assert!(
+        before.0.is_empty() && before.1.is_empty(),
+        "还没收藏任何东西时不该有「收藏夹」这一段，实际 {:?} / {:?}",
+        before.0,
+        before.1
+    );
+
+    // 选中第一行（升序是 projects 目录，它排在最前面）再按 Cmd+D。
+    step(cx, handle, |window, cx| {
+        window.click(("row-name", 0usize), cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-d", cx);
+        settle(window, cx);
+    });
+
+    let after = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        sidebar_favorites(window)
+    });
+    assert_eq!(
+        after,
+        vec!["projects"],
+        "按了 Cmd+D 之后侧栏该多出这一行，实际 {after:?}"
+    );
+
+    // 再按一次：拿掉。不是"移到最后"——收藏栏里该没有它了。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-d", cx);
+        settle(window, cx);
+    });
+    let back = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        sidebar_favorites(window)
+    });
+    assert!(back.is_empty(), "再按一次该取消收藏，实际还剩 {back:?}");
+}
+
+/// 收藏**文件**也认：用户 2026-10-14 明确选了"文件也能收"。
+#[gpui_kit::test]
+fn a_file_can_be_favorited_too(cx: &mut TestAppContext) {
+    let (_root, dir) = dir_to_favorite();
+    let (_session, handle) = open_in(cx, &dir);
+
+    // notes.md 是第 2 行（目录 projects 排最前，然后 aaa.txt、notes.md）。
+    step(cx, handle, |window, cx| {
+        window.click(("row-name", 2usize), cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-d", cx);
+        settle(window, cx);
+    });
+
+    let after = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        sidebar_favorites(window)
+    });
+    assert_eq!(
+        after,
+        vec!["notes.md"],
+        "文件也该能收进侧栏，实际 {after:?}"
+    );
+    // 收藏那一刻它是不是目录，得原样存着——点它才会走"打开"那条路。
+    let stored = cx.update(|cx| Settings::read(cx).favorites);
+    assert_eq!(stored.len(), 1);
+    assert!(!stored[0].is_dir, "收藏的是文件，别把它记成目录");
+}
+
+/// 收藏是**新的排在最上面**（用户拍板"加入顺序，新的在最上"）。
+#[gpui_kit::test]
+fn the_newest_favorite_comes_first(cx: &mut TestAppContext) {
+    let (_root, dir) = dir_to_favorite();
+    let (_session, handle) = open_in(cx, &dir);
+
+    for row in [0usize, 1usize, 2usize] {
+        step(cx, handle, |window, cx| {
+            window.click(("row-name", row), cx);
+            settle(window, cx);
+        });
+        step(cx, handle, |window, cx| {
+            window.press("cmd-d", cx);
+            settle(window, cx);
+        });
+    }
+
+    let after = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        sidebar_favorites(window)
+    });
+    // 依次收藏第 0、1、2 行 = projects、aaa.txt、notes.md，
+    // 所以最后收藏的 notes.md 该排最前面。
+    assert_eq!(
+        after,
+        vec!["notes.md", "aaa.txt", "projects"],
+        "最后收藏的那个该排在最前面，实际 {after:?}"
+    );
+}
+
+/// 没选中东西时按 Cmd+D 要说清楚为什么，而不是默默什么都不做。
+#[gpui_kit::test]
+fn favoriting_nothing_says_why(cx: &mut TestAppContext) {
+    let (_root, dir) = dir_to_favorite();
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-d", cx);
+        settle(window, cx);
+    });
+
+    // 读 `pane-status` 而不是 `status-message`：后者是 App 那条
+    // "操作结果"消息的 id，而窗格自己写进 `self.status` 的那句
+    // 挂在 `pane-status` 上（见 `render_footer`）。
+    let said = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "pane-status")
+    });
+    assert!(
+        said.contains("先选中"),
+        "该告诉用户先选中一项，实际 {said:?}"
+    );
+}
+
+/// 后开的窗口认设置里已经有的收藏。
+///
+/// **为什么不是"收藏栏会当场刷新"**：这个台架测不出来。`settle()` 直接调
+/// `window.render_frame()`，那会把窗口根实体整个重画一遍——于是"App
+/// 有没有被通知"在这里是隐形的。把 `app::init` 里那句
+/// `observe_global::<Settings>` 删掉，上面那 7 条收藏测试照样全绿，
+/// 而真实运行时用户按了 Cmd+D 侧栏会纹丝不动。
+///
+/// 所以判据落在**不依赖重画时机**的那一层：新开一扇窗，它的侧栏是从
+/// 设置里读的。这条覆盖了"设置是全局的、跨窗口共享、且真的被读"，
+/// 覆盖不了"当帧刷新"——后者靠 `observe_global` 那行（机制已查证：
+/// `Settings::update` → `update_global` → `default_global` 推
+/// `NotifyGlobalObservers` effect，见 gpui-pre 的 `app.rs`）。
+#[gpui_kit::test]
+fn a_later_window_reads_the_favorites_already_stored(cx: &mut TestAppContext) {
+    let (_root, dir) = dir_to_favorite();
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        window.click(("row-name", 0usize), cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-d", cx);
+        settle(window, cx);
+    });
+
+    // 第二扇窗：收藏是全局的，新窗不该从零开始。
+    let handle2 = open_app(cx);
+    let after = step_value(cx, handle2, |window, cx| {
+        settle(window, cx);
+        sidebar_favorites(window)
+    });
+    assert_eq!(
+        after,
+        vec!["projects"],
+        "后开的窗口该也看到这一条收藏，实际 {after:?}"
+    );
+    assert!(
+        cx.read(|cx| Settings::read(cx).is_favorite(&dir.join("projects"))),
+        "收藏该落在设置里（新窗口读的就是它）"
+    );
+}
+
+/// 点收藏项里的**目录**就该进去。
+#[gpui_kit::test]
+fn clicking_a_favorite_folder_goes_there(cx: &mut TestAppContext) {
+    let (_root, dir) = dir_to_favorite();
+    std::fs::write(dir.join("projects").join("inner.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        window.click(("row-name", 0usize), cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-d", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.click(("favorite", 0usize), cx);
+        settle(window, cx);
+    });
+
+    let names = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        row_names(window)
+    });
+    assert_eq!(
+        names,
+        vec!["inner.txt"],
+        "点收藏的目录该进去并看到里面的东西，实际 {names:?}"
+    );
+}

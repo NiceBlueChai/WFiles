@@ -108,6 +108,10 @@ pub fn defaults(command: PaneCommand) -> &'static [&'static str] {
         // GNOME Files、Nautilus 都是它）。Windows 习惯 Ctrl+H，但全项目
         // 的键位都用 `cmd-` 前缀描述，跟那一套保持一致更省解释。
         PaneCommand::ToggleHidden => &["cmd-shift-."],
+        // Cmd+D 是 macOS 与 Linux 上的老键位（Finder 的"加入书签"、
+        // GNOME Files 的"收藏夹"都是它）。Windows 习惯 Ctrl+D，但全项目
+        // 的键位都用 `cmd-` 前缀描述，跟那一套保持一致更省解释。
+        PaneCommand::ToggleFavorite => &["cmd-d"],
     }
 }
 

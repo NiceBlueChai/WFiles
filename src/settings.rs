@@ -79,6 +79,27 @@ pub struct Settings {
     /// （进了 `.config` 就把它里面的全显示出来），不写进这份设置。
     #[serde(default)]
     pub show_hidden: bool,
+    /// 侧栏「收藏」段里的那些项，**新的排在最前面**。
+    ///
+    /// 存的是路径加"收藏那一刻它是不是目录"，不存显示名：
+    /// 名字从 `file_name()` 推，跟标签栏同一套做法——用户把文件夹改了名，
+    /// 收藏栏里跟着变，不需要在这里留一份会过期的副本。
+    #[serde(default)]
+    pub favorites: Vec<Favorite>,
+}
+
+/// 侧栏里收藏的一项。
+///
+/// **为什么存 `is_dir` 而不每次去问磁盘**：侧栏每一帧都要渲染这一段，
+/// 十几次 `stat` 换来的是"列表刷新时才发现路径没了"。更重要的是
+/// **收藏的目录被删掉之后**（用户明确选了"照旧显示，点进去才报"）：
+/// `path.is_dir()` 此时会返回 false，于是点它会去叫系统打开一个
+/// 不存在的目录，报出来的是"没有.application 能打开它"——那是误导。
+/// 记下收藏那一刻的判断，点击时才知道用户当初收藏的是个目录。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Favorite {
+    pub path: PathBuf,
+    pub is_dir: bool,
 }
 
 /// 一个存下来的搜索。
@@ -167,6 +188,7 @@ impl Default for Settings {
             meta_column: String::new(),
             speed_limit: 0,
             show_hidden: false,
+            favorites: Vec::new(),
             // 空串 = "跟着系统走"。不是直接写死中文：一份英文系统上刚装好
             // 就该是英文，让用户自己去设置里挑语言是把默认值做成了默认值。
             locale: String::new(),
@@ -265,11 +287,36 @@ impl Settings {
         self.folder_views.insert(0, FolderView { path, sort, view });
     }
 
+    /// 这一项在不在收藏里。
+    pub fn is_favorite(&self, path: &Path) -> bool {
+        self.favorites.iter().any(|it| it.path == path)
+    }
+
+    /// 收藏 / 取消收藏这一个路径，返回切换之后它**在不在**收藏里。
+    ///
+    /// 收藏就**插到最前面**（用户 2026-10-14 拍板"加入顺序，新的在最上"）：
+    /// 新收藏的那个最可能是他刚要用的，而收藏多了自然等于常用位置——
+    /// 这也是「最近文件」不单独做的理由。
+    ///
+    /// 已在收藏里时取消它**不重排**（不移到末尾）：取消不是一次"添加"，
+    /// 把它的位置换掉会让用户以为自己弄丢了顺序。
+    pub fn toggle_favorite(&mut self, path: PathBuf, is_dir: bool) -> bool {
+        match self.favorites.iter().position(|it| it.path == path) {
+            Some(position) => {
+                self.favorites.remove(position);
+                false
+            }
+            None => {
+                self.favorites.insert(0, Favorite { path, is_dir });
+                true
+            }
+        }
+    }
+
     /// 按名字找一条存下来的搜索。
     pub fn saved_search(&self, name: &str) -> Option<&SavedSearch> {
         self.saved_searches.iter().find(|it| it.name == name)
     }
-
     /// 存一条搜索。同名就覆盖——用户改了查询又存一次，多半是想换掉旧的。
     ///
     /// 名字是空的就不存：一条没有名字的保存搜索在界面上没法点。
@@ -558,6 +605,72 @@ mod tests {
             loaded.view_for(&PathBuf::from("/a")).map(|view| view.view),
             Some(ViewMode::List)
         );
+    }
+
+    #[test]
+    fn a_favorite_goes_to_the_front_and_comes_back_out() {
+        let mut stored = Settings::default();
+        assert!(!stored.is_favorite(&PathBuf::from("/a")));
+
+        assert!(
+            stored.toggle_favorite(PathBuf::from("/a"), true),
+            "第一次是收藏"
+        );
+        assert!(stored.is_favorite(&PathBuf::from("/a")));
+        assert_eq!(stored.favorites.len(), 1);
+        // 收藏那一刻它是不是目录，得原样记下来。
+        assert!(stored.favorites[0].is_dir);
+
+        // 新的排在最前面（用户拍板"加入顺序，新的在最上"）。
+        stored.toggle_favorite(PathBuf::from("/b"), false);
+        assert_eq!(stored.favorites[0].path, PathBuf::from("/b"));
+        assert_eq!(stored.favorites[1].path, PathBuf::from("/a"));
+        assert!(!stored.favorites[0].is_dir, "文件也收，得记住它是文件");
+
+        assert!(
+            !stored.toggle_favorite(PathBuf::from("/b"), false),
+            "再按是取消"
+        );
+        assert!(!stored.is_favorite(&PathBuf::from("/b")));
+        assert_eq!(
+            stored.favorites[0].path,
+            PathBuf::from("/a"),
+            "取消不该把剩下的重排——那会让用户以为顺序被弄丢了"
+        );
+        assert_eq!(stored.favorites.len(), 1);
+    }
+
+    #[test]
+    fn favorites_survive_the_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        let mut stored = settings();
+        stored.toggle_favorite(PathBuf::from("/Users/me/项目"), true);
+        stored.toggle_favorite(PathBuf::from("/Users/me/notes.md"), false);
+
+        stored.save_to(&path).unwrap();
+        let loaded = Settings::load_from(&path).expect("读回来");
+
+        assert_eq!(loaded.favorites, stored.favorites);
+        assert_eq!(
+            loaded.favorites[0].path,
+            PathBuf::from("/Users/me/notes.md")
+        );
+        assert!(loaded.is_favorite(&PathBuf::from("/Users/me/项目")));
+    }
+
+    #[test]
+    fn an_old_settings_file_without_favorites_still_loads() {
+        // 收藏是新加的：升级上来的人那份配置里没有这个字段，
+        // 读出来必须是空的，不能报"配置损坏"——那会把用户的终端、
+        // 标记、快捷键一起弄丢。
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        std::fs::write(&path, r#"{"terminal":"auto"}"#).unwrap();
+
+        let loaded = Settings::load_from(&path).expect("老配置也要读得进");
+        assert!(loaded.favorites.is_empty());
+        assert!(!loaded.is_favorite(&PathBuf::from("/a")));
     }
 
     #[test]

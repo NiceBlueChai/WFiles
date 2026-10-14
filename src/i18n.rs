@@ -1397,6 +1397,28 @@ static EN: &[(&str, &str)] = &[
     ("隐藏隐藏项", "Hide Hidden Items"),
     // 工具栏那颗按钮把动作跟快捷键拼在一起。
     ("{action}（Cmd+Shift+.）", "{action} (Cmd+Shift+.)"),
+    // ---- 收藏 ----
+    //
+    // 分段标题用「收藏夹」而不是「收藏」：分段标题与菜单项如果共用一个
+    // 中文 key，英文表就只能给一个答案（按 key 索引，重复条目后写的
+    // 静默赢）——"Favorites"当标题对、"Add to Favorites"当菜单项也对，
+    // 二选一就是另一个界面上写错。分成两个词就绕开了。
+    ("收藏夹", "Favorites"),
+    ("收藏 / 取消收藏", "Add / Remove from Favorites"),
+    ("收藏", "Add to Favorites"),
+    ("取消收藏", "Remove from Favorites"),
+    ("已收藏 {name}", "Added “{name}” to Favorites"),
+    ("已取消收藏 {name}", "Removed “{name}” from Favorites"),
+    // 这两条都只在状态栏出现，区分"没选东西"与"选了一堆"：
+    // 后者是"这次操作没法做"，不是"你还没选"。
+    (
+        "先选中一个项目再收藏",
+        "Select one item to add it to Favorites",
+    ),
+    (
+        "一次只能收藏一个项目",
+        "Only one item can be favorited at a time",
+    ),
 ];
 
 /// 英文表里有没有漏掉不该出现的条目：译文等于原文（等于没翻），

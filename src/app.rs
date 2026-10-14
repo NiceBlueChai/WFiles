@@ -347,6 +347,21 @@ impl WFilesApp {
             secret_note: None,
         };
 
+        // 侧栏的「收藏」段读的是设置，而设置是**窗格**改的（Cmd+D 在窗格上）。
+        // 窗格 notify 只重画窗格，侧栏在 App 上，不重画就纹丝不动。
+        //
+        // 这里观察**设置这个全局**而不是等窗格来报：`Settings::update`
+        // 走 GPUI 的 `update_global`，它会推一个 `NotifyGlobalObservers`
+        // effect（见 gpui-pre 的 `default_global`），观察者一律被叫醒。
+        // 好处是**以后再加设置字段自动生效**——侧栏、工具栏、详情板
+        // 都从设置里读东西，靠"记得在每个改动处通知 App"必然漏一处，
+        // 而漏掉的那处症状是"改了设置界面没反应"，极难定位。
+        //
+        // `Subscription` 存在 `subscriptions` 里（不能 `let _ =` 丢掉）：
+        // 它一析构就注销，整条接线静默失效——而症状跟没接线一模一样
+        // （见下面 `settings_changes_wake_the_app` 那条测试的注释）。
+        app.subscriptions
+            .push(cx.observe_global::<Settings>(|_window, cx| cx.notify()));
         app.subscriptions.push(cx.subscribe_in(
             &ops,
             window,
@@ -357,11 +372,7 @@ impl WFilesApp {
                 tab,
                 window,
                 |this, pane, event: &PaneEvent, window, cx| {
-                    this.sync_session(cx);
-                    match event {
-                        PaneEvent::Navigated => this.mirror_navigation(pane, window, cx),
-                        PaneEvent::Focused => this.note_focus(pane, cx),
-                    }
+                    this.on_pane_event(pane, event, window, cx);
                 },
             ));
         }
@@ -623,6 +634,7 @@ impl WFilesApp {
                     )
                     .children(items),
             )
+            .child(self.render_favorites_section(cx))
             .child(self.render_volumes_section(cx))
             .child(self.render_cloud_section(cx))
             .child(self.render_remote_section(cx))
@@ -651,7 +663,7 @@ impl WFilesApp {
     /// 每一项都还能点回去，标签写不进就靠 tooltip 与无障碍名。
     fn render_sidebar_collapsed(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.tabs[self.active].read(cx).path().to_path_buf();
-        let places: Vec<AnyElement> = Self::places()
+        let mut places: Vec<AnyElement> = Self::places()
             .into_iter()
             .enumerate()
             .map(|(index, (label, icon, path))| {
@@ -671,6 +683,39 @@ impl WFilesApp {
                     .into_any_element()
             })
             .collect();
+
+        // 收藏也一个都不少（同上那条理由）：用户自己收藏的东西比
+        // "桌面/文稿"更是他每天要点的地方，收起侧栏就够不着它们
+        // 等于把收藏功能废掉了一半。
+        let favorites = Settings::peek(cx, |settings| settings.favorites.clone());
+        if !favorites.is_empty() {
+            places.push(
+                div()
+                    .id("collapsed-favorites-gap")
+                    .size(px(4.))
+                    .into_any_element(),
+            );
+            places.extend(favorites.iter().enumerate().map(|(index, favorite)| {
+                let target = favorite.path.clone();
+                let is_dir = favorite.is_dir;
+                let label = crate::pane::Pane::short_name_of(&favorite.path);
+                Button::new(("collapsed-favorite", index))
+                    .icon(if is_dir {
+                        IconName::Folder
+                    } else {
+                        IconName::File
+                    })
+                    .ghost()
+                    .small()
+                    .selected(current == favorite.path)
+                    .tooltip(label.clone())
+                    .accessibility_label(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_favorite(target.clone(), is_dir, window, cx);
+                    }))
+                    .into_any_element()
+            }));
+        }
 
         v_flex()
             .w(px(SIDEBAR_COLLAPSED_WIDTH))
@@ -705,6 +750,102 @@ impl WFilesApp {
     /// 空分组比没有更烦人。
     ///
     /// 排在云盘上面：插 U 盘找它是眼下最急的一件事，不该排在云盘后面。
+    /// 侧栏的「收藏」段：用户自己收藏的文件夹与文件。
+    ///
+    /// **一项都没收藏时整块不出现**——跟磁盘、云盘那两段一个道理：
+    /// 空分组比没有更烦人。
+    ///
+    /// 文件和文件夹都收（用户 2026-10-14 拍板）：点文件夹是进去，
+    /// 点文件是交给系统打开，行为跟列表里双击一样。收藏的路径被删了
+    /// 也照样列着——用户明确选了"点进去才报"，静默把配置里的条目删掉
+    /// 是最难查的一类故障。
+    fn render_favorites_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let favorites = Settings::peek(cx, |settings| settings.favorites.clone());
+        if favorites.is_empty() {
+            return div().into_any_element();
+        }
+        let current = self.tabs[self.active].read(cx).path().to_path_buf();
+
+        let rows: Vec<AnyElement> = favorites
+            .iter()
+            .enumerate()
+            .map(|(index, favorite)| {
+                let target = favorite.path.clone();
+                let is_dir = favorite.is_dir;
+                // 收藏项的名字现算：用户把文件夹改了名，这里要跟着变。
+                let label = crate::pane::Pane::short_name_of(&favorite.path);
+                let row = ListItem::new(("favorite", index))
+                    .rounded(cx.theme().radius)
+                    .selected(current == favorite.path)
+                    .accessibility_label(label.clone())
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            // 文件夹与文件给不同的图标：侧栏这一段的图标
+                            // 是唯一的类型提示（行里只有一行字，没有扩展名）。
+                            .child(
+                                Icon::new(if is_dir {
+                                    IconName::Folder
+                                } else {
+                                    IconName::File
+                                })
+                                .size_4(),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(label)),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_favorite(target.clone(), is_dir, window, cx);
+                    }));
+                // 拖到收藏项上 = 拷进去，跟拖到"位置"里的"下载"同理。
+                Self::drop_target(
+                    div().id(("favorite-drop", index)).child(row),
+                    favorite.path.clone(),
+                    cx,
+                )
+                .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .p_2()
+            .gap_1()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .id("sidebar-favorites")
+                    .test_support()
+                    .aria_label(crate::i18n::tr(cx, "收藏夹"))
+                    .child(crate::i18n::tr(cx, "收藏夹")),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// 点了一个收藏项：文件夹进去，文件交给系统打开。
+    ///
+    /// **按收藏那一刻记住的 `is_dir` 决定，不去问磁盘**：路径被删掉之后
+    /// `is_dir()` 会说 false，于是点一个消失了的目录会去叫系统打开它，
+    /// 报出来的是"没有应用能打开"——那是在误导用户（用户看到的是一个
+    /// 明明是文件夹的东西）。
+    ///
+    /// 打开失败的话转给当前窗格去报（[`Pane::open_favorite`]）：状态栏
+    /// 那一句是窗格的字段，App 自己没有第二套错误通路可写。
+    fn open_favorite(
+        &mut self,
+        path: PathBuf,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tabs[self.active].update(cx, |pane, cx| {
+            pane.open_favorite(path, is_dir, window, cx);
+        });
+    }
+
     fn render_volumes_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.tabs[self.active].read(cx).path().to_path_buf();
         let volumes = crate::volumes::detected();
@@ -948,11 +1089,7 @@ impl WFilesApp {
             &tab,
             window,
             |this, pane, event: &PaneEvent, window, cx| {
-                this.sync_session(cx);
-                match event {
-                    PaneEvent::Navigated => this.mirror_navigation(pane, window, cx),
-                    PaneEvent::Focused => this.note_focus(pane, cx),
-                }
+                this.on_pane_event(pane, event, window, cx);
             },
         ));
         self.tabs.push(tab);
@@ -1568,6 +1705,26 @@ impl WFilesApp {
     }
 
     /// 有变化才写盘；写失败不影响使用（下次启动退回默认会话）。
+    /// 窗格广播了一件事过来。
+    ///
+    /// 抽成共用处理器而不是在两处订阅里各写一遍 `match`：新开标签页
+    /// （`open_tab`）与会话恢复（`app::init` 里那个循环）都要接，
+    /// 漏一处的话那条事件就只在某一种来源下有反应——而那种 bug 要等到
+    /// "恢复出来的标签上收藏栏不刷新"才看得出来。
+    fn on_pane_event(
+        &mut self,
+        pane: &Entity<Pane>,
+        event: &PaneEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_session(cx);
+        match event {
+            PaneEvent::Navigated => self.mirror_navigation(pane, window, cx),
+            PaneEvent::Focused => self.note_focus(pane, cx),
+        }
+    }
+
     fn sync_session(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.snapshot(cx);
         if snapshot == self.saved_session {
@@ -2451,6 +2608,9 @@ impl WFilesApp {
             PaneCommand::EditRemote => pane.edit_remote_enabled(),
             // 标记是对一个文件做的事，多选时说不清该标谁。
             PaneCommand::Mark => selected == 1,
+            // 收藏同理：多选时"收藏"还是"取消收藏"取决于其中有几项已经
+            // 在里面，同一个键做两件相反的事说不清。
+            PaneCommand::ToggleFavorite => pane.favorite_enabled(),
             _ => true,
         }
     }
@@ -2645,6 +2805,15 @@ impl WFilesApp {
                 Self::shortcut_of(command, cx),
                 view,
                 "hidden dotfile 点文件 隐藏 显示 dot 隐式",
+            ),
+            // 同样是中性说法：面板这一条走纯函数路径，能拿到选中项
+            // （`favorite_enabled` 在下面单独判），但拿不到"当前这一项
+            // 收藏了没有"——那要让用户自己在标题里猜，反而不如写中性。
+            PaneCommand::ToggleFavorite => (
+                crate::i18n::tr(cx, "收藏 / 取消收藏"),
+                Self::shortcut_of(command, cx),
+                files,
+                "favorite 收藏 书签 bookmark 常用 侧栏",
             ),
         }
     }

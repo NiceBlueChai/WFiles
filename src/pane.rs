@@ -127,6 +127,7 @@ gpui_kit::actions!(
         Analyze,
         EditRemote,
         ToggleHidden,
+        ToggleFavorite,
     ]
 );
 
@@ -196,6 +197,7 @@ fn key_binding_for(
         PaneCommand::Analyze => KeyBinding::new(key, Analyze, context),
         PaneCommand::EditRemote => KeyBinding::new(key, EditRemote, context),
         PaneCommand::ToggleHidden => KeyBinding::new(key, ToggleHidden, context),
+        PaneCommand::ToggleFavorite => KeyBinding::new(key, ToggleFavorite, context),
     })
 }
 
@@ -247,11 +249,13 @@ pub enum PaneCommand {
     EditRemote,
     /// 显示 / 隐藏以 `.` 开头的那些项。
     ToggleHidden,
+    /// 收藏 / 取消收藏选中的那一项（在侧栏「收藏」段里露出来）。
+    ToggleFavorite,
 }
 
 impl PaneCommand {
     /// 全部命令。配置层与命令面板都靠它枚举，加一条命令只改这一处。
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::NewFolder,
         Self::Rename,
         Self::BulkRename,
@@ -276,6 +280,7 @@ impl PaneCommand {
         Self::Analyze,
         Self::EditRemote,
         Self::ToggleHidden,
+        Self::ToggleFavorite,
     ];
 
     /// 配置文件里用的名字。
@@ -308,6 +313,7 @@ impl PaneCommand {
             Self::Analyze => "analyze",
             Self::EditRemote => "edit_remote",
             Self::ToggleHidden => "toggle_hidden",
+            Self::ToggleFavorite => "toggle_favorite",
         }
     }
 
@@ -343,6 +349,7 @@ impl PaneCommand {
             Self::Analyze => "analyze 分析 大小 重复 校验和 md5 sha 快捷键 按键 keybinding",
             Self::EditRemote => "edit 编辑 remote 远程 回传 上传 快捷键 按键 keybinding",
             Self::ToggleHidden => "hidden dotfile 点文件 隐藏 显示 dot 快捷键 按键 keybinding",
+            Self::ToggleFavorite => "favorite 收藏 书签 bookmark 常用 侧栏 快捷键 按键 keybinding",
         }
     }
 }
@@ -2124,6 +2131,7 @@ impl Pane {
             PaneCommand::Analyze => self.toggle_analyze(window, cx),
             PaneCommand::EditRemote => self.edit_remote(cx),
             PaneCommand::ToggleHidden => self.toggle_hidden(cx),
+            PaneCommand::ToggleFavorite => self.toggle_favorite(cx),
         }
     }
 
@@ -2151,6 +2159,91 @@ impl Pane {
         crate::settings::Settings::update(cx, |settings| settings.show_hidden = show);
         self.update_status(cx);
         cx.notify();
+    }
+
+    /// 收藏 / 取消收藏选中的那一项。
+    ///
+    /// **只对单个选中项生效**（用户 2026-10-14 拍板「Cmd+D 再按一次取消」）：
+    /// 收藏是侧栏里一条一条的列表，多选时"收藏"还是"取消收藏"取决于
+    /// 其中有几项已经在里面——同一个键在两种状态下做两件相反的事，
+    /// 用户按之前得先数一遍。与其这样，不如把原因写进状态栏。
+    ///
+    /// `is_dir` 取自**当前列表里的那一项**，不是去问磁盘：列表已经读过了，
+    /// 再 `stat` 一次是白花钱。收藏的项后来被删了也不会走到这条路——
+    /// 它还在设置里，删不掉。
+    pub fn toggle_favorite(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.selection.single().map(PathBuf::from) else {
+            // 分清"没选"和"选了一堆"：前者是提示，后者是这次操作没法做。
+            self.status = crate::i18n::tr(
+                cx,
+                if self.selection.is_empty() {
+                    "先选中一个项目再收藏"
+                } else {
+                    "一次只能收藏一个项目"
+                },
+            );
+            cx.notify();
+            return;
+        };
+        let is_dir = self.listing.entry(&path).is_some_and(|entry| entry.is_dir);
+        let now_favorite = crate::settings::Settings::update(cx, |settings| {
+            settings.toggle_favorite(path.clone(), is_dir)
+        });
+        self.status = crate::i18n::tr_args(
+            cx,
+            if now_favorite {
+                "已收藏 {name}"
+            } else {
+                "已取消收藏 {name}"
+            },
+            &[("name", Self::short_name_of(&path))],
+        );
+        // 只重画**这个窗格**：侧栏那一段画在 App 上，而 App 观察着
+        // 设置这个全局（`app::init` 里的 `observe_global::<Settings>`），
+        // 上面那句 `Settings::update` 已经让它重画了。
+        cx.notify();
+    }
+
+    /// 一个路径在界面上叫什么：文件名那一段，没有就用整条路径。
+    ///
+    /// 收藏项不存名字（存了就会和用户改名的结果对不上），所以每次
+    /// 显示都现算。跟标签栏、标记浮层用的是同一套。
+    pub fn short_name_of(path: &std::path::Path) -> String {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    /// 打开一个侧栏收藏项：目录进去，文件交给系统打开。
+    ///
+    /// `is_dir` 由调用方给（它读的是收藏那一刻记下的值），**不重新 stat**：
+    /// 收藏的路径被删掉之后 `path.is_dir()` 会说 false，于是点它会去叫
+    /// 系统打开一个不存在的目录，报出来的是"没有应用能打开它"——
+    /// 用户看到的是一个明明是文件夹的东西，那条提示在误导他。
+    pub fn open_favorite(
+        &mut self,
+        path: PathBuf,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if is_dir {
+            self.navigate_to(path, true, window, cx);
+            return;
+        }
+        if let Err(error) = open::that(&path) {
+            self.error = Some(error.into());
+            self.update_status(cx);
+            cx.notify();
+        }
+    }
+
+    /// 选中的是不是一个能收藏的项。
+    ///
+    /// 命令面板与工具栏菜单靠它决定这条命令亮不亮：没选中或选了
+    /// 一堆的时候列一条"收藏"，用户按下只会看到一句解释。
+    pub fn favorite_enabled(&self) -> bool {
+        self.selection.single().is_some()
     }
 
     // ---- 目录监听与外部变更 ----
@@ -2491,6 +2584,18 @@ impl Pane {
         let quick_look = self.quick_look_target().is_some();
         let archive_is_zip = self.archive_target().is_some();
         let me = self.me.clone();
+        // 收藏这一项的可用性与文案都要**在菜单闭包体内**算（`Fn`，每帧
+        // 重建一次）：算在外面就成了"打开菜单那一刻"的状态。
+        //
+        // 只把**选中路径本身**（owned）带进闭包，不带 `self` 引用——
+        // `dropdown_menu` 要求 `'static`，闭包里借用 `self` 编译不过。
+        let favorite_enabled = self.favorite_enabled();
+        let favorite_path = self.selection.single().map(PathBuf::from);
+        let favorite_is_set = move |cx: &gpui_kit::App| {
+            favorite_path
+                .as_ref()
+                .is_some_and(|path| Settings::peek(cx, |s| s.is_favorite(path)))
+        };
 
         Button::new("op-more")
             .icon(IconName::Ellipsis)
@@ -2511,6 +2616,7 @@ impl Pane {
                 let me_term = me.clone();
                 let me_archive = me.clone();
                 let me_hidden = me.clone();
+                let me_favorite = me.clone();
 
                 menu.item(
                     PopupMenuItem::new(crate::i18n::tr(cx, "重命名"))
@@ -2605,6 +2711,22 @@ impl Pane {
                     .icon(IconName::EyeOff)
                     .on_click(move |_, _, cx| {
                         run_on_pane(&me_hidden, cx, |pane, cx| pane.toggle_hidden(cx));
+                    }),
+                )
+                .separator()
+                // 跟上面那条同一个思路：**写「按下之后会变成什么」**。
+                // 选中项已经在收藏里时写「取消收藏」，否则写「收藏」。
+                // 状态要在**闭包体内**读（同上，`shows_hidden` 那条理由）。
+                .item(
+                    PopupMenuItem::new(if favorite_is_set(cx) {
+                        crate::i18n::tr(cx, "取消收藏")
+                    } else {
+                        crate::i18n::tr(cx, "收藏")
+                    })
+                    .icon(IconName::Star)
+                    .disabled(!favorite_enabled)
+                    .on_click(move |_, _, cx| {
+                        run_on_pane(&me_favorite, cx, |pane, cx| pane.toggle_favorite(cx));
                     }),
                 )
             })
@@ -3897,6 +4019,7 @@ impl Pane {
                 this.run_command(PaneCommand::EditRemote, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleHidden, _, cx| this.toggle_hidden(cx)))
+            .on_action(cx.listener(|this, _: &ToggleFavorite, _, cx| this.toggle_favorite(cx)))
             .child(self.render_width_probe())
             .when(self.view == ViewMode::List, |body| {
                 body.child(self.render_header(cx))
@@ -4205,6 +4328,7 @@ impl Pane {
             // 真正上屏的那两处（工具栏 tooltip、命令面板）走
             // [`Self::hidden_switch_title`]，那一处能读状态。
             PaneCommand::ToggleHidden => "显示 / 隐藏隐藏项",
+            PaneCommand::ToggleFavorite => "收藏 / 取消收藏",
         };
         crate::i18n::tr(cx, text)
     }
