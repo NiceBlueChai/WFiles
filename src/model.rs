@@ -18,6 +18,10 @@ pub struct FileEntry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// 什么时候创建的。**读不到就是 `None`**——Linux 的部分文件系统
+    /// （ext3、早年的 FAT）压根不记这个时间，硬报一个 1970 年的假日期
+    /// 比说"没有"更糟。
+    pub created: Option<SystemTime>,
     /// 预计算的小写名称，避免排序时反复分配。
     sort_name: String,
     /// 预计算的小写扩展名。
@@ -61,6 +65,8 @@ impl FileEntry {
             is_dir,
             size,
             modified: None,
+            // 性能基准只测排序与过滤，不关心时间，给 `None` 最省事。
+            created: None,
             sort_name,
             sort_kind,
         }
@@ -86,6 +92,10 @@ impl FileEntry {
             is_dir: metadata.is_dir(),
             size: metadata.len(),
             modified: metadata.modified().ok(),
+            created: metadata
+                .created()
+                .ok()
+                .filter(|time| *time != SystemTime::UNIX_EPOCH),
             sort_kind,
         })
     }
@@ -108,6 +118,10 @@ impl FileEntry {
     ///
     /// 放在这里而不是 `remote` 里，是为了让"排序、过滤、显示"这一套
     /// 不用管东西是本地的还是远端的。
+    /// **远程条目的创建时间一律 `None`**：S3 与 FTP 的目录列表压根不回
+    /// 这个字段，SFTP 虽然有 `SSH_FILEXFER_ATTR_ACMODTIME`，但那是 mtime
+    /// 不是 birthtime。所以这里**不留参数**——留一个调用方永远传 `None`
+    /// 的参数，等于给"远程也能给创建时间"留一个假口子。
     pub fn remote(
         path: PathBuf,
         name: &str,
@@ -130,6 +144,7 @@ impl FileEntry {
             is_dir,
             size,
             modified,
+            created: None,
         }
     }
 

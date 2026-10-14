@@ -65,6 +65,29 @@ fn absolute(time: SystemTime) -> String {
     format!("{year}-{month:02}-{day:02}")
 }
 
+/// 详情面板里的精确时间：`YYYY-MM-DD HH:MM`。
+///
+/// **跟 [`modified`] 分开是故意的**：那个给列表用，要的是"一眼看出新旧"
+/// （「3 天前」）；详情面板要的是"到底什么时候"，两句话对同一件事
+/// 只会有一句是对的。24 小时制不带秒——秒在这个场景是噪音，而跨平台
+/// 自己算时区会算错（`chrono` 引入的时区数据库在 Windows 上要额外一步）。
+pub fn timestamp(time: Option<SystemTime>) -> String {
+    let Some(time) = time else {
+        return "—".to_string();
+    };
+    let Ok(since_epoch) = time.duration_since(SystemTime::UNIX_EPOCH) else {
+        return "—".to_string();
+    };
+    let seconds = since_epoch.as_secs() as i64;
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    let minute_of_day = seconds.rem_euclid(86_400) / 60;
+    format!(
+        "{year}-{month:02}-{day:02} {:02}:{:02}",
+        minute_of_day / 60,
+        minute_of_day % 60
+    )
+}
+
 /// Howard Hinnant 的 days_from_civil 逆变换，避免为了一个日期引入 chrono。
 fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let z = days_since_epoch + 719_468;
@@ -94,6 +117,27 @@ mod tests {
         assert_eq!(file_size(1536), "1.5 KB");
         assert_eq!(file_size(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(file_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn a_timestamp_says_exactly_when_not_how_long_ago() {
+        // 锚点是 2024-01-01 00:00 UTC = 1704067200（这个数好核对：
+        // 2020-01-01 是 1577836800，之后 4 年 366+365+365+365 天）。
+        // 往后 16 天 9 小时 5 分 = 2024-01-17 09:05。
+        let when = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(1_704_067_200 + 16 * 86_400 + 9 * 3_600 + 5 * 60);
+        assert_eq!(timestamp(Some(when)), "2024-01-17 09:05");
+
+        // 缺时间就是缺时间，别拿 epoch 那个 1970-01-01 顶上去。
+        assert_eq!(timestamp(None), "—");
+    }
+
+    #[test]
+    fn a_timestamp_before_1970_does_not_panic() {
+        // 有些文件系统给得出 1960 年的时间（测试文件、归档解出来的）。
+        // `duration_since` 在这里是 Err，得走"—"那条路而不是 wrap 成 2094。
+        let before = SystemTime::UNIX_EPOCH - Duration::from_secs(86_400 * 400);
+        assert_eq!(timestamp(Some(before)), "—");
     }
 
     #[test]

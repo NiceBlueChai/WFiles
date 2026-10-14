@@ -701,6 +701,7 @@ static EN: &[(&str, &str)] = &[
     ("按{key}{order}", "by {key} {order}"),
     // ---- 窗格：详情面板 ----
     ("详细信息", "Details"),
+    ("创建", "Created"),
     ("修改", "Modified"),
     ("标记", "Tags"),
     ("云盘", "Cloud"),

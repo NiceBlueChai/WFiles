@@ -4088,9 +4088,21 @@ impl Pane {
                     cx,
                 ))
                 .child(detail_row(
+                    "created",
+                    crate::i18n::tr(cx, "创建"),
+                    // 目录与读不到创建时间的文件系统都显示"—"：
+                    // 报一个 1970 年的假日期比说"没有"更糟。
+                    if entry.is_dir {
+                        "—".to_string()
+                    } else {
+                        format::timestamp(entry.created)
+                    },
+                    cx,
+                ))
+                .child(detail_row(
                     "modified",
                     crate::i18n::tr(cx, "修改"),
-                    format::modified(entry.modified),
+                    format::timestamp(entry.modified),
                     cx,
                 ))
                 // 云盘状态只对选中那一项判：判一次要问一次文件系统，

@@ -5656,6 +5656,62 @@ fn opening_a_hidden_directory_shows_what_is_inside(cx: &mut TestAppContext) {
     );
 }
 
+/// 详情面板给出**创建时间**，而且是精确到分的那个，不是「3 天前」。
+///
+/// 判据钉在"精确"上：列表用的 `format::modified` 也会填同一行，
+/// 写一个只验"这一行存在"的测试，两种实现都能过。
+#[gpui_kit::test]
+fn the_details_panel_shows_when_the_file_was_created(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("note.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, dir.path());
+
+    let (created, modified) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+        settle(window, cx);
+        (
+            a11y_label_at(window, "detail-created"),
+            a11y_label_at(window, "detail-modified"),
+        )
+    });
+
+    assert!(
+        created.contains('-') && created.contains(':'),
+        "创建时间该是精确到分的日期时间，实际 {created:?}"
+    );
+    assert!(
+        modified.contains('-') && modified.contains(':'),
+        "详情面板的修改时间也该是精确的（列表才是相对时间），实际 {modified:?}"
+    );
+    // 新建的文件不该报 1970——那是 epoch 顶上去的假日期。
+    assert!(
+        !created.starts_with("1970-01-01"),
+        "刚建的文件不该显示 1970，实际 {created:?}"
+    );
+}
+
+/// 目录没有创建时间可言：显示「—」，不拿 mtime 冒充。
+#[gpui_kit::test]
+fn a_folder_has_no_creation_time_to_show(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::create_dir(dir.path().join("sub")).expect("建目录");
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, dir.path());
+
+    // 目录排在文件前面（排序是目录优先），所以第 0 行就是它。
+    let created = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+        settle(window, cx);
+        a11y_label_at(window, "detail-created")
+    });
+    assert_eq!(
+        created, "—",
+        "目录没有创建时间，显示「—」而不是拿修改时间顶上去"
+    );
+}
+
 /// 一个有目录也有文件的夹子，用来做收藏测试。
 ///
 /// 真名子目录：macOS 上 `tempfile::tempdir()` 给的是 `.tmpXXXX`，
