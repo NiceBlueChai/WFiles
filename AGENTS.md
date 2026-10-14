@@ -68,7 +68,9 @@ cargo fmt --check
 | `src/ui_tests.rs` | 无头窗口 UI 集成测试 |
 | `src/perf.rs` | 性能基准：9 条，钉住 ROADMAP「性能基线」（**看数字要用 `--release`**） |
 | `ROADMAP.md` | 产品路线图：功能范围、阶段划分、明确不做清单 |
-| `docs/cross-platform-filesystem.md` | 三平台文件系统约束调研（文件名/路径/回收站元数据） |
+| `docs/cross-platform-filesystem.md` | 三平台文件系统约束调研（文件名/路径/回收站/元数据） |
+| `.agents/skills/` | 项目级 skill 的规范位置（当前：`gpui-kit`、`gpui-kit-design-guides` 两个官方 skill，改 UI/架构前必读） |
+| `.workbuddy/skills/` | 上面两个 skill 的加载副本（WorkBuddy 只扫这个路径，且扫描跳过符号链接，所以必须是真实目录副本） |
 
 ## 代码铁律（来自 docs/cross-platform-filesystem.md，违反即 bug）
 
