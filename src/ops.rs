@@ -114,7 +114,7 @@ impl Control {
 pub struct Outcome {
     pub done: usize,
     pub skipped: usize,
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<(PathBuf, crate::i18n::Msg)>,
     /// 本次操作实际创建或移动出来的路径，界面刷新用它。
     pub touched: Vec<PathBuf>,
     /// 移动操作的“源 -> 目标”配对，撤销移动要用。
@@ -186,31 +186,39 @@ fn same_file(left: &Path, right: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 /// 用指定的名字新建文件夹；名字已存在时报错，由界面留在输入框里让用户改。
-pub fn create_folder_named(parent: &Path, name: &str) -> Result<PathBuf, String> {
+pub fn create_folder_named(parent: &Path, name: &str) -> Result<PathBuf, crate::i18n::Msg> {
     valid_name(name)?;
     let trimmed = name.trim();
     let path = parent.join(trimmed);
     if path.exists() {
-        return Err(format!("“{trimmed}”已存在"));
+        return Err(crate::i18n::Message::args(
+            "“{trimmed}”已存在",
+            &[("trimmed", trimmed.to_string())],
+        ));
     }
-    fs::create_dir(&path).map_err(|error| format!("无法创建文件夹：{error}"))?;
+    fs::create_dir(&path)
+        .map_err(|error| crate::i18n::Message::caused("无法创建文件夹：{error}", error))?;
     Ok(path)
 }
 
 /// 重命名。只改名字，不换目录。
-pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
+pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, crate::i18n::Msg> {
     valid_name(new_name)?;
     let trimmed = new_name.trim();
 
     let parent = path
         .parent()
-        .ok_or_else(|| "没有父目录，无法重命名".to_string())?;
+        .ok_or_else(|| crate::i18n::Message::msg("没有父目录，无法重命名"))?;
     let target = parent.join(trimmed);
     if target.exists() && !same_file(path, &target) {
-        return Err(format!("“{trimmed}”已存在"));
+        return Err(crate::i18n::Message::args(
+            "“{trimmed}”已存在",
+            &[("trimmed", trimmed.to_string())],
+        ));
     }
 
-    fs::rename(path, &target).map_err(|error| format!("重命名失败：{error}"))?;
+    fs::rename(path, &target)
+        .map_err(|error| crate::i18n::Message::caused("重命名失败：{error}", error))?;
     Ok(target)
 }
 
@@ -235,7 +243,7 @@ pub fn trash(paths: &[PathBuf]) -> Vec<(PathBuf, SystemTime)> {
 /// - macOS：系统不提供查询接口，改为扫描 `~/.Trash` 里同名、且 inode 变更时间
 ///   （ctime，移入回收站会刷新）不早于删除时刻的项，取最新的一个放回。
 ///   这是启发式：万一失败会给出明确错误，让用户去回收站手动放回。
-pub fn restore_from_trash(original: &Path, trashed_at: SystemTime) -> Result<(), String> {
+pub fn restore_from_trash(original: &Path, trashed_at: SystemTime) -> Result<(), crate::i18n::Msg> {
     #[cfg(any(
         target_os = "windows",
         all(
@@ -246,7 +254,7 @@ pub fn restore_from_trash(original: &Path, trashed_at: SystemTime) -> Result<(),
         )
     ))]
     {
-        let items = trash::os_limited::list().map_err(|error| error.to_string())?;
+        let items = trash::os_limited::list().map_err(crate::i18n::Message::from)?;
         let mut matches: Vec<_> = items
             .into_iter()
             .filter(|item| item.original_path() == original)
@@ -254,7 +262,7 @@ pub fn restore_from_trash(original: &Path, trashed_at: SystemTime) -> Result<(),
         // 时间戳越大删除越晚，放回最新的那条。
         matches.sort_by_key(|item| item.time_deleted);
         let Some(item) = matches.pop() else {
-            return Err("回收站里找不到这一项".to_string());
+            return Err(crate::i18n::Message::msg("回收站里找不到这一项"));
         };
         return trash::os_limited::restore_all([item]).map_err(|error| error.to_string());
     }
@@ -262,7 +270,7 @@ pub fn restore_from_trash(original: &Path, trashed_at: SystemTime) -> Result<(),
     #[cfg(target_os = "macos")]
     {
         let trash_dir = dirs::home_dir()
-            .ok_or_else(|| "找不到个人文件夹，无法定位回收站".to_string())?
+            .ok_or_else(|| crate::i18n::Message::msg("找不到个人文件夹，无法定位回收站"))?
             .join(".Trash");
         restore_from_trash_dir(&trash_dir, original, trashed_at)
     }
@@ -274,7 +282,9 @@ pub fn restore_from_trash(original: &Path, trashed_at: SystemTime) -> Result<(),
     )))]
     {
         let _ = (original, trashed_at);
-        Err("这个平台不支持从回收站撤销，请手动打开回收站放回".to_string())
+        Err(crate::i18n::Message::msg(
+            "这个平台不支持从回收站撤销，请手动打开回收站放回",
+        ))
     }
 }
 
@@ -284,12 +294,12 @@ fn restore_from_trash_dir(
     trash_dir: &Path,
     original: &Path,
     trashed_at: SystemTime,
-) -> Result<(), String> {
+) -> Result<(), crate::i18n::Msg> {
     use std::os::unix::fs::MetadataExt as _;
 
     let name = original
         .file_name()
-        .ok_or_else(|| "无法解析原文件名".to_string())?
+        .ok_or_else(|| crate::i18n::Message::msg("无法解析原文件名"))?
         .to_string_lossy()
         .into_owned();
     let (stem, extension) = split_name(&name);
@@ -298,7 +308,7 @@ fn restore_from_trash_dir(
     let cutoff = trashed_at - Duration::from_secs(2);
     let mut best: Option<(i64, PathBuf)> = None;
 
-    let entries = fs::read_dir(trash_dir).map_err(|error| error.to_string())?;
+    let entries = fs::read_dir(trash_dir).map_err(crate::i18n::Message::from)?;
     for entry in entries.flatten() {
         let entry_name = entry.file_name().to_string_lossy().into_owned();
         if !trash_name_matches(&entry_name, &stem, &extension) {
@@ -320,16 +330,19 @@ fn restore_from_trash_dir(
         }
     }
 
-    let (_, candidate) =
-        best.ok_or_else(|| "回收站里找不到这次删掉的项，请手动打开回收站放回".to_string())?;
+    let (_, candidate) = best.ok_or_else(|| {
+        crate::i18n::Message::msg("回收站里找不到这次删掉的项，请手动打开回收站放回")
+    })?;
 
     if original.exists() {
-        return Err("原位置已经有同名项目，先移走它再撤销".to_string());
+        return Err(crate::i18n::Message::msg(
+            "原位置已经有同名项目，先移走它再撤销",
+        ));
     }
     if let Some(parent) = original.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::rename(&candidate, original).map_err(|error| error.to_string())
+    fs::rename(&candidate, original).map_err(crate::i18n::Message::from)
 }
 
 /// 回收站里的名字是“原名”或“原名 N”（macOS 遇到同名项时自动加序号）。
@@ -367,7 +380,11 @@ fn cutoff_seconds(cutoff: SystemTime) -> i64 {
 /// 一次读写的数据块大小。
 const COPY_CHUNK: usize = 1024 * 1024;
 
-fn copy_entry(source: &Path, dest: &Path, report: &mut dyn FnMut(u64) -> bool) -> io::Result<()> {
+fn copy_entry(
+    source: &Path,
+    dest: &Path,
+    report: &mut dyn FnMut(u64) -> bool,
+) -> Result<(), crate::i18n::Msg> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.is_dir() {
         fs::create_dir_all(dest)?;
@@ -391,14 +408,20 @@ fn copy_entry(source: &Path, dest: &Path, report: &mut dyn FnMut(u64) -> bool) -
 /// 也**不往目标上直接写**：先写状态目录底下的暂存文件，成了才落成目标。
 /// 这样中止一个 40 GB 的拷贝，目标目录里不会多一个看着像传好了的半截货，
 /// 而半截数据还留在暂存处——下一次同样的 (源, 目标) 会接着传（见 `resume`）。
-fn copy_file(source: &Path, target: &Path, report: &mut dyn FnMut(u64) -> bool) -> io::Result<()> {
+///
+/// **返回 `Msg` 而不是 `io::Result`**：整条拷贝链上凡是自己的措辞
+/// （「落不了盘」「源和目标在同一个文件上」）都要能翻译，而中途冒出来的
+/// IO 错误靠 `?` 自动转成 `verbatim` 透传——「Permission denied」
+/// 是操作系统的话，翻了它用户反而认不出这是谁讲的。
+fn copy_file(
+    source: &Path,
+    target: &Path,
+    report: &mut dyn FnMut(u64) -> bool,
+) -> Result<(), crate::i18n::Msg> {
     // 拷到自己身上会把源文件先截断成 0 字节——`fs::copy` 内置了这个检查，
     // 手写拷贝必须自己补上。
     if same_file(source, target) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "源和目标在同一个文件上",
-        ));
+        return Err(crate::i18n::Message::msg("源和目标在同一个文件上"));
     }
 
     let journal = resume::journal();
@@ -464,7 +487,7 @@ fn copy_file(source: &Path, target: &Path, report: &mut dyn FnMut(u64) -> bool) 
             },
         );
         journal.sweep();
-        return Err(aborted());
+        return Err(aborted_msg());
     }
 
     let result = pump(&mut reader, &mut writer, &mut done, report);
@@ -477,9 +500,9 @@ fn copy_file(source: &Path, target: &Path, report: &mut dyn FnMut(u64) -> bool) 
             // 暂存文件还在就改名落成目标；已经叫别人清掉了（系统清临时目录，
             // 或者哪个测试把自己的状态目录连窝端了）就换个法子把内容补上。
             land(&staging, target, || {
-                fs::copy(source, target)
-                    .map(|_| ())
-                    .map_err(|error| io::Error::other(format!("落不了盘：{error}")))
+                fs::copy(source, target).map(|_| ()).map_err(|error| {
+                    crate::i18n::Message::args("落不了盘：{error}", &[("error", error.to_string())])
+                })
             })?;
             // `fs::copy` 会带上权限位，手写拷贝必须自己补：
             // 否则拷出来的脚本和程序会丢掉执行权限。
@@ -515,7 +538,7 @@ fn pump(
     writer: &mut fs::File,
     done: &mut u64,
     report: &mut dyn FnMut(u64) -> bool,
-) -> io::Result<()> {
+) -> Result<(), crate::i18n::Msg> {
     let mut buffer = vec![0u8; COPY_CHUNK];
     loop {
         let read = reader.read(&mut buffer)?;
@@ -528,7 +551,7 @@ fn pump(
             // 只删这一个没拷完的文件，由**这一层**负责：
             // 拷文件夹时兄弟们已经拷好了，在外面删会把整棵子树连坐删掉——
             // 现在更简单了：半截的在暂存处，目标里本来就没有它。
-            return Err(aborted());
+            return Err(aborted_msg());
         }
     }
 }
@@ -544,14 +567,27 @@ fn show(path: &Path) -> String {
 /// 打断，重试一次就好"，于是 `write_all` / `read_exact` / `io::copy`
 /// 都会把它当成该重试的错误——中止一个下载会变成无限重试，
 /// 一直写到磁盘满才停下（实测写掉了 28 GB）。
-/// 换成一个不触发重试的种类，再靠文案认出它。
+/// 换成一个不触发重试的种类，再靠 [`crate::i18n::Aborted`] 这个类型
+/// 认出它（不是靠文案——文案能改、能翻，判据不能跟着变）。
 fn aborted() -> io::Error {
-    io::Error::other("已中止")
+    io::Error::other(crate::i18n::Aborted)
+}
+
+/// 用户中止了，拷贝链上用的那一份（[`copy_file`] 走 `Msg`）。
+///
+/// 同一个意思两个类型：进 [`Reporting`] 的必须还是 `io::Error`——
+/// 它实现的是 `std::io::Read`，签名改不了。
+fn aborted_msg() -> crate::i18n::Msg {
+    crate::i18n::Message::aborted()
 }
 
 /// 这个错误是不是"用户中止了"。
-fn is_aborted(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::Other && error.to_string() == "已中止"
+///
+/// **判 key 不判显示文案**（[`crate::i18n::Message::is_aborted`]）：
+/// 拿 `to_string()` 判在中文下一直成立，切到英文就永远不成立——那一趟
+/// 会被当成真失败，白扫一遍暂存。
+fn is_aborted(error: &crate::i18n::Msg) -> bool {
+    error.is_aborted()
 }
 
 /// 修改时间（Unix 秒）。取不到就没有——续传账本拿它当"源没变过"的证据之一。
@@ -663,9 +699,10 @@ fn transfer_entries(
 
         // 目标是移动源的子目录时会形成环，直接拒绝。
         if remove_source && target.starts_with(source) {
-            outcome
-                .failed
-                .push((source.clone(), "不能把文件夹移进它自己".to_string()));
+            outcome.failed.push((
+                source.clone(),
+                crate::i18n::Message::msg("不能把文件夹移进它自己"),
+            ));
             continue;
         }
 
@@ -729,7 +766,12 @@ pub struct RemoteSides {
 fn sub_of(path: &Path) -> Result<String, TransferError> {
     remote::parse_location(path)
         .map(|(_, sub)| sub)
-        .ok_or_else(|| TransferError::Failed(format!("不是远程路径：{}", path.display())))
+        .ok_or_else(|| {
+            TransferError::Failed(crate::i18n::Message::args(
+                "不是远程路径：{path}",
+                &[("path", path.display().to_string())],
+            ))
+        })
 }
 
 /// 远程目标上有没有这一项。`Path::exists()` 对 `dav://…` 永远是假，
@@ -789,7 +831,7 @@ fn unique_remote(client: &dyn remote::Remote, sub: &str) -> String {
 /// 操作中心会把失败项列出来让人重试，被中止的不该混进去。
 pub enum TransferError {
     Aborted,
-    Failed(String),
+    Failed(crate::i18n::Msg),
 }
 
 fn transfer_one(
@@ -807,7 +849,10 @@ fn transfer_one(
             download_entry(client, &sub, target, report)?;
             if remove_source {
                 client.remove(&sub).map_err(|error| {
-                    TransferError::Failed(format!("已下载但删除远程源失败：{error}"))
+                    TransferError::Failed(crate::i18n::Message::args(
+                        "已下载但删除远程源失败：{error}",
+                        &[("error", error.to_string())],
+                    ))
                 })?;
             }
             Ok(())
@@ -822,9 +867,9 @@ fn transfer_one(
         // 所以明确不支持，好过偷偷在临时目录里绕一圈。
         (Some(from), Some(to)) => {
             if from.id() != to.id() {
-                return Err(TransferError::Failed(
-                    "不支持在两个不同的服务器之间直接搬运".to_string(),
-                ));
+                return Err(TransferError::Failed(crate::i18n::Message::msg(
+                    "不支持在两个不同的服务器之间直接搬运",
+                )));
             }
             let from_sub = sub_of(source)?;
             let to_sub = sub_of(target)?;
@@ -858,13 +903,17 @@ fn local_to_local(
         if is_aborted(&error) {
             TransferError::Aborted
         } else {
-            TransferError::Failed(format!("拷贝失败：{error}"))
+            TransferError::Failed(error)
         }
     })?;
 
     if remove_source {
-        remove_entry(source)
-            .map_err(|error| TransferError::Failed(format!("已拷贝但删除源文件失败：{error}")))?;
+        remove_entry(source).map_err(|error| {
+            TransferError::Failed(crate::i18n::Message::args(
+                "已拷贝但删除源文件失败：{error}",
+                &[("error", error.to_string())],
+            ))
+        })?;
     }
     Ok(())
 }
@@ -879,11 +928,15 @@ fn download_entry(
     let info = client
         .stat(sub)
         .map_err(TransferError::Failed)?
-        .ok_or_else(|| TransferError::Failed("远程那一项已经不在了".to_string()))?;
+        .ok_or_else(|| TransferError::Failed(crate::i18n::Message::msg("远程那一项已经不在了")))?;
 
     if info.is_dir {
-        fs::create_dir_all(target)
-            .map_err(|error| TransferError::Failed(format!("建不了本地目录：{error}")))?;
+        fs::create_dir_all(target).map_err(|error| {
+            TransferError::Failed(crate::i18n::Message::args(
+                "建不了本地目录：{error}",
+                &[("error", error.to_string())],
+            ))
+        })?;
         let children = client.list(sub).map_err(TransferError::Failed)?;
         for child in children {
             download_entry(client, &child.path, &target.join(&child.name), report)?;
@@ -907,8 +960,12 @@ fn download_entry(
     };
     let staging = journal.staging(&key);
     if let Some(parent) = staging.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| TransferError::Failed(format!("建不了暂存目录：{error}")))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            TransferError::Failed(crate::i18n::Message::args(
+                "建不了暂存目录：{error}",
+                &[("error", error.to_string())],
+            ))
+        })?;
     }
     // 暂存文件被动过（系统清临时目录、磁盘满写坏了）：以磁盘上实际有的为准。
     let on_disk = fs::metadata(&staging).map(|it| it.len()).unwrap_or(0);
@@ -925,13 +982,26 @@ fn download_entry(
         .write(true)
         .create(true)
         .open(&staging)
-        .map_err(|error| TransferError::Failed(format!("写不了本地文件：{error}")))?;
+        .map_err(|error| {
+            TransferError::Failed(crate::i18n::Message::args(
+                "写不了本地文件：{error}",
+                &[("error", error.to_string())],
+            ))
+        })?;
     // 同上：只认前 `done` 个字节，读写都从断点起。
-    file.set_len(done)
-        .map_err(|error| TransferError::Failed(format!("写不了本地文件：{error}")))?;
+    file.set_len(done).map_err(|error| {
+        TransferError::Failed(crate::i18n::Message::args(
+            "写不了本地文件：{error}",
+            &[("error", error.to_string())],
+        ))
+    })?;
     if done > 0 {
-        file.seek(io::SeekFrom::Start(done))
-            .map_err(|error| TransferError::Failed(format!("写不了本地文件：{error}")))?;
+        file.seek(io::SeekFrom::Start(done)).map_err(|error| {
+            TransferError::Failed(crate::i18n::Message::args(
+                "写不了本地文件：{error}",
+                &[("error", error.to_string())],
+            ))
+        })?;
     }
 
     // 续上的那部分先报一次，进度条从半路开始。
@@ -942,16 +1012,17 @@ fn download_entry(
         return Err(TransferError::Aborted);
     }
 
-    let result = {
-        let mut sink = Reporting {
-            inner: &mut file,
-            report,
-        };
-        if done > 0 {
+    let (result, was_aborted) = {
+        let mut sink = Reporting::new(&mut file, report);
+        let result = if done > 0 {
             client.download_from(sub, done, &mut sink)
         } else {
             client.download(sub, &mut sink)
-        }
+        };
+        // 顺序要紧：先问 `sink` 要「用户按过中止没有」，再让它掉出作用域。
+        // 问错了地方就只能回去比错误文案——而 `ureq` 包装过的那句已经
+        // 认不出来了。理由见 `Reporting`。
+        (result, sink.aborted())
     };
     // 先关掉句柄：Windows 上开着的文件动不了。
     drop(file);
@@ -960,14 +1031,13 @@ fn download_entry(
             land(&staging, target, || {
                 // 暂存叫清了：重新下一趟，直接落到目标上。
                 // 不报进度——这些字节前面已经报过了，再报一遍进度条会跑过 100%。
-                let mut file = fs::File::create(target)
-                    .map_err(|error| io::Error::other(format!("写不了本地文件：{error}")))?;
-                client
-                    .download(sub, &mut file)
-                    .map_err(|error| io::Error::other(format!("下载失败：{error}")))?;
+                let mut file = fs::File::create(target).map_err(|error| {
+                    crate::i18n::Message::caused("写不了本地文件：{error}", error)
+                })?;
+                client.download(sub, &mut file)?;
                 Ok(())
             })
-            .map_err(|error| TransferError::Failed(error.to_string()))?;
+            .map_err(TransferError::Failed)?;
             journal.clear(&key);
             Ok(())
         }
@@ -980,15 +1050,14 @@ fn download_entry(
             // 是一份完整的文件。这种时候再判中止等于白下一趟——用户已经
             // 有一份完整文件躺在暂存里，却得看着它被扫掉重来。
             // 判据只能是长度：续传账本拿不到"服务器那边还剩多少"。
-            if error.contains("已中止") && done >= info.size {
-                land(&staging, target, || Ok(()))
-                    .map_err(|error| TransferError::Failed(error.to_string()))?;
+            if was_aborted && done >= info.size {
+                land(&staging, target, || Ok(())).map_err(TransferError::Failed)?;
                 journal.clear(&key);
                 return Ok(());
             }
             note_download(&journal, &key, client, sub, &info, done);
             journal.sweep();
-            if error.contains("已中止") {
+            if was_aborted {
                 Err(TransferError::Aborted)
             } else {
                 Err(TransferError::Failed(error))
@@ -1030,13 +1099,18 @@ fn remote_source(client: &dyn remote::Remote, sub: &str) -> String {
 /// `fallback` 是"没有暂存文件时怎么把内容搬过去"：本地拷贝是整个重拷一遍，
 /// 远程下载是重新下一趟。两条路都**不报进度**——这些字节前面已经报过了，
 /// 再报一遍进度条就会跑过 100%。
+///
+/// **收 `Msg` 而不是 `io::Result`**：这三条落地路（改名、拷贝、下载）最后都要
+/// 冒泡成界面上一行话，各自都有自己的措辞。让它们在各自的位置攒 `Msg`，
+/// 比在这里降级成 `io::Error` 再在外层重新包一次省事，也不会把「落不了盘」
+/// 这种自己的措辞漏进 `io::Error`（漏进去就再也翻译不了了）。
 fn land(
     staging: &Path,
     target: &Path,
-    fallback: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
+    fallback: impl FnOnce() -> Result<(), crate::i18n::Msg>,
+) -> Result<(), crate::i18n::Msg> {
     if staging.exists() {
-        resume::finish(staging, target).map_err(io::Error::other)
+        resume::finish(staging, target)
     } else {
         fallback()
     }
@@ -1053,14 +1127,23 @@ fn upload_entry(
     remove_source: bool,
     report: &mut dyn FnMut(u64) -> bool,
 ) -> Result<(), TransferError> {
-    let metadata = fs::symlink_metadata(source)
-        .map_err(|error| TransferError::Failed(format!("读不了源文件：{error}")))?;
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        TransferError::Failed(crate::i18n::Message::args(
+            "读不了源文件：{error}",
+            &[("error", error.to_string())],
+        ))
+    })?;
     if metadata.is_dir() {
         client.mkdir(sub).map_err(TransferError::Failed)?;
-        let children = fs::read_dir(source)
-            .map_err(|error| TransferError::Failed(format!("列不了本地目录：{error}")))?;
+        let children = fs::read_dir(source).map_err(|error| {
+            TransferError::Failed(crate::i18n::Message::args(
+                "列不了本地目录：{error}",
+                &[("error", error.to_string())],
+            ))
+        })?;
         for child in children {
-            let child = child.map_err(|error| TransferError::Failed(error.to_string()))?;
+            let child =
+                child.map_err(|error| TransferError::Failed(crate::i18n::Message::from(error)))?;
             let name = child.file_name().to_string_lossy().into_owned();
             let child_sub = if sub.is_empty() {
                 name
@@ -1072,7 +1155,10 @@ fn upload_entry(
         // 孩子已经各传各的、也各删各的了，到这里目录是空的，可以收尾。
         if remove_source {
             remove_entry(source).map_err(|error| {
-                TransferError::Failed(format!("已上传但删除本地源失败：{error}"))
+                TransferError::Failed(crate::i18n::Message::args(
+                    "已上传但删除本地源失败：{error}",
+                    &[("error", error.to_string())],
+                ))
             })?;
         }
         return Ok(());
@@ -1105,12 +1191,20 @@ fn upload_entry(
         }
     }
 
-    let file = fs::File::open(source)
-        .map_err(|error| TransferError::Failed(format!("读不了源文件：{error}")))?;
+    let file = fs::File::open(source).map_err(|error| {
+        TransferError::Failed(crate::i18n::Message::args(
+            "读不了源文件：{error}",
+            &[("error", error.to_string())],
+        ))
+    })?;
     let mut file = file;
     if done > 0 {
-        file.seek(io::SeekFrom::Start(done))
-            .map_err(|error| TransferError::Failed(format!("读不了源文件：{error}")))?;
+        file.seek(io::SeekFrom::Start(done)).map_err(|error| {
+            TransferError::Failed(crate::i18n::Message::args(
+                "读不了源文件：{error}",
+                &[("error", error.to_string())],
+            ))
+        })?;
         // 已经传上去的那部分先报一次，进度条从半路开始。
         if !report(done) {
             return Err(TransferError::Aborted);
@@ -1122,20 +1216,19 @@ fn upload_entry(
         inner: file,
         sent: 0,
     };
-    let result = {
-        let mut reader = Reporting {
-            inner: &mut counting,
-            report,
-        };
-        if done > 0 {
+    let (result, was_aborted) = {
+        let mut reader = Reporting::new(&mut counting, report);
+        let result = if done > 0 {
             client.upload_from(sub, &mut reader, length, done)
         } else {
             client.upload(sub, &mut reader, length)
-        }
+        };
+        // 同下载那边：先问 `Reporting` 要，再让它掉出作用域。理由见 `Reporting`。
+        (result, reader.aborted())
     };
     let sent = done + counting.sent;
     if let Err(error) = result {
-        if error.contains("已中止") {
+        if was_aborted {
             // 同下载那边：`Reporting` 读完一块才报进度，那块若刚好盖到文件
             // 末尾，回调说停就停，其实服务器上已经是一份完整的文件。
             // 这时候报中止等于让用户白传一遍——下次接着传会从"长度正好
@@ -1144,7 +1237,10 @@ fn upload_entry(
                 journal.clear(&key);
                 if remove_source {
                     remove_entry(source).map_err(|error| {
-                        TransferError::Failed(format!("已上传但删除本地源失败：{error}"))
+                        TransferError::Failed(crate::i18n::Message::args(
+                            "已上传但删除本地源失败：{error}",
+                            &[("error", error.to_string())],
+                        ))
                     })?;
                 }
                 return Ok(());
@@ -1170,8 +1266,12 @@ fn upload_entry(
     }
     journal.clear(&key);
     if remove_source {
-        remove_entry(source)
-            .map_err(|error| TransferError::Failed(format!("已上传但删除本地源失败：{error}")))?;
+        remove_entry(source).map_err(|error| {
+            TransferError::Failed(crate::i18n::Message::args(
+                "已上传但删除本地源失败：{error}",
+                &[("error", error.to_string())],
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1193,19 +1293,52 @@ impl<R: std::io::Read> std::io::Read for Counting<R> {
 
 /// 边读边报字节数（上传用）/ 边写边报（下载用）的那一层包装。
 ///
-/// 返回 false 就是用户按了中止：这里把它变成一个 [`aborted`] 的 IO 错误，
-/// 顺着 `io::copy` / `ureq` 的读冒泡出去，调用方据此收尾。
-/// 错误种类必须是"不会触发重试"的那种——理由见 [`aborted`]。
+/// 返回 false 就是用户按了中止：这里既把它变成一个 [`aborted`] 的 IO 错误
+/// 让那一趟停下来，也**自己记进 [`Self::aborted`]**。
+///
+/// **为什么两个都要**：错误要穿过 `ureq` / `suppaftp` 才回到我们手里，
+/// 而它们会把 IO 错误包一层再字符串化——`ureq::Error::Transport(..)`
+/// 那边只留下 `transport.to_string()`，「已中止」到 `explain` 前面
+/// 已经变成一句普通文本了。那时候再判「这一趟是不是被叫停的」，
+/// 只能回去比文案，那正是 `Message::is_aborted` 要顶掉的毛病。
+///
+/// 自己记一份就绕开了整条猜谜链：这个类型是我们自己的，
+/// 「我中止过」这个事实没有理由让它掉在半路上。
+///
+/// 错误种类仍必须是"不会触发重试"的那种——理由见 [`aborted`]。
 struct Reporting<'a, R> {
     inner: R,
     report: &'a mut dyn FnMut(u64) -> bool,
+    /// 用户按过中止。抄出来给调用方判，这一趟到底是"被叫停"还是"真失败"。
+    aborted: bool,
+}
+
+impl<'a, R> Reporting<'a, R> {
+    fn new(inner: R, report: &'a mut dyn FnMut(u64) -> bool) -> Self {
+        Self {
+            inner,
+            report,
+            aborted: false,
+        }
+    }
+
+    /// 用户是不是按过中止。
+    fn aborted(&self) -> bool {
+        self.aborted
+    }
+
+    /// 记下中止，并给出那一趟要用的错误。
+    fn stop(&mut self) -> io::Error {
+        self.aborted = true;
+        aborted()
+    }
 }
 
 impl<R: std::io::Read> std::io::Read for Reporting<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read(buffer)?;
         if read > 0 && !(self.report)(read as u64) {
-            return Err(aborted());
+            return Err(self.stop());
         }
         Ok(read)
     }
@@ -1215,7 +1348,7 @@ impl<R: Write> Write for Reporting<'_, R> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let written = self.inner.write(buffer)?;
         if written > 0 && !(self.report)(written as u64) {
-            return Err(aborted());
+            return Err(self.stop());
         }
         Ok(written)
     }
@@ -1396,12 +1529,12 @@ impl HistoryEntry {
     ///
     /// `clients` 是这一条记录涉及的远程连接（按连接 id 索引）；
     /// 只涉及本地路径时它是空的，行为跟以前一样。
-    pub fn undo(&self, clients: &HashMap<String, Client>) -> Result<(), String> {
+    pub fn undo(&self, clients: &HashMap<String, Client>) -> Result<(), crate::i18n::Msg> {
         match self {
             Self::Created { path } => remove_any(path, clients),
             Self::Renamed { from, to } => {
                 if exists_any(to, clients) != Some(true) {
-                    return Err("原文件已经不在改名后的位置了".to_string());
+                    return Err(crate::i18n::Message::msg("原文件已经不在改名后的位置了"));
                 }
                 move_back(from, to, clients)
             }
@@ -1424,9 +1557,12 @@ impl HistoryEntry {
                 // 逆序改回去，避免序号类改名互相踩。
                 for (from, to) in moves.iter().rev() {
                     if !to.exists() {
-                        return Err(format!("“{}”已经不在改名后的位置了", display_name(to)));
+                        return Err(crate::i18n::Message::args(
+                            "“{name}”已经不在改名后的位置了",
+                            &[("name", display_name(to))],
+                        ));
                     }
-                    fs::rename(to, from).map_err(|error| error.to_string())?;
+                    fs::rename(to, from).map_err(crate::i18n::Message::from)?;
                 }
                 Ok(())
             }
@@ -1453,27 +1589,34 @@ fn exists_any(path: &Path, clients: &HashMap<String, Client>) -> Option<bool> {
 }
 
 /// 本地或远程，删掉这一项。
-fn remove_any(path: &Path, clients: &HashMap<String, Client>) -> Result<(), String> {
+fn remove_any(path: &Path, clients: &HashMap<String, Client>) -> Result<(), crate::i18n::Msg> {
     let Some((id, sub)) = remote::parse_location(path) else {
-        let metadata = fs::symlink_metadata(path).map_err(|_| "这一项已经不存在了".to_string())?;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| crate::i18n::Message::msg("这一项已经不存在了"))?;
         if metadata.is_dir() {
             let empty = fs::read_dir(path)
                 .map(|mut entries| entries.next().is_none())
                 .unwrap_or(false);
             if !empty {
-                return Err("文件夹里已经有了新内容，先清空再撤销".to_string());
+                return Err(crate::i18n::Message::msg(
+                    "文件夹里已经有了新内容，先清空再撤销",
+                ));
             }
         }
-        return remove_entry(path).map_err(|error| error.to_string());
+        return remove_entry(path).map_err(crate::i18n::Message::from);
     };
     let client = clients
         .get(&id)
-        .ok_or_else(|| "这条远程连接已经不在了".to_string())?;
+        .ok_or_else(|| crate::i18n::Message::msg("这条远程连接已经不在了"))?;
     client.remove(&sub)
 }
 
 /// 撤销一次移动：把 `to` 搬回 `from`。两端各可能是本地或远程。
-fn move_back(from: &Path, to: &Path, clients: &HashMap<String, Client>) -> Result<(), String> {
+fn move_back(
+    from: &Path,
+    to: &Path,
+    clients: &HashMap<String, Client>,
+) -> Result<(), crate::i18n::Msg> {
     let from_remote = remote::parse_location(from);
     let to_remote = remote::parse_location(to);
     // 先按“两边各是什么位置”取好客户端，后面哪个分支用得上就用。
@@ -1490,13 +1633,13 @@ fn move_back(from: &Path, to: &Path, clients: &HashMap<String, Client>) -> Resul
             if let Some(parent) = from.parent() {
                 fs::create_dir_all(parent).ok();
             }
-            fs::rename(to, from).map_err(|error| error.to_string())
+            fs::rename(to, from).map_err(crate::i18n::Message::from)
         }
         // 同一台服务器：让服务器自己搬回去，一趟 MOVE 就完事。
         (Some((from_id, from_sub)), Some((to_id, to_sub))) if from_id == to_id => {
             let client = clients
                 .get(&from_id)
-                .ok_or_else(|| "这条远程连接已经不在了".to_string())?;
+                .ok_or_else(|| crate::i18n::Message::msg("这条远程连接已经不在了"))?;
             client.rename(&to_sub, &from_sub)
         }
         // 一边本地一边远程（或跨服务器）：走一趟真的下载/上传。
@@ -1506,7 +1649,7 @@ fn move_back(from: &Path, to: &Path, clients: &HashMap<String, Client>) -> Resul
             let mut report = |_bytes: u64| true;
             match transfer_one(to, from, true, &sides, &mut report) {
                 Ok(()) => Ok(()),
-                Err(TransferError::Aborted) => Err("已中止".to_string()),
+                Err(TransferError::Aborted) => Err(crate::i18n::Message::aborted()),
                 Err(TransferError::Failed(message)) => Err(message),
             }
         }
@@ -1548,11 +1691,14 @@ impl History {
     }
 
     /// 弹出并执行撤销，返回被撤销操作的描述。
-    pub fn pop_undo(&mut self, clients: &HashMap<String, Client>) -> Result<String, String> {
+    pub fn pop_undo(
+        &mut self,
+        clients: &HashMap<String, Client>,
+    ) -> Result<String, crate::i18n::Msg> {
         let entry = self
             .entries
             .pop()
-            .ok_or_else(|| "没有可撤销的操作".to_string())?;
+            .ok_or_else(|| crate::i18n::Message::msg("没有可撤销的操作"))?;
         match entry.undo(clients) {
             Ok(()) => Ok(entry.describe()),
             Err(error) => {
@@ -1640,13 +1786,13 @@ impl History {
 }
 
 /// 名字是否合法（新建/重命名共用）。
-pub fn valid_name(name: &str) -> Result<(), String> {
+pub fn valid_name(name: &str) -> Result<(), crate::i18n::Msg> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err("名称不能为空".to_string());
+        return Err(crate::i18n::Message::msg("名称不能为空"));
     }
     if trimmed == "." || trimmed == ".." || trimmed.contains('/') || trimmed.contains('\\') {
-        return Err("名称不能包含路径分隔符".to_string());
+        return Err(crate::i18n::Message::msg("名称不能包含路径分隔符"));
     }
     Ok(())
 }
@@ -2078,7 +2224,7 @@ mod tests {
         assert_eq!(outcome.done, 0);
         assert_eq!(outcome.failed.len(), 1);
         assert!(
-            outcome.failed[0].1.contains("两个不同的服务器"),
+            outcome.failed[0].1.to_string().contains("两个不同的服务器"),
             "要说清为什么不行：{}",
             outcome.failed[0].1
         );
@@ -2631,7 +2777,7 @@ mod tests {
         let error = restore_from_trash_dir(&trash_dir, &original, much_later).unwrap_err();
 
         assert!(
-            error.contains("回收站"),
+            error.to_string().contains("回收站"),
             "应当给出可理解的失败原因：{error}"
         );
         assert!(trash_dir.join("old.txt").exists(), "旧项不能被误放回");

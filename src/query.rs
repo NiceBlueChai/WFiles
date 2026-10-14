@@ -147,12 +147,15 @@ pub struct Query {
 }
 
 impl Query {
-    pub fn parse(input: &str) -> Result<Self, String> {
+    pub fn parse(input: &str) -> Result<Self, crate::i18n::Msg> {
         let mut parser = Parser::new(input);
         let root = parser.expression()?;
         parser.skip_space();
         if !parser.rest.is_empty() {
-            return Err(format!("看不懂：{}", parser.rest.trim()));
+            return Err(crate::i18n::Message::args(
+                "看不懂：{rest}",
+                &[("rest", parser.rest.trim().to_string())],
+            ));
         }
         Ok(Self {
             needs_content: root.as_ref().is_some_and(needs_content),
@@ -315,7 +318,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `a OR b OR c`（OR 优先级最低）。
-    fn expression(&mut self) -> Result<Option<Term>, String> {
+    fn expression(&mut self) -> Result<Option<Term>, crate::i18n::Msg> {
         let Some(left) = self.and_group()? else {
             return Ok(None);
         };
@@ -326,7 +329,7 @@ impl<'a> Parser<'a> {
             let word = self.word()?;
             if word.as_deref() == Some("or") || word.as_deref() == Some("OR") {
                 let Some(right) = self.and_group()? else {
-                    return Err("OR 后面少了条件".to_string());
+                    return Err(crate::i18n::Message::msg("OR 后面少了条件"));
                 };
                 branches.push(right);
             } else {
@@ -342,7 +345,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 挨着的几个条件默认就是"都要满足"。
-    fn and_group(&mut self) -> Result<Option<Term>, String> {
+    fn and_group(&mut self) -> Result<Option<Term>, crate::i18n::Msg> {
         let mut terms: Vec<Term> = Vec::new();
         loop {
             self.skip_space();
@@ -372,7 +375,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn unary(&mut self) -> Result<Option<Term>, String> {
+    fn unary(&mut self) -> Result<Option<Term>, crate::i18n::Msg> {
         self.skip_space();
         if self.rest.is_empty() {
             return Ok(None);
@@ -384,7 +387,7 @@ impl<'a> Parser<'a> {
         {
             self.rest = after;
             let Some(inner) = self.unary()? else {
-                return Err("- 后面少了要排除的东西".to_string());
+                return Err(crate::i18n::Message::msg("- 后面少了要排除的东西"));
             };
             return Ok(Some(Term::Not(Box::new(inner))));
         }
@@ -393,7 +396,7 @@ impl<'a> Parser<'a> {
         {
             self.rest = after;
             let Some(inner) = self.unary()? else {
-                return Err("! 后面少了要排除的东西".to_string());
+                return Err(crate::i18n::Message::msg("! 后面少了要排除的东西"));
             };
             return Ok(Some(Term::Not(Box::new(inner))));
         }
@@ -402,7 +405,7 @@ impl<'a> Parser<'a> {
             && word.eq_ignore_ascii_case("not")
         {
             let Some(inner) = self.unary()? else {
-                return Err("NOT 后面少了要排除的东西".to_string());
+                return Err(crate::i18n::Message::msg("NOT 后面少了要排除的东西"));
             };
             return Ok(Some(Term::Not(Box::new(inner))));
         }
@@ -411,7 +414,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 一个最小的条件：一个词、一个引号串、或一个 `字段:值`。
-    fn primary(&mut self) -> Result<Option<Term>, String> {
+    fn primary(&mut self) -> Result<Option<Term>, crate::i18n::Msg> {
         self.skip_space();
         let Some(token) = self.token()? else {
             return Ok(None);
@@ -432,7 +435,7 @@ impl<'a> Parser<'a> {
         Ok(Some(term))
     }
 
-    fn field(&mut self, field: &str, raw: &str) -> Result<Term, String> {
+    fn field(&mut self, field: &str, raw: &str) -> Result<Term, crate::i18n::Msg> {
         // 值通常在冒号后面就写好了（`size:>1M`）；写成 `name: foo` 时
         // 值在下一个片段里，那就再读一个。
         let value = if raw.is_empty() {
@@ -451,20 +454,23 @@ impl<'a> Parser<'a> {
             "re" | "regex" => Ok(Term::Name(Pattern::Regex(compile(value.trim())?))),
             "content" | "c" => {
                 if bare.is_empty() {
-                    return Err("content: 后面要写要找的词".to_string());
+                    return Err(crate::i18n::Message::msg("content: 后面要写要找的词"));
                 }
                 Ok(Term::Content(bare))
             }
             "tag" => {
                 if bare.is_empty() {
-                    return Err("tag: 后面要写标签".to_string());
+                    return Err(crate::i18n::Message::msg("tag: 后面要写标签"));
                 }
                 Ok(Term::Tag(bare))
             }
             "color" => {
                 if !crate::marks::is_color(&bare) {
                     let names: Vec<&str> = crate::marks::COLORS.iter().map(|(id, _)| *id).collect();
-                    return Err(format!("颜色只认 {}，不是“{bare}”", names.join("/")));
+                    return Err(crate::i18n::Message::args(
+                        "颜色只认 {names}，不是“{bare}”",
+                        &[("names", names.join("/")), ("bare", bare.clone())],
+                    ));
                 }
                 Ok(Term::Color(bare))
             }
@@ -478,8 +484,9 @@ impl<'a> Parser<'a> {
                 "archive" | "压缩包" => "archive",
                 "code" | "源码" => "code",
                 _ => {
-                    return Err(format!(
-                        "type 只认 dir/file/image/video/audio/text/archive/code，不是“{bare}”"
+                    return Err(crate::i18n::Message::args(
+                        "type 只认 dir/file/image/video/audio/text/archive/code，不是“{bare}”",
+                        &[("bare", bare.clone())],
                     ));
                 }
             })),
@@ -491,12 +498,15 @@ impl<'a> Parser<'a> {
                 let (cmp, rest) = split_cmp(&bare);
                 Ok(Term::Date(cmp, parse_moment(rest)?))
             }
-            _ => Err(format!("没有“{field}:”这个字段")),
+            _ => Err(crate::i18n::Message::args(
+                "没有“{field}:”这个字段",
+                &[("field", field.to_string())],
+            )),
         }
     }
 
     /// 读一个词：到空格为止，但 `OR` / `NOT` 这种关键词要单独认出来。
-    fn word(&mut self) -> Result<Option<String>, String> {
+    fn word(&mut self) -> Result<Option<String>, crate::i18n::Msg> {
         self.skip_space();
         if self.rest.is_empty() {
             return Ok(None);
@@ -511,7 +521,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 读一个最小片段：引号串、`字段:值`、或者一个裸词。
-    fn token(&mut self) -> Result<Option<String>, String> {
+    fn token(&mut self) -> Result<Option<String>, crate::i18n::Msg> {
         self.skip_space();
         let Some(first) = self.rest.chars().next() else {
             return Ok(None);
@@ -520,7 +530,10 @@ impl<'a> Parser<'a> {
             let quote = first;
             let rest = &self.rest[quote.len_utf8()..];
             let Some(end) = rest.find(quote) else {
-                return Err(format!("引号没配对：{quote}{rest}"));
+                return Err(crate::i18n::Message::args(
+                    "引号没配对：{quote}{rest}",
+                    &[("quote", quote.to_string()), ("rest", rest.to_string())],
+                ));
             };
             let value = rest[..end].to_string();
             self.rest = &rest[end + quote.len_utf8()..];
@@ -592,34 +605,39 @@ fn pattern_of(value: &str) -> Pattern {
     }
 }
 
-fn compile(source: &str) -> Result<Regex, String> {
-    Regex::new(source).map_err(|error| format!("正则写错了：{error}"))
+fn compile(source: &str) -> Result<Regex, crate::i18n::Msg> {
+    Regex::new(source)
+        .map_err(|error| crate::i18n::Message::caused("正则写错了：{error}", error.to_string()))
 }
 
 /// 大小：`2M`、`100K`、`1G`、纯数字（字节）。1024 进制，跟大多数文件管理器一致。
-fn parse_size(value: &str) -> Result<u64, String> {
+fn parse_size(value: &str) -> Result<u64, crate::i18n::Msg> {
     let text = value.trim();
     let (digits, unit) = match text.chars().last() {
         Some(last) if last.is_ascii_alphabetic() => (&text[..text.len() - 1], last),
         _ => (text, 'b'),
     };
-    let amount: f64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| format!("大小看不懂：{value}"))?;
+    let amount: f64 = digits.trim().parse().map_err(|_| {
+        crate::i18n::Message::args("大小看不懂：{value}", &[("value", value.to_string())])
+    })?;
     let scale: u64 = match unit.to_ascii_lowercase() {
         'b' => 1,
         'k' => 1024,
         'm' => 1024 * 1024,
         'g' => 1024 * 1024 * 1024,
         't' => 1024 * 1024 * 1024 * 1024,
-        _ => return Err(format!("大小的单位只认 B/K/M/G/T，不是 {unit}")),
+        _ => {
+            return Err(crate::i18n::Message::args(
+                "大小的单位只认 B/K/M/G/T，不是 {unit}",
+                &[("unit", unit.to_string())],
+            ));
+        }
     };
     Ok((amount * scale as f64).round() as u64)
 }
 
 /// 时间：`7d`（七天内）、`2026-01-01`、或者 `2026-06-01` 这种日期。
-fn parse_moment(value: &str) -> Result<Moment, String> {
+fn parse_moment(value: &str) -> Result<Moment, crate::i18n::Msg> {
     let text = value.trim();
     if let Some(digits) = text
         .strip_suffix('d')
@@ -627,7 +645,9 @@ fn parse_moment(value: &str) -> Result<Moment, String> {
         .or_else(|| text.strip_suffix('m'))
         .or_else(|| text.strip_suffix('y'))
     {
-        let amount: u64 = digits.parse().map_err(|_| format!("时间看不懂：{value}"))?;
+        let amount: u64 = digits.parse().map_err(|_| {
+            crate::i18n::Message::args("时间看不懂：{value}", &[("value", value.to_string())])
+        })?;
         let seconds = match text.chars().last().unwrap_or('d') {
             'd' => amount * 86_400,
             'w' => amount * 604_800,
@@ -645,11 +665,20 @@ fn parse_moment(value: &str) -> Result<Moment, String> {
     let (month, day) = rest
         .split_once('-')
         .ok_or_else(|| format!("时间要写成 7d 或者 2026-01-01，不是 {value}"))?;
-    let year: i32 = year.parse().map_err(|_| format!("年份看不懂：{value}"))?;
-    let month: u32 = month.parse().map_err(|_| format!("月份看不懂：{value}"))?;
-    let day: u32 = day.parse().map_err(|_| format!("日期看不懂：{value}"))?;
+    let year: i32 = year.parse().map_err(|_| {
+        crate::i18n::Message::args("年份看不懂：{value}", &[("value", value.to_string())])
+    })?;
+    let month: u32 = month.parse().map_err(|_| {
+        crate::i18n::Message::args("月份看不懂：{value}", &[("value", value.to_string())])
+    })?;
+    let day: u32 = day.parse().map_err(|_| {
+        crate::i18n::Message::args("日期看不懂：{value}", &[("value", value.to_string())])
+    })?;
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(format!("日期不在日历上：{value}"));
+        return Err(crate::i18n::Message::args(
+            "日期不在日历上：{value}",
+            &[("value", value.to_string())],
+        ));
     }
     Ok(Moment::Epoch(days_from_civil(year, month, day) * 86_400))
 }
@@ -814,14 +843,17 @@ mod tests {
     #[test]
     fn an_unknown_color_is_reported() {
         let error = Query::parse("color:pink").unwrap_err();
-        assert!(error.contains("red"), "错误里该列出认得的颜色：{error}");
+        assert!(
+            error.to_string().contains("red"),
+            "错误里该列出认得的颜色：{error}"
+        );
     }
 
     #[test]
     fn an_unknown_field_is_reported_not_silently_ignored() {
         // 认不出来的字段名直接报错，否则用户写的条件被悄悄丢掉，结果全不对。
         let error = Query::parse("colour:red").unwrap_err();
-        assert!(error.contains("colour"), "实际错误：{error}");
+        assert!(error.to_string().contains("colour"), "实际错误：{error}");
     }
 
     #[test]

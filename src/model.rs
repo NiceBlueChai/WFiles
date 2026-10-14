@@ -238,8 +238,8 @@ pub struct Listing {
 }
 
 impl Listing {
-    pub fn read(path: &Path) -> Result<Self, String> {
-        let read_dir = fs::read_dir(path).map_err(|error| error.to_string())?;
+    pub fn read(path: &Path) -> Result<Self, crate::i18n::Msg> {
+        let read_dir = fs::read_dir(path).map_err(crate::i18n::Message::from)?;
         let mut entries = Vec::new();
         for dir_entry in read_dir.flatten() {
             if let Some(entry) = FileEntry::from_dir_entry(&dir_entry) {

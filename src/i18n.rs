@@ -151,6 +151,304 @@ pub fn tr_args(cx: &gpui_kit::App, text: &str, args: &[(&str, String)]) -> Strin
     fill(&tr(cx, text), args)
 }
 
+/// 一句**还没决定用什么语言说**的文案。
+///
+/// **为什么需要它**：错误信息在很深的地方产生（`ops::valid_name`、
+/// `archive::create`、`query::parse`…），那些函数签名是
+/// `Result<T, crate::i18n::Msg>`，既拿不到 `cx` 也不知道用户选了哪种语言。
+/// 三个走过的路子：
+///
+/// | 做法 | 为什么不行|
+/// |---|---|
+/// | 在错误产生处就 `format!` 成中文 | 上屏时只有一坨成品字符串，查表无从下手——key 已经被拼没了 |
+/// | 给每个函数加 `locale: Locale` 参数 | 参数会沿调用链传得很深（`ops_entity` → `ops` → `trash::os_limited` → …），而且那些函数本来就是纯逻辑，单测得为一个参数造一个 locale |
+/// | **产生 `Message`，上屏时才翻** ✅ | 语言这个决定推迟到最后一刻，恰好是唯一知道语言的地方 |
+///
+/// `Display` 出来是中文（`tr_args_in(ZhHans, …)`），所以单测里
+/// `assert_eq!(err.to_string(), "名称不能为空")` 照样成立——
+///
+/// ```ignore
+/// OpsError::msg("名称不能为空")
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Message {
+    /// 英文表里的 key，中文原文。空串 = 不是我们自己的措辞，看 `verbatim`。
+    key: &'static str,
+    /// 带名字的占位符实参。**都是字符串，不含内层消息**——
+    /// 内层消息走 [`Self::cause`]。
+    args: Vec<(&'static str, String)>,
+    /// **别人说的话，原样显示**：IO 错误、远端服务器返回的消息、
+    /// 协议报文的正文。查了表也白查——那句英文是 NAS 说的，
+    /// 我们翻了它，用户排查时反而认不出这是谁讲的。
+    verbatim: Option<String>,
+    /// 内层消息，渲染时填进外层的 `{error}`。
+    ///
+    /// **为什么不给 `args` 加一条能装 `Message` 的实参**：那样就得在构造时
+    /// 把它 `to_string()` 掉，而 `Display` 恒给中文——于是
+    /// 「下载：写盘失败：{error}」包着「已中止」，等上屏时内层已经是
+    /// 中文死符。两个后果：英文界面里漏中文；更糟的是内层的 key 没了，
+    /// [`Self::is_aborted`] 认不出中止，那一趟被当成真失败。
+    ///
+    /// 留在结构里、内层自己到上屏那一刻才渲染，这两件事才都成立。
+    cause: Option<Box<Message>>,
+}
+
+impl Message {
+    /// 一句不带参数的文案。
+    pub fn msg(key: &'static str) -> Self {
+        Self {
+            key,
+            args: Vec::new(),
+            verbatim: None,
+            cause: None,
+        }
+    }
+
+    /// 一句带占位符的文案。实参按给的顺序存，不影响：
+    /// 英文的语序由译文自己定，实参对不上号才要紧。
+    pub fn args(key: &'static str, args: &[(&'static str, String)]) -> Self {
+        Self {
+            key,
+            args: args.to_vec(),
+            verbatim: None,
+            cause: None,
+        }
+    }
+
+    /// **透传的原文**：IO 错误、远端服务器返回的消息、协议报文的正文
+    /// 都走这条路。
+    pub fn verbatim(text: impl Into<String>) -> Self {
+        Self {
+            key: "",
+            args: Vec::new(),
+            verbatim: Some(text.into()),
+            cause: None,
+        }
+    }
+
+    /// 在一句自己的措辞里**包住另一个错误**：`key` 里的 `{error}`
+    /// 拿 `cause` 填，`key` 里没有别的占位符。
+    ///
+    /// 这是链式错误的正路：`explain` 之类一层层往上包，每层说清
+    /// 「当时在干什么」，内层那句负责说「到底哪儿错了」。内层保持
+    /// [`Message`] 而不是提前 `to_string()`，理由见 [`Self::cause`]。
+    ///
+    /// ```ignore
+    /// Message::caused("下载：写盘失败：{error}", io_error)
+    /// ```
+    pub fn caused(key: &'static str, cause: impl Cause) -> Self {
+        Self::caused_with(key, &[], cause)
+    }
+
+    /// [`Self::caused`] 加上别的占位符（「建不了 {name}：{error}」那种）。
+    ///
+    /// `args` 里**不要**再放 `"error"`——它由 `cause` 填，
+    /// 放了也是被 [`Self::cause`] 覆盖掉，白写一遍。
+    pub fn caused_with(
+        key: &'static str,
+        args: &[(&'static str, String)],
+        cause: impl Cause,
+    ) -> Self {
+        Self {
+            key,
+            args: args.to_vec(),
+            verbatim: None,
+            cause: Some(Box::new(cause.into_message())),
+        }
+    }
+
+    /// 这句话是不是透传的原文（不是我们自己的措辞）。
+    pub fn is_verbatim(&self) -> bool {
+        self.verbatim.is_some()
+    }
+
+    /// 用户按了中止。
+    ///
+    /// 走 [`Self::msg`] 而不是 `verbatim`：中止是我们自己的措辞，
+    /// 而且判据（[`Self::is_aborted`]）全靠它。
+    pub fn aborted() -> Self {
+        Self::msg(ABORTED)
+    }
+
+    /// **这句话是不是"用户叫停了这一趟"**。
+    ///
+    /// **一层层往内看**：中止常常被包在好几层措辞里
+    /// （「下载：写盘失败：已中止」），只看最外层的 key 认不出来。
+    ///
+    /// 单独给一个方法而不是让调用点写 `is("已中止")`：那个字面量
+    /// 在三个文件里各写一遍，改文案就断了一处，而断掉的地方不报编译错误
+    /// ——它只是安静地永远返回 false，于是「被叫停」被当成「真失败」。
+    pub fn is_aborted(&self) -> bool {
+        self.key == ABORTED || self.cause.as_deref().is_some_and(Message::is_aborted)
+    }
+
+    /// **这句话是不是某个 key**：给拿文案当判据的地方用。
+    ///
+    /// 存在的理由是 `ops.rs` 里有一处
+    /// `if error.contains("已中止")` ——那是在判"这一趟是被用户叫停的"。
+    /// 拿显示文案当条件，在切到英文之后那句判据就永远不成立。
+    /// 所以比的是 [`Self::key`]，跟语言无关。
+    pub fn is(&self, key: &str) -> bool {
+        self.key == key
+    }
+
+    /// 按当前语言说这句话。
+    pub fn say(&self, cx: &gpui_kit::App) -> String {
+        let locale = crate::settings::Settings::peek(cx, |settings| settings.locale());
+        self.say_in(locale)
+    }
+
+    /// 按指定语言说这句话（纯函数版，给单测与没有 `cx` 的地方用）。
+    ///
+    /// **内层跟着外层一起翻**：内层是 [`Self::cause`]，
+    /// 到这一刻才渲染，所以英文界面里不会出现
+    /// 「Download: write failed: 已中止」这种半中半英。
+    pub fn say_in(&self, locale: Locale) -> String {
+        match &self.verbatim {
+            Some(text) => text.clone(),
+            None => match &self.cause {
+                Some(cause) => {
+                    let mut args = self.args.clone();
+                    args.push(("error", cause.say_in(locale)));
+                    fill(&lookup(locale, self.key), &args)
+                }
+                None => fill(&lookup(locale, self.key), &self.args),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // **`Display` 恒给中文**：它存在的意义是"还没上屏的中间态
+        // 有个能看的字符串"（`Err` 的错误类型、`eprintln!("{msg}")`）。
+        // 上屏处一律走 `say` / `say_in`——那是唯一知道语言的地方。
+        f.write_str(&self.say_in(Locale::ZhHans))
+    }
+}
+
+impl std::error::Error for Message {}
+
+/// 能当 [`Message::cause`] 的东西。
+///
+/// **为什么不直接用 `impl Into<Message>`**：那样每个第三方错误类型
+/// （`ZipError`、`russh::Error`、`suppaftp::FtpError`、`regex::Error`…）
+/// 都得写一条 `From`，而它们一共 6 类、分布在 4 个 crate 里——
+/// `i18n` 得反过来依赖它们。
+///
+/// **为什么不能给所有 `Display` 都套 blanket impl**：`Message` 自己
+/// 也实现了 `Display`（给 `eprintln!` 和中间态用），泛型 impl 会跟
+/// `impl Cause for Message` 撞上，只能靠 negative impl 挡——那更绕。
+///
+/// 于是只给三类做 impl，其余的（上面那 6 种第三方错误）在调用点
+/// `.to_string()`。对它们来说那是**唯一正确的处理**：那些句子是
+/// 第三方库说的，我们翻它只会让用户认不出来源。
+pub trait Cause {
+    fn into_message(self) -> Message;
+}
+
+impl Cause for Message {
+    fn into_message(self) -> Message {
+        self
+    }
+}
+
+impl Cause for String {
+    fn into_message(self) -> Message {
+        Message::verbatim(self)
+    }
+}
+
+impl Cause for &str {
+    fn into_message(self) -> Message {
+        Message::verbatim(self)
+    }
+}
+
+impl Cause for std::io::Error {
+    /// 走 [`From<std::io::Error>`]：认 [`Aborted`] 哨兵。
+    fn into_message(self) -> Message {
+        self.into()
+    }
+}
+
+/// 用户中止的 key。**唯一一份**，别在别处再写一遍字面量。
+pub const ABORTED: &str = "已中止";
+
+/// 「用户按了中止」这个哨兵的类型。
+///
+/// **为什么哨兵要带类型而不是只带一句文案**：搬运链上有个 [`std::io::Read`]
+/// 的包装（`ops::Reporting`）在回调说停时只能递 `io::Error`——
+/// trait 的返回类型改不了。那条错误一路冒到上层，路上要经过
+/// `From<io::Error> for Message`，而那一步默认把错误当**别人的话**原样透传，
+/// 于是 key 就丢了；等上层判 `is_aborted()` 时，它对着一个空 key 永远返回
+/// false——「用户叫停」被当成「真失败」。
+///
+/// 认类型的办法是 `downcast_ref`：错误里带一个我们自己的类型，
+/// 透传那一步就认得出「这句是我们自己造的」，把它还原成带 key 的 `Message`。
+/// 认文案（`text == "已中止"`）也能通，但那跟当初用 `contains("已中止")`
+/// 是同一类毛病：把判据绑在一句能改、能翻译的字面上。
+#[derive(Debug)]
+pub struct Aborted;
+
+impl std::fmt::Display for Aborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(ABORTED)
+    }
+}
+
+impl std::error::Error for Aborted {}
+
+/// [`Message`] 的别名：给错误签名用，写起来短一点。
+pub type Msg = Message;
+
+impl From<Message> for String {
+    /// **降级成中文原文**：给还没改成 `Msg` 的旧调用点用
+    /// （`Result<_, crate::i18n::Msg>` 的老签名里 `?` 一下就过去了）。
+    /// 那些点上屏时还是中文——这正是"改了一半"的样子，
+    /// 所以新写的代码别用这条路，直接把签名改成 `Result<_, Msg>`。
+    fn from(message: Message) -> String {
+        message.to_string()
+    }
+}
+
+impl From<String> for Message {
+    /// **透传的原文**：IO 错误、远端服务器返回的消息、协议报文的正文
+    /// 都走这条路。它们是**别人说的话**，不该被我们翻——
+    /// 把「Address has no host name」（NAS 那边返回的）翻成中文，
+    /// 用户排查时反而认不出这是谁说的。
+    fn from(text: String) -> Self {
+        Self::verbatim(text)
+    }
+}
+
+impl From<&str> for Message {
+    fn from(text: &str) -> Self {
+        Self::verbatim(text.to_string())
+    }
+}
+
+impl From<std::io::Error> for Message {
+    /// IO 错误**原样透传**：`fs::rename` 之类返回的东西里有
+    /// "Permission denied"、"No such file or directory"，
+    /// 那是操作系统的话，我们翻了它用户反而认不出。
+    /// 想加自己的措辞就在调用点包一层 `Message::args("改名失败：{error}", …)`。
+    ///
+    /// **例外是 [`Aborted`]**：那句话是我们自己造的（`Reporting` 只能递
+    /// `io::Error`），不是操作系统的抱怨。认它，把它还原成带 key 的 `Message`，
+    /// 否则上层判「这一趟是不是被叫停的」永远不成立。
+    fn from(error: std::io::Error) -> Self {
+        if error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Aborted>())
+            .is_some()
+        {
+            return Self::aborted();
+        }
+        Self::verbatim(error.to_string())
+    }
+}
+
 /// [`tr`] 的纯函数版：语言已经解析好了，直接查。
 ///
 /// 给那些**拿到的是别人的 `cx`** 的地方用——最常见的是
@@ -485,6 +783,458 @@ static EN: &[(&str, &str)] = &[
     // 程序的名字**——Windows 上的"Windows Terminal"、Linux 上的"GNOME 终端"
     // 各有各的本地化版本，这里硬编码一份英文只会跟系统对不上。
     // 而 App Store / Homebrew 那些名字本身就该按原样显示（iTerm2 就是 iTerm2）。
+
+    // ---- 错误信息 ----
+    //
+    // 这一批全是**错误**，跟上面那些操作项不一样的地方有两点：
+    //
+    // 1. 一半是自己造的措辞（翻），一半是别人说的话（不翻，见 `Message::verbatim`）。
+    // 2. 键里带占位符——`{error}` 是内层那句，`caused` 的 `cause` 字段负责填。
+    //    英文的语序跟中文不同，所以每条译文都得自己决定 `{error}` 放哪儿。
+    ("已中止", "Stopped"),
+    ("落不了盘：{error}", "Couldn't save to disk: {error}"),
+    (
+        "源和目标在同一个文件上",
+        "Source and target are the same file",
+    ),
+    (
+        "没有父目录，无法重命名",
+        "No parent directory, can't rename",
+    ),
+    // ---- 名字与路径 ----
+    ("名称不能为空", "Name can't be empty"),
+    (
+        "名称不能包含路径分隔符",
+        "Name can't contain a path separator",
+    ),
+    ("名称为空", "Name is empty"),
+    ("名称非法", "Name is not allowed"),
+    ("“{trimmed}”已存在", "“{trimmed}” already exists"),
+    (
+        "无法创建文件夹：{error}",
+        "Couldn't create the folder: {error}",
+    ),
+    ("重命名失败：{error}", "Rename failed: {error}"),
+    (
+        "已上传但删除本地源失败：{error}",
+        "Uploaded, but deleting the local source failed: {error}",
+    ),
+    (
+        "已拷贝但删除源文件失败：{error}",
+        "Copied, but deleting the source failed: {error}",
+    ),
+    (
+        "读不了源文件：{error}",
+        "Couldn't read the source file: {error}",
+    ),
+    ("读不了：{error}", "Couldn't read: {error}"),
+    ("删除失败：{error}", "Delete failed: {error}"),
+    ("删目录失败：{error}", "Couldn't delete the folder: {error}"),
+    ("上传失败：{error}", "Upload failed: {error}"),
+    ("下载失败：{error}", "Download failed: {error}"),
+    ("续传失败：{error}", "Resuming failed: {error}"),
+    (
+        "回传失败：{error}",
+        "Uploading the changes back failed: {error}",
+    ),
+    (
+        "写不进本地文件：{error}",
+        "Couldn't write to the local file: {error}",
+    ),
+    (
+        "写不了本地文件：{error}",
+        "Couldn't write the local file: {error}",
+    ),
+    (
+        "写不了临时文件：{error}",
+        "Couldn't write the temporary file: {error}",
+    ),
+    (
+        "看不了临时文件：{error}",
+        "Couldn't inspect the temporary file: {error}",
+    ),
+    (
+        "读不了临时文件：{error}",
+        "Couldn't read the temporary file: {error}",
+    ),
+    (
+        "建不了临时文件：{error}",
+        "Couldn't create the temporary file: {error}",
+    ),
+    (
+        "建不了临时目录：{error}",
+        "Couldn't create the temporary folder: {error}",
+    ),
+    ("建目录失败：{error}", "Couldn't create the folder: {error}"),
+    (
+        "建不了目标目录：{error}",
+        "Couldn't create the target folder: {error}",
+    ),
+    ("不能把文件夹移进它自己", "Can't move a folder into itself"),
+    ("这一项已经不存在了", "This item no longer exists"),
+    ("远程那一项已经不在了", "That remote item is gone"),
+    (
+        "起不了后台线程：{error}",
+        "Couldn't start the background thread: {error}",
+    ),
+    // ---- 撤销 ----
+    ("没有可撤销的操作", "Nothing to undo"),
+    (
+        "原位置已经有同名项目，先移走它再撤销",
+        "Something already sits at the original spot; move it first, then undo",
+    ),
+    (
+        "文件夹里已经有了新内容，先清空再撤销",
+        "The folder is no longer empty; clear it before undoing",
+    ),
+    (
+        "原文件已经不在改名后的位置了",
+        "The original file is no longer at its renamed spot",
+    ),
+    ("回收站里找不到这一项", "That item isn't in the trash"),
+    (
+        "找不到个人文件夹，无法定位回收站",
+        "Can't locate your home folder, so the trash is out of reach",
+    ),
+    (
+        "回收站里找不到这次删掉的项，请手动打开回收站放回",
+        "That item isn't in the trash; put it back from the trash yourself",
+    ),
+    (
+        "这个平台不支持从回收站撤销，请手动打开回收站放回",
+        "This platform can't undo from the trash; put it back yourself",
+    ),
+    // ---- 连接 ----
+    ("没有这条连接", "There's no such connection"),
+    ("这条远程连接已经不在了", "That remote connection is gone"),
+    ("这条连接不支持续传", "This connection can't resume"),
+    ("这条连接正在忙", "This connection is busy"),
+    ("服务器地址不能为空", "Server address can't be empty"),
+    (
+        "地址要写成 https://… 这样",
+        "Write the address like https://…",
+    ),
+    ("地址里没有主机名", "The address has no host name"),
+    ("端口号不对：{port}", "Wrong port: {port}"),
+    (
+        "连不上 {address}：{error}",
+        "Can't connect to {address}: {error}",
+    ),
+    (
+        "连不上 {host}:{port}：{error}",
+        "Can't connect to {host}:{port}: {error}",
+    ),
+    (
+        "进不去起始目录 {start}：{error}",
+        "Can't enter the start folder {start}: {error}",
+    ),
+    (
+        "进不去起始目录 {target}：{error}",
+        "Can't enter the start folder {target}: {error}",
+    ),
+    ("登录失败：{error}", "Sign-in failed: {error}"),
+    (
+        "开不了会话通道：{error}",
+        "Couldn't open the session channel: {error}",
+    ),
+    (
+        "服务器不给开 SFTP：{error}",
+        "The server wouldn't open SFTP: {error}",
+    ),
+    ("SFTP 握手失败：{error}", "SFTP handshake failed: {error}"),
+    (
+        "打不开钥匙串：{error}",
+        "Couldn't open the keychain: {error}",
+    ),
+    (
+        "找不到设置文件位置",
+        "Can't work out where the settings file lives",
+    ),
+    (
+        "找不到会话文件位置",
+        "Can't work out where the session file lives",
+    ),
+    (
+        "找不到恢复文件位置",
+        "Can't work out where the recovery file lives",
+    ),
+    ("序列化失败：{error}", "Serializing failed: {error}"),
+    // ---- 列目录与查询 ----
+    ("列目录失败：{error}", "Listing the folder failed: {error}"),
+    (
+        "列目录：读不回响应：{error}",
+        "Listing the folder: couldn't read the reply: {error}",
+    ),
+    (
+        "列目录：服务器回 {status}",
+        "Listing the folder: the server returned {status}",
+    ),
+    (
+        "列目录：服务器回 {status}：{reason}",
+        "Listing the folder: the server returned {status}: {reason}",
+    ),
+    (
+        "列目录：这份 XML 读不了：{error}",
+        "Listing the folder: can't read this XML: {error}",
+    ),
+    (
+        "查询：服务器回 {status}",
+        "Querying: the server returned {status}",
+    ),
+    (
+        "查询：读不回响应：{error}",
+        "Querying: couldn't read the reply: {error}",
+    ),
+    ("查询：{error}", "Querying: {error}"),
+    ("服务器回 {status}", "The server returned {status}"),
+    (
+        "删除：服务器回 {status}：{reason}",
+        "Deleting: the server returned {status}: {reason}",
+    ),
+    (
+        "服务器回的东西里没有文件",
+        "The server's reply has no file in it",
+    ),
+    (
+        "列不出 {source:?}：{error}",
+        "Couldn't list {source:?}: {error}",
+    ),
+    (
+        "看不了 {source:?}：{error}",
+        "Couldn't inspect {source:?}: {error}",
+    ),
+    (
+        "读不了 {source:?}：{error}",
+        "Couldn't read {source:?}: {error}",
+    ),
+    (
+        "XML 读不懂：{error}",
+        "Can't make sense of the XML: {error}",
+    ),
+    // ---- S3 / 对象存储 ----
+    (
+        "认不出桶名：把桶名写在地址里，如 https://host/bucket/",
+        "Can't tell which bucket: put it in the address, like https://host/bucket/",
+    ),
+    // ---- 压缩包 ----
+    ("不是 zip 压缩包", "Not a zip archive"),
+    (
+        "读不了这个压缩包：{error}",
+        "Couldn't read this archive: {error}",
+    ),
+    ("打不开：{error}", "Couldn't open: {error}"),
+    (
+        "建不了 {zip:?}：{error}",
+        "Couldn't create {zip:?}: {error}",
+    ),
+    ("收尾写坏了：{error}", "The final write went wrong: {error}"),
+    ("先选中要打包的东西", "Select something to package first"),
+    ("没有可打包的内容", "There's nothing to package"),
+    ("没有“{field}:”这个字段", "There's no “{field}:” field"),
+    // ---- 传输细节 ----
+    (
+        "下载：写盘失败：{error}",
+        "Downloading: couldn't write to disk: {error}",
+    ),
+    (
+        "下载：写不下去：{error}",
+        "Downloading: couldn't keep writing: {error}",
+    ),
+    (
+        "下载：读不回来：{error}",
+        "Downloading: couldn't read the reply: {error}",
+    ),
+    (
+        "下载：服务器回 {status}（要的是 {wanted}）",
+        "Downloading: the server returned {status} (wanted {wanted})",
+    ),
+    (
+        "续传：定位不到 {offset}：{error}",
+        "Resuming: can't position at {offset}: {error}",
+    ),
+    (
+        "打不开 {absolute}：{error}",
+        "Couldn't open {absolute}: {error}",
+    ),
+    ("建不了 {name}：{error}", "Couldn't create {name}: {error}"),
+    (
+        "建不了 {name} 的上级目录：{error}",
+        "Couldn't create {name}'s parent folder: {error}",
+    ),
+    ("写不了 {name}：{error}", "Couldn't write {name}: {error}"),
+    (
+        "写不了目录 {name}：{error}",
+        "Couldn't write the folder {name}: {error}",
+    ),
+    (
+        "写 {name} 写到一半：{error}",
+        "Writing {name}: it broke halfway: {error}",
+    ),
+    (
+        "解 {name} 解到一半：{error}",
+        "Unpacking {name}: it broke halfway: {error}",
+    ),
+    // ---- 终端 ----
+    ("没找到可用的终端程序", "No usable terminal program found"),
+    ("写不进终端", "Couldn't write to the terminal"),
+    ("终端没在跑", "The terminal isn't running"),
+    ("{path} 不是目录", "{path} isn't a directory"),
+    // ---- 杂项 ----
+    (
+        "关不掉远程文件：{error}",
+        "Couldn't close the remote file: {error}",
+    ),
+    ("先选中一个远程文件", "Select a remote file first"),
+    (
+        "切二进制模式失败：{error}",
+        "Couldn't switch to binary mode: {error}",
+    ),
+    ("正则写错了：{error}", "The pattern is wrong: {error}"),
+    (
+        "地址要写成 https://… 这样",
+        "Write the address like https://…",
+    ),
+    (
+        "起不了网络运行时：{error}",
+        "Couldn't start the network runtime: {error}",
+    ),
+    ("{doing}失败：{detail}", "{doing} failed: {detail}"),
+    // ---- 搜索语法（`query.rs`）----
+    //
+    // 提示翻，语法关键词不翻：`OR` / `NOT` / `content:` / `tag:` 在任何界面里
+    // 都得是用户能照着敲的那几个字符——译成 "或者" 的话，用户看懂了提示，
+    // 敲进去却搜不出东西。键里带上关键词本身，译文里也原样留着它，
+    // 这样用户看提示时看到的字，跟他要敲的字是同一批。
+    ("OR 后面少了条件", "OR needs something to its right"),
+    (
+        "NOT 后面少了要排除的东西",
+        "NOT needs something to exclude after it",
+    ),
+    (
+        "- 后面少了要排除的东西",
+        "- needs something to exclude after it",
+    ),
+    (
+        "! 后面少了要排除的东西",
+        "! needs something to exclude after it",
+    ),
+    (
+        "content: 后面要写要找的词",
+        "content: needs the word to look for",
+    ),
+    ("tag: 后面要写标签", "tag: needs a tag"),
+    (
+        "引号没配对：{quote}{rest}",
+        "Unmatched quote: {quote}{rest}",
+    ),
+    ("看不懂：{rest}", "Can't make sense of this: {rest}"),
+    (
+        "大小看不懂：{value}",
+        "Can't make sense of this size: {value}",
+    ),
+    (
+        "大小的单位只认 B/K/M/G/T，不是 {unit}",
+        "Size units are only B/K/M/G/T, not {unit}",
+    ),
+    (
+        "时间看不懂：{value}",
+        "Can't make sense of this time: {value}",
+    ),
+    (
+        "年份看不懂：{value}",
+        "Can't make sense of this year: {value}",
+    ),
+    (
+        "月份看不懂：{value}",
+        "Can't make sense of this month: {value}",
+    ),
+    (
+        "日期看不懂：{value}",
+        "Can't make sense of this date: {value}",
+    ),
+    (
+        "日期不在日历上：{value}",
+        "That date isn't on the calendar: {value}",
+    ),
+    (
+        "type 只认 dir/file/image/video/audio/text/archive/code，不是“{bare}”",
+        "type only takes dir/file/image/video/audio/text/archive/code, not “{bare}”",
+    ),
+    (
+        "颜色只认 {names}，不是“{bare}”",
+        "Colors are only {names}, not “{bare}”",
+    ),
+    ("没有“{field}:”这个字段", "There's no “{field}:” field"),
+    // ---- 协议层零散 ----
+    ("无法解析原文件名", "Can't work out the original name"),
+    (
+        "读不了本地文件：{error}",
+        "Couldn't read the local file: {error}",
+    ),
+    ("读不回响应：{error}", "Couldn't read the reply: {error}"),
+    (
+        "问不到当前目录：{error}",
+        "Couldn't ask for the current folder: {error}",
+    ),
+    (
+        "问不到登录目录：{error}",
+        "Couldn't ask for the sign-in folder: {error}",
+    ),
+    ("改名失败：{error}", "Rename failed: {error}"),
+    (
+        "钥匙串写不进去：{error}",
+        "Couldn't write to the keychain: {error}",
+    ),
+    (
+        "建不了本地目录：{error}",
+        "Couldn't create the local folder: {error}",
+    ),
+    (
+        "建不了暂存目录：{error}",
+        "Couldn't create the staging folder: {error}",
+    ),
+    (
+        "列不了本地目录：{error}",
+        "Couldn't list the local folder: {error}",
+    ),
+    (
+        "已下载但删除远程源失败：{error}",
+        "Downloaded, but deleting the remote source failed: {error}",
+    ),
+    ("不是远程路径：{path}", "Not a remote path: {path}"),
+    (
+        "不支持在两个不同的服务器之间直接搬运",
+        "Can't move between two different servers directly",
+    ),
+    (
+        "上传：服务器回 {status}：{reason}",
+        "Uploading: the server returned {status}: {reason}",
+    ),
+    (
+        "下载：服务器回 {status}（要的是 {wanted}）：{reason}",
+        "Downloading: the server returned {status} (wanted {wanted}): {reason}",
+    ),
+    (
+        "复制：服务器回 {status}：{reason}",
+        "Copying: the server returned {status}: {reason}",
+    ),
+    (
+        "建目录：服务器回 {status}：{reason}",
+        "Creating the folder: the server returned {status}: {reason}",
+    ),
+    (
+        "落不了盘（{from} → {to}）：{rename_error}",
+        "Couldn't save to disk ({from} → {to}): {rename_error}",
+    ),
+    (
+        "“{name}”已经不在改名后的位置了",
+        "“{name}” is no longer at its renamed spot",
+    ),
+    ("启动{name}失败：{error}", "Couldn't start {name}: {error}"),
+    (
+        "文件太大，只比了前 {size}",
+        "File too large, only the first {size} were compared",
+    ),
 ];
 
 /// 英文表里有没有漏掉不该出现的条目：译文等于原文（等于没翻），
@@ -539,6 +1289,7 @@ pub fn cli_locale() -> Option<Locale> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn language_codes_round_trip() {
@@ -628,4 +1379,225 @@ mod tests {
         );
         assert_eq!(fill("没有占位符", &[]), "没有占位符");
     }
+
+    // ---- Message ----
+
+    /// 源码里用到的每一个 `Message` key 都得在英文表里。
+    ///
+    /// **为什么这条测试值得有**：查不到译文时 `lookup` 会回落中文原文，
+    /// 界面上只是「那一句还是中文」——**不会崩、不会报警**。
+    /// 于是漏翻一条的代价是几个月后才被人在英文界面里发现，
+    /// 而那条错误信息只有触发那个错误的人才看得到。
+    /// 换个键名或者抄错一个字，效果跟漏翻一模一样，也一样查不出来。
+    ///
+    /// 扫源码而不是让人来登记：登记表一定会漏，而且漏了没人知道。
+    /// 认不出的构造方式（`explain` 拼的 `{doing}失败：{detail}` 之类）
+    /// 单独列在 [`EXEMPT_KEYS`] 里，每条写清为什么。
+    #[test]
+    fn every_message_key_has_an_english_entry() {
+        let mut missing = Vec::new();
+        for (key, where_) in message_keys_in_src() {
+            if !EN.iter().any(|(k, _)| *k == key) && !EXEMPT_KEYS.contains(&key) {
+                missing.push(format!("{key}（{where_}）"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "这些错误信息还没有英文译文：\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn a_message_speaks_english_when_english_is_chosen() {
+        let message = Message::msg("名称不能为空");
+        assert_eq!(message.say_in(Locale::En), "Name can't be empty");
+        // 中文下就是原文（key 自己就是中文，恒等）。
+        assert_eq!(message.say_in(Locale::ZhHans), "名称不能为空");
+    }
+
+    /// 透传的原文**不查表**：那句英文是 NAS / zip / 操作系统说的，
+    /// 翻了它用户排查时认不出是谁讲的。
+    #[test]
+    fn a_verbatim_message_is_never_translated() {
+        let message = Message::verbatim("Permission denied (os error 13)");
+        assert!(message.is_verbatim());
+        assert_eq!(
+            message.say_in(Locale::En),
+            "Permission denied (os error 13)"
+        );
+        assert_eq!(
+            message.say_in(Locale::ZhHans),
+            "Permission denied (os error 13)"
+        );
+    }
+
+    /// **链式错误的内层跟着外层一起翻**。
+    ///
+    /// 这条是 `caused` 存在的全部理由：内层如果是提前 `to_string()`
+    /// 冻住的，英文界面里就会露出半中半英的
+    /// 「Download: couldn't write to disk: 已中止」。
+    #[test]
+    fn a_wrapped_message_speaks_english_all_the_way_down() {
+        let wrapped = Message::caused("下载：写盘失败：{error}", Message::msg("已中止"));
+        assert_eq!(
+            wrapped.say_in(Locale::En),
+            "Downloading: couldn't write to disk: Stopped"
+        );
+        // 中文下还是那句中文，一层套一层。
+        assert_eq!(wrapped.say_in(Locale::ZhHans), "下载：写盘失败：已中止");
+    }
+
+    /// 带别的占位符的那一层，`{name}` 和 `{error}` 各填各的。
+    #[test]
+    fn a_wrapper_keeps_its_other_placeholders() {
+        let wrapped = Message::caused_with(
+            "建不了 {name}：{error}",
+            &[("name", "报告.txt".to_string())],
+            Message::verbatim("Permission denied"),
+        );
+        assert_eq!(
+            wrapped.say_in(Locale::En),
+            "Couldn't create 报告.txt: Permission denied"
+        );
+    }
+
+    /// 中止哨兵穿过 `io::Error` 那一跳之后，key 还在。
+    ///
+    /// **为什么值得单测**：`ops::Reporting` 实现的是 `std::io::Read`，
+    /// 回调说停时只能递 `io::Error`，那一步默认把错误当**别人的话**原样透传。
+    /// key 一丢，上层判 `is_aborted()` 就永远不成立——
+    /// 「用户叫停」被当成「真失败」，暂存被扫掉、服务器上的残骸被删。
+    #[test]
+    fn the_abort_sentinel_survives_being_wrapped_in_an_io_error() {
+        let as_io: std::io::Error = std::io::Error::other(Aborted);
+        let message: Message = as_io.into();
+        assert!(
+            message.is_aborted(),
+            "哨兵经过 io::Error 之后就不该再被当成 verbatim"
+        );
+        assert!(!message.is_verbatim());
+
+        // 包一层之后依然认得出：一层套几层都不该丢。
+        let wrapped = Message::caused("上传失败：{error}", std::io::Error::other(Aborted));
+        assert!(wrapped.is_aborted(), "包了别的措辞之后仍要认得出是被叫停");
+
+        // 而**普通的 IO 错误不该**被误判成中止——那会让真失败白走一遍。
+        let genuine: Message = std::io::Error::from(std::io::ErrorKind::NotFound).into();
+        assert!(!genuine.is_aborted(), "「文件不存在」不是「用户叫停」");
+    }
+
+    #[test]
+    fn a_plain_message_is_not_mistaken_for_an_abort() {
+        assert!(!Message::msg("下载失败：{error}").is_aborted());
+        assert!(
+            !Message::verbatim("已中止").is_aborted(),
+            "透传的「已中止」是我们的话吗？不是"
+        );
+        assert!(Message::aborted().is_aborted());
+    }
+
+    /// `Display` 恒给中文——它的存在是让还没上屏的中间态有个能看的字符串。
+    #[test]
+    fn display_is_always_chinese_whatever_the_language() {
+        assert_eq!(Message::msg("名称不能为空").to_string(), "名称不能为空");
+        assert_eq!(
+            Message::caused("下载：写盘失败：{error}", Message::msg("已中止")).to_string(),
+            "下载：写盘失败：已中止"
+        );
+        // 透传的原文在 `Display` 里也原样（那是别人说的话）。
+        assert_eq!(
+            Message::verbatim("Address has no host name").to_string(),
+            "Address has no host name"
+        );
+    }
+
+    /// 扫源码里所有 `Message::{msg,args,caused,caused_with}` 的第一个字符串参数。
+    ///
+    /// 返回 (key, 位置) —— 位置进报错信息，让人能直接跳过去补。
+    fn message_keys_in_src() -> Vec<(&'static str, String)> {
+        // 用 `include_str!` 把源码读进来：`cargo test` 时 CWD 不保证是
+        // 项目根，靠相对路径读文件会时灵时不灵。`env!("CARGO_MANIFEST_DIR")`
+        // 才是编译器给的可信路径。
+        let root = env!("CARGO_MANIFEST_DIR");
+        let src = format!("{root}/src");
+        let mut out = Vec::new();
+        // 构造方式名 → 认它的第几个参数是关键。
+        let forms = [
+            ("Message::msg(", 1),
+            ("Message::args(", 1),
+            ("Message::caused(", 1),
+            ("Message::caused_with(", 1),
+        ];
+        for name in fs::read_dir(&src).expect("读得到 src 目录") {
+            let path = name.expect("目录项").path();
+            if path.extension().and_then(|it| it.to_str()) != Some("rs") {
+                continue;
+            }
+            let file = path
+                .file_name()
+                .and_then(|it| it.to_str())
+                .unwrap_or_default();
+            // `i18n.rs` 自己是表，不扫（否则每条表项都变成"没翻"）。
+            if file == "i18n.rs" {
+                continue;
+            }
+            // macOS 在外置卷（这里是 Ventoy）上会留下一堆 `._xxx.rs`
+            // 资源叉残片：不是 UTF-8，读它会 panic，扫它也没意义。
+            // 按名字跳过而不是读失败就算了——后者会把**真的**源码文件
+            // 编码坏了这件事一起吞掉，那种情况该报错而不是安静地少扫一个。
+            if file.starts_with("._") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("源码是 UTF-8");
+            for (line_no, line) in text.lines().enumerate() {
+                for (form, arity) in forms {
+                    let Some(at) = line.find(form) else { continue };
+                    // 取 form 之后第一个字符串字面量——这些构造的第一个参数
+                    // 一定是 key（`caused` 的第 2 参才是 cause）。
+                    let rest = &line[at + form.len()..];
+                    let rest = rest.trim_start();
+                    let Some(rest) = rest.strip_prefix('"') else {
+                        continue;
+                    };
+                    let mut key = String::new();
+                    let mut escaped = false;
+                    let mut closed = false;
+                    for c in rest.chars() {
+                        if escaped {
+                            key.push(c);
+                            escaped = false;
+                            continue;
+                        }
+                        match c {
+                            '\\' => escaped = true,
+                            '"' => {
+                                closed = true;
+                                break;
+                            }
+                            _ => key.push(c),
+                        }
+                    }
+                    if !closed {
+                        continue;
+                    }
+                    let _ = arity;
+                    let leaked: &'static str = Box::leak(key.into_boxed_str());
+                    out.push((leaked, format!("{file}:{}", line_no + 1)));
+                }
+            }
+        }
+        out
+    }
+
+    /// 扫不出来的 key，及原因。
+    ///
+    /// `explain` 拼的键（`{doing}失败：{detail}`）是运行时用实参拼出来的，
+    /// 源码里只有格式串——那条的英文走的是同一个格式串，
+    /// 所以表里留着它。
+    const EXEMPT_KEYS: &[&str] = &[
+        "{doing}失败：{detail}",
+        // 键是 `i18n::ABORTED` 这个 const，不是字面量。
+        ABORTED,
+    ];
 }

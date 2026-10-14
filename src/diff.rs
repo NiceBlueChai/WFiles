@@ -178,8 +178,9 @@ impl Loaded {
     }
 }
 
-pub fn load(path: &Path) -> Result<Loaded, String> {
-    let bytes = std::fs::read(path).map_err(|error| format!("读不了：{error}"))?;
+pub fn load(path: &Path) -> Result<Loaded, crate::i18n::Msg> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| crate::i18n::Message::caused("读不了：{error}", error))?;
     let truncated = bytes.len() > MAX_BYTES;
     let kept = &bytes[..bytes.len().min(MAX_BYTES)];
     let head = &kept[..kept.len().min(SNIFF_BYTES)];
@@ -725,7 +726,7 @@ mod tests {
     #[test]
     fn a_missing_file_says_why() {
         let error = load(Path::new("/并不存在的文件")).expect_err("该报错");
-        assert!(error.contains("读不了"));
+        assert!(error.to_string().contains("读不了"));
     }
 
     #[test]

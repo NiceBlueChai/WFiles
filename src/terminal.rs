@@ -319,18 +319,29 @@ pub fn command(terminal: &Terminal, dir: &Path) -> Command {
 }
 
 /// 打开一个终端窗口。返回实际用的是哪个终端，失败时给人能看懂的原因。
-pub fn open(id: &str, dir: &Path) -> Result<String, String> {
+pub fn open(id: &str, dir: &Path) -> Result<String, crate::i18n::Msg> {
     let Some(terminal) = resolve(id) else {
-        return Err("没找到可用的终端程序".to_string());
+        return Err(crate::i18n::Message::msg("没找到可用的终端程序"));
     };
     if !dir.is_dir() {
-        return Err(format!("{} 不是目录", dir.display()));
+        return Err(crate::i18n::Message::args(
+            "{path} 不是目录",
+            &[("path", dir.display().to_string())],
+        ));
     }
 
     command(&terminal, dir)
         .spawn()
         .map(|_| terminal.name.to_string())
-        .map_err(|error| format!("启动{}失败：{error}", terminal.name))
+        .map_err(|error| {
+            crate::i18n::Message::args(
+                "启动{name}失败：{error}",
+                &[
+                    ("name", terminal.name.to_string()),
+                    ("error", error.to_string()),
+                ],
+            )
+        })
 }
 
 #[cfg(test)]
@@ -422,7 +433,7 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
 
         let error = open(AUTO, &file).unwrap_err();
-        assert!(error.contains("不是目录"), "实际错误：{error}");
+        assert!(error.to_string().contains("不是目录"), "实际错误：{error}");
     }
 
     #[cfg(unix)]

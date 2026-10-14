@@ -152,7 +152,7 @@ struct ConnectState {
     /// 正在后台试连：按钮变灰，也不再重复发起。
     busy: bool,
     /// 上一次试连失败的原因。
-    error: Option<String>,
+    error: Option<crate::i18n::Msg>,
 }
 
 /// 命令面板的当前状态。候选项在打开时快照，
@@ -1372,7 +1372,7 @@ impl WFilesApp {
         let name = value(&state.name);
 
         if url.is_empty() {
-            state.error = Some("服务器地址不能为空".to_string());
+            state.error = Some(crate::i18n::Message::msg("服务器地址不能为空"));
             cx.notify();
             return;
         }
@@ -3512,7 +3512,7 @@ impl WFilesApp {
                 div()
                     .text_xs()
                     .text_color(cx.theme().danger)
-                    .child(error.clone()),
+                    .child(error.say(cx)),
             );
         }
 
@@ -3599,7 +3599,7 @@ impl WFilesApp {
                 div()
                     .text_xs()
                     .text_color(danger)
-                    .child(error.clone())
+                    .child(error.say(cx))
                     .into_any_element()
             } else if item.collision {
                 div()
@@ -3825,10 +3825,10 @@ impl WFilesApp {
                 div()
                     .id("connect-error")
                     .test_support()
-                    .aria_label(error.clone())
+                    .aria_label(error.say(cx))
                     .text_xs()
                     .text_color(cx.theme().danger)
-                    .child(error.clone()),
+                    .child(error.say(cx)),
             );
         }
         if state.busy {

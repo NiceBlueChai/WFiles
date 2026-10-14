@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// 成功改名的一组文件：原路径 → 新路径。
 pub type Renamed = Vec<(PathBuf, PathBuf)>;
 /// 失败的一组文件：原路径加上失败原因。
-pub type RenameFailures = Vec<(PathBuf, String)>;
+pub type RenameFailures = Vec<(PathBuf, crate::i18n::Msg)>;
 
 /// 一套批量重命名规则。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +46,7 @@ pub struct BulkRenamePreview {
     pub old_name: String,
     pub new_name: String,
     /// 这一项不能执行的原因（名字非法、与磁盘上其他项重名等）。
-    pub error: Option<String>,
+    pub error: Option<crate::i18n::Msg>,
     /// 是否与当前目录里另一个被选中的项撞名。
     pub collision: bool,
     /// 新旧名字是否相同（没变化就不必执行）。
@@ -126,15 +126,15 @@ pub fn preview(paths: &[PathBuf], rule: &BulkRename) -> Vec<BulkRenamePreview> {
     let mut seen: Vec<String> = Vec::new();
     for preview in &mut previews {
         if preview.new_name.is_empty() {
-            preview.error = Some("名称为空".to_string());
+            preview.error = Some(crate::i18n::Message::msg("名称为空"));
             continue;
         }
         if preview.new_name.contains('/') || preview.new_name.contains('\\') {
-            preview.error = Some("名称不能包含路径分隔符".to_string());
+            preview.error = Some(crate::i18n::Message::msg("名称不能包含路径分隔符"));
             continue;
         }
         if preview.new_name == "." || preview.new_name == ".." {
-            preview.error = Some("名称非法".to_string());
+            preview.error = Some(crate::i18n::Message::msg("名称非法"));
             continue;
         }
         if seen.contains(&preview.new_name) {

@@ -27,20 +27,29 @@ pub struct Ftp {
 }
 
 impl Ftp {
-    pub fn new(config: &Config, password: &str) -> Result<Self, String> {
+    pub fn new(config: &Config, password: &str) -> Result<Self, crate::i18n::Msg> {
         let address = address_of(&config.url)?;
-        let mut stream =
-            FtpStream::connect(&address).map_err(|error| format!("连不上 {address}：{error}"))?;
+        let mut stream = FtpStream::connect(&address).map_err(|error| {
+            crate::i18n::Message::caused_with(
+                "连不上 {address}：{error}",
+                &[("address", address.to_string())],
+                error.to_string(),
+            )
+        })?;
         stream
             .login(config.user.as_str(), password)
-            .map_err(|error| format!("登录失败：{error}"))?;
+            .map_err(|error| {
+                crate::i18n::Message::caused("登录失败：{error}", error.to_string())
+            })?;
         // 二进制模式：ASCII 模式会顺手把换行改掉，传压缩包就废了。
         stream
             .transfer_type(suppaftp::types::FileType::Binary)
-            .map_err(|error| format!("切二进制模式失败：{error}"))?;
-        let base = stream
-            .pwd()
-            .map_err(|error| format!("问不到当前目录：{error}"))?;
+            .map_err(|error| {
+                crate::i18n::Message::caused("切二进制模式失败：{error}", error.to_string())
+            })?;
+        let base = stream.pwd().map_err(|error| {
+            crate::i18n::Message::caused("问不到当前目录：{error}", error.to_string())
+        })?;
         // 地址里写了子目录（`ftp://host/pub/`）或配置里填了起始目录，
         // 就先 `CWD` 进去：用户填的那个目录才是他想的根。
         let start = if config.root.trim_matches('/').is_empty() {
@@ -52,12 +61,16 @@ impl Ftp {
             base
         } else {
             let target = absolute(&base, &start);
-            stream
-                .cwd(&target)
-                .map_err(|error| format!("进不去起始目录 {target}：{error}"))?;
-            stream
-                .pwd()
-                .map_err(|error| format!("问不到当前目录：{error}"))?
+            stream.cwd(&target).map_err(|error| {
+                crate::i18n::Message::caused_with(
+                    "进不去起始目录 {target}：{error}",
+                    &[("target", target.to_string())],
+                    error.to_string(),
+                )
+            })?;
+            stream.pwd().map_err(|error| {
+                crate::i18n::Message::caused("问不到当前目录：{error}", error.to_string())
+            })?
         };
         Ok(Self {
             id: config.id.clone(),
@@ -71,8 +84,10 @@ impl Ftp {
         absolute(&self.base, path)
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, FtpStream>, String> {
-        self.stream.lock().map_err(|_| "这条连接正在忙".to_string())
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, FtpStream>, crate::i18n::Msg> {
+        self.stream
+            .lock()
+            .map_err(|_| crate::i18n::Message::msg("这条连接正在忙"))
     }
 
     /// 这一项是不是目录：只有真的 `CWD` 进去才知道，
@@ -90,20 +105,21 @@ impl Ftp {
     }
 
     /// 复制没有 FTP 指令可用：先下到临时文件，再传上去。
-    fn copy_through_a_temp_file(&self, from: &str, to: &str) -> Result<(), String> {
+    fn copy_through_a_temp_file(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         let mut temporary = std::env::temp_dir();
         temporary.push(format!("wfiles-ftp-{}-{}.tmp", self.id, std::process::id()));
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<(), crate::i18n::Msg> {
             {
-                let mut file = std::fs::File::create(&temporary)
-                    .map_err(|error| format!("建不了临时文件：{error}"))?;
+                let mut file = std::fs::File::create(&temporary).map_err(|error| {
+                    crate::i18n::Message::caused("建不了临时文件：{error}", error)
+                })?;
                 self.download(from, &mut file)?;
             }
             let mut file = std::fs::File::open(&temporary)
-                .map_err(|error| format!("读不了临时文件：{error}"))?;
+                .map_err(|error| crate::i18n::Message::caused("读不了临时文件：{error}", error))?;
             let length = file
                 .metadata()
-                .map_err(|error| format!("看不了临时文件：{error}"))?
+                .map_err(|error| crate::i18n::Message::caused("看不了临时文件：{error}", error))?
                 .len();
             self.upload(to, &mut file, length)
         })();
@@ -128,12 +144,11 @@ impl Remote for Ftp {
         true
     }
 
-    fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
+    fn list(&self, path: &str) -> Result<Vec<Entry>, crate::i18n::Msg> {
         let absolute = self.absolute(path);
-        let lines = self
-            .lock()?
-            .list(Some(&absolute))
-            .map_err(|error| format!("列目录失败：{error}"))?;
+        let lines = self.lock()?.list(Some(&absolute)).map_err(|error| {
+            crate::i18n::Message::caused("列目录失败：{error}", error.to_string())
+        })?;
         let mut out = Vec::new();
         for line in lines {
             let Ok(file) = ListedFile::try_from(line.as_str()) else {
@@ -154,7 +169,7 @@ impl Remote for Ftp {
         Ok(out)
     }
 
-    fn stat(&self, path: &str) -> Result<Option<Entry>, String> {
+    fn stat(&self, path: &str) -> Result<Option<Entry>, crate::i18n::Msg> {
         if path.is_empty() {
             return Ok(Some(Entry {
                 name: String::new(),
@@ -196,11 +211,11 @@ impl Remote for Ftp {
         }))
     }
 
-    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
+    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, crate::i18n::Msg> {
         let absolute = self.absolute(path);
         self.lock()?
             .retr(&absolute, |reader| pump(reader, sink))
-            .map_err(|error| format!("下载失败：{error}"))
+            .map_err(|error| crate::i18n::Message::caused("下载失败：{error}", error.to_string()))
     }
 
     /// 从 `offset` 接着下载。
@@ -209,19 +224,29 @@ impl Remote for Ftp {
     /// 再照常 `RETR`。`REST` 自己不会开始传输，也不该留着——
     /// 下一次不带 `REST` 的 `RETR` 用的是同一条控制连接，
     /// 服务器还记得上一个断点，所以用完要把偏移归零。
-    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+    fn download_from(
+        &self,
+        path: &str,
+        offset: u64,
+        sink: &mut dyn Write,
+    ) -> Result<u64, crate::i18n::Msg> {
         let absolute = self.absolute(path);
         let mut session = self.lock()?;
-        session
-            .resume_transfer(offset as usize)
-            .map_err(|error| format!("续传失败：{error}"))?;
+        session.resume_transfer(offset as usize).map_err(|error| {
+            crate::i18n::Message::caused("续传失败：{error}", error.to_string())
+        })?;
         let result = session.retr(&absolute, |reader| pump(reader, sink));
         // 不管成没成，把断点还回去：下一次普通下载该从 0 开始。
         session.resume_transfer(0).ok();
-        result.map_err(|error| format!("下载失败：{error}"))
+        result.map_err(|error| crate::i18n::Message::caused("下载失败：{error}", error.to_string()))
     }
 
-    fn upload(&self, path: &str, reader: &mut dyn Read, _length: u64) -> Result<(), String> {
+    fn upload(
+        &self,
+        path: &str,
+        reader: &mut dyn Read,
+        _length: u64,
+    ) -> Result<(), crate::i18n::Msg> {
         let absolute = self.absolute(path);
         // `put_file` 要一个 Sized 的 `R: Read`，而这里我们只有 `&mut dyn Read`：
         // 套一层就行，它只是把 read 转发过去。
@@ -229,7 +254,7 @@ impl Remote for Ftp {
         self.lock()?
             .put_file(&absolute, &mut wrapped)
             .map(|_| ())
-            .map_err(|error| format!("上传失败：{error}"))
+            .map_err(|error| crate::i18n::Message::caused("上传失败：{error}", error.to_string()))
     }
 
     /// 从 `offset` 接着上传：`APPE` 的意思是"接着文件末尾写"，
@@ -244,23 +269,23 @@ impl Remote for Ftp {
         reader: &mut dyn Read,
         _length: u64,
         _offset: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::i18n::Msg> {
         let absolute = self.absolute(path);
         let mut wrapped = ReadRef(reader);
         self.lock()?
             .append_file(&absolute, &mut wrapped)
             .map(|_| ())
-            .map_err(|error| format!("续传失败：{error}"))
+            .map_err(|error| crate::i18n::Message::caused("续传失败：{error}", error.to_string()))
     }
 
-    fn mkdir(&self, path: &str) -> Result<(), String> {
+    fn mkdir(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         let absolute = self.absolute(path);
         self.lock()?
             .mkdir(&absolute)
-            .map_err(|error| format!("建目录失败：{error}"))
+            .map_err(|error| crate::i18n::Message::caused("建目录失败：{error}", error.to_string()))
     }
 
-    fn remove(&self, path: &str) -> Result<(), String> {
+    fn remove(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         let absolute = self.absolute(path);
         // 目录得先把里面清空：FTP 的 RMD 只删空目录，
         // 而用户按删除时想的是"这个文件夹没了"。
@@ -268,25 +293,24 @@ impl Remote for Ftp {
             for child in self.list(path)? {
                 self.remove(&child.path)?;
             }
-            return self
-                .lock()?
-                .rmdir(&absolute)
-                .map_err(|error| format!("删目录失败：{error}"));
+            return self.lock()?.rmdir(&absolute).map_err(|error| {
+                crate::i18n::Message::caused("删目录失败：{error}", error.to_string())
+            });
         }
         self.lock()?
             .rm(&absolute)
-            .map_err(|error| format!("删除失败：{error}"))
+            .map_err(|error| crate::i18n::Message::caused("删除失败：{error}", error.to_string()))
     }
 
-    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+    fn rename(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         let from = self.absolute(from);
         let to = self.absolute(to);
         self.lock()?
             .rename(&from, &to)
-            .map_err(|error| format!("改名失败：{error}"))
+            .map_err(|error| crate::i18n::Message::caused("改名失败：{error}", error.to_string()))
     }
 
-    fn copy(&self, from: &str, to: &str) -> Result<(), String> {
+    fn copy(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         // FTP 的指令集里没有复制：只能下到临时文件再传上去。
         // 同一台服务器绕这一圈确实慢，但"复制"点下去就该真的复制一份。
         match self.stat(from)? {
@@ -354,11 +378,11 @@ fn absolute(base: &str, path: &str) -> String {
 }
 
 /// `ftp://host:21/起始目录` → `host:21`。没写端口就按 21。
-fn address_of(url: &str) -> Result<String, String> {
+fn address_of(url: &str) -> Result<String, crate::i18n::Msg> {
     let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let host = rest.split('/').next().unwrap_or_default();
     if host.is_empty() {
-        return Err("地址里没有主机名".to_string());
+        return Err(crate::i18n::Message::msg("地址里没有主机名"));
     }
     if host.contains(':') {
         Ok(host.to_string())

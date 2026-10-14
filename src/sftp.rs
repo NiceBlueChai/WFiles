@@ -43,18 +43,31 @@ pub struct Sftp {
 }
 
 impl Sftp {
-    fn pull(&self, absolute: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+    fn pull(
+        &self,
+        absolute: &str,
+        offset: u64,
+        sink: &mut dyn Write,
+    ) -> Result<u64, crate::i18n::Msg> {
         self.runtime.block_on(async {
-            let mut file = self
-                .session
-                .open(absolute)
-                .await
-                .map_err(|error| format!("打不开 {absolute}：{error}"))?;
+            let mut file = self.session.open(absolute).await.map_err(|error| {
+                crate::i18n::Message::caused_with(
+                    "打不开 {absolute}：{error}",
+                    &[("absolute", absolute.to_string())],
+                    error.to_string(),
+                )
+            })?;
             if offset > 0 {
                 use tokio::io::AsyncSeekExt as _;
                 file.seek(std::io::SeekFrom::Start(offset))
                     .await
-                    .map_err(|error| format!("续传：定位不到 {offset}：{error}"))?;
+                    .map_err(|error| {
+                        crate::i18n::Message::caused_with(
+                            "续传：定位不到 {offset}：{error}",
+                            &[("offset", offset.to_string())],
+                            error,
+                        )
+                    })?;
             }
             let mut buffer = vec![0u8; 64 * 1024];
             let mut total = 0u64;
@@ -62,17 +75,18 @@ impl Sftp {
                 let read = file
                     .read(&mut buffer)
                     .await
-                    .map_err(|error| format!("下载失败：{error}"))?;
+                    .map_err(|error| crate::i18n::Message::caused("下载失败：{error}", error))?;
                 if read == 0 {
                     break;
                 }
-                sink.write_all(&buffer[..read])
-                    .map_err(|error| format!("写不进本地文件：{error}"))?;
+                sink.write_all(&buffer[..read]).map_err(|error| {
+                    crate::i18n::Message::caused("写不进本地文件：{error}", error)
+                })?;
                 total += read as u64;
             }
             file.close()
                 .await
-                .map_err(|error| format!("关不掉远程文件：{error}"))?;
+                .map_err(|error| crate::i18n::Message::caused("关不掉远程文件：{error}", error))?;
             Ok(total)
         })
     }
@@ -82,7 +96,7 @@ impl Sftp {
         absolute: &str,
         reader: &mut dyn Read,
         offset: Option<u64>,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::i18n::Msg> {
         self.runtime.block_on(async {
             // 续传时不截断：`CREATE | WRITE` 会新建，也会留着旧内容。
             let flags = if offset.is_some() {
@@ -94,40 +108,56 @@ impl Sftp {
                 .session
                 .open_with_flags(absolute, flags)
                 .await
-                .map_err(|error| format!("打不开 {absolute}：{error}"))?;
+                .map_err(|error| {
+                    crate::i18n::Message::caused_with(
+                        "打不开 {absolute}：{error}",
+                        &[("absolute", absolute.to_string())],
+                        error.to_string(),
+                    )
+                })?;
             if let Some(offset) = offset {
                 use tokio::io::AsyncSeekExt as _;
                 file.seek(std::io::SeekFrom::Start(offset))
                     .await
-                    .map_err(|error| format!("续传：定位不到 {offset}：{error}"))?;
+                    .map_err(|error| {
+                        crate::i18n::Message::caused_with(
+                            "续传：定位不到 {offset}：{error}",
+                            &[("offset", offset.to_string())],
+                            error,
+                        )
+                    })?;
             }
             let mut buffer = vec![0u8; 64 * 1024];
             loop {
-                let read = reader
-                    .read(&mut buffer)
-                    .map_err(|error| format!("读不了本地文件：{error}"))?;
+                let read = reader.read(&mut buffer).map_err(|error| {
+                    crate::i18n::Message::caused("读不了本地文件：{error}", error)
+                })?;
                 if read == 0 {
                     break;
                 }
                 file.write_all(&buffer[..read])
                     .await
-                    .map_err(|error| format!("上传失败：{error}"))?;
+                    .map_err(|error| crate::i18n::Message::caused("上传失败：{error}", error))?;
             }
             file.close()
                 .await
-                .map_err(|error| format!("关不掉远程文件：{error}"))?;
+                .map_err(|error| crate::i18n::Message::caused("关不掉远程文件：{error}", error))?;
             Ok(())
         })
     }
 
     /// 建一个连接（会联网：握手、登录、开 SFTP 子系统）。
-    pub fn new(config: &Config, password: &str) -> Result<Self, String> {
+    pub fn new(config: &Config, password: &str) -> Result<Self, crate::i18n::Msg> {
         Self::connect(config, password, known_hosts_file())
     }
 
     /// known_hosts 的位置可以指定：默认值是用户 `~/.ssh/known_hosts`，
     /// 跟 OpenSSH 是同一份、同一个格式，测试里则换到临时目录去。
-    pub(crate) fn connect(config: &Config, password: &str, known: PathBuf) -> Result<Self, String> {
+    pub(crate) fn connect(
+        config: &Config,
+        password: &str,
+        known: PathBuf,
+    ) -> Result<Self, crate::i18n::Msg> {
         let (host, port) = address_of(&config.url)?;
         let start = if config.root.trim_matches('/').is_empty() {
             start_of(&config.url)
@@ -138,7 +168,7 @@ impl Sftp {
             .worker_threads(1)
             .enable_all()
             .build()
-            .map_err(|error| format!("起不了网络运行时：{error}"))?;
+            .map_err(|error| crate::i18n::Message::caused("起不了网络运行时：{error}", error))?;
 
         let refused: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let trust = Trust {
@@ -157,7 +187,13 @@ impl Sftp {
         let connected = runtime.block_on(async {
             let mut handle = russh::client::connect(Arc::new(options), (&host[..], port), trust)
                 .await
-                .map_err(|error| format!("连不上 {host}:{port}：{error}"))?;
+                .map_err(|error| {
+                    crate::i18n::Message::caused_with(
+                        "连不上 {host}:{port}：{error}",
+                        &[("host", host.to_string()), ("port", port.to_string())],
+                        error.to_string(),
+                    )
+                })?;
             let accepted = if config.key.trim().is_empty() {
                 handle
                     .authenticate_password(config.user.as_str(), password)
@@ -173,21 +209,26 @@ impl Sftp {
                     .authenticate_publickey(config.user.as_str(), key)
                     .await
             }
-            .map_err(|error| format!("登录失败：{error}"))?;
+            .map_err(|error| {
+                crate::i18n::Message::caused("登录失败：{error}", error.to_string())
+            })?;
             if !accepted.success() {
                 return Err(format!("{} 没通过：用户名或凭据不对", config.user));
             }
-            let channel = handle
-                .channel_open_session()
-                .await
-                .map_err(|error| format!("开不了会话通道：{error}"))?;
+            let channel = handle.channel_open_session().await.map_err(|error| {
+                crate::i18n::Message::caused("开不了会话通道：{error}", error.to_string())
+            })?;
             channel
                 .request_subsystem(true, "sftp")
                 .await
-                .map_err(|error| format!("服务器不给开 SFTP：{error}"))?;
+                .map_err(|error| {
+                    crate::i18n::Message::caused("服务器不给开 SFTP：{error}", error.to_string())
+                })?;
             let session = SftpSession::new(channel.into_stream())
                 .await
-                .map_err(|error| format!("SFTP 握手失败：{error}"))?;
+                .map_err(|error| {
+                    crate::i18n::Message::caused("SFTP 握手失败：{error}", error.to_string())
+                })?;
             Ok::<_, String>((handle, session))
         });
 
@@ -196,24 +237,31 @@ impl Sftp {
             Err(error) => {
                 // known_hosts 那句"钥匙换了"比 russh 的报错有用得多。
                 if let Some(reason) = refused.lock().ok().and_then(|mut it| it.take()) {
-                    return Err(reason);
+                    // russh 的 `Handler::refuse` 要`String`（那是它定的接口），
+                    // 所以翻译推迟到这儿——`refused` 里存的是原文。
+                    return Err(crate::i18n::Message::verbatim(reason));
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
 
         let base = runtime.block_on(async {
-            let home = session
-                .canonicalize(".")
-                .await
-                .map_err(|error| format!("问不到登录目录：{error}"))?;
+            let home = session.canonicalize(".").await.map_err(|error| {
+                crate::i18n::Message::caused("问不到登录目录：{error}", error.to_string())
+            })?;
             if start.is_empty() {
-                return Ok::<_, String>(home);
+                return Ok::<_, crate::i18n::Msg>(home);
             }
             session
                 .canonicalize(absolute(&home, &start))
                 .await
-                .map_err(|error| format!("进不去起始目录 {start}：{error}"))
+                .map_err(|error| {
+                    crate::i18n::Message::caused_with(
+                        "进不去起始目录 {start}：{error}",
+                        &[("start", start.to_string())],
+                        error.to_string(),
+                    )
+                })
         })?;
 
         Ok(Self {
@@ -237,7 +285,7 @@ impl Sftp {
     fn attributes(
         &self,
         absolute: &str,
-    ) -> Result<Option<russh_sftp::protocol::FileAttributes>, String> {
+    ) -> Result<Option<russh_sftp::protocol::FileAttributes>, crate::i18n::Msg> {
         self.runtime.block_on(async {
             match self.session.symlink_metadata(absolute).await {
                 Ok(info) => Ok(Some(info)),
@@ -247,24 +295,25 @@ impl Sftp {
     }
 
     /// 复制没有标准指令可用：先下到临时文件，再传上去。
-    fn copy_through_a_temp_file(&self, from: &str, to: &str) -> Result<(), String> {
+    fn copy_through_a_temp_file(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         let mut temporary = std::env::temp_dir();
         temporary.push(format!(
             "wfiles-sftp-{}-{}.tmp",
             self.id,
             std::process::id()
         ));
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<(), crate::i18n::Msg> {
             {
-                let mut file = std::fs::File::create(&temporary)
-                    .map_err(|error| format!("建不了临时文件：{error}"))?;
+                let mut file = std::fs::File::create(&temporary).map_err(|error| {
+                    crate::i18n::Message::caused("建不了临时文件：{error}", error)
+                })?;
                 self.download(from, &mut file)?;
             }
             let mut file = std::fs::File::open(&temporary)
-                .map_err(|error| format!("读不了临时文件：{error}"))?;
+                .map_err(|error| crate::i18n::Message::caused("读不了临时文件：{error}", error))?;
             let length = file
                 .metadata()
-                .map_err(|error| format!("看不了临时文件：{error}"))?
+                .map_err(|error| crate::i18n::Message::caused("看不了临时文件：{error}", error))?
                 .len();
             self.upload(to, &mut file, length)
         })();
@@ -288,13 +337,12 @@ impl Remote for Sftp {
         true
     }
 
-    fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
+    fn list(&self, path: &str) -> Result<Vec<Entry>, crate::i18n::Msg> {
         let absolute = self.absolute(path);
         let entries = self.runtime.block_on(async {
-            self.session
-                .read_dir(&absolute)
-                .await
-                .map_err(|error| format!("列目录失败：{error}"))
+            self.session.read_dir(&absolute).await.map_err(|error| {
+                crate::i18n::Message::caused("列目录失败：{error}", error.to_string())
+            })
         })?;
         let mut out = Vec::new();
         for entry in entries {
@@ -314,7 +362,7 @@ impl Remote for Sftp {
         Ok(out)
     }
 
-    fn stat(&self, path: &str) -> Result<Option<Entry>, String> {
+    fn stat(&self, path: &str) -> Result<Option<Entry>, crate::i18n::Msg> {
         if path.is_empty() {
             return Ok(Some(Entry {
                 name: String::new(),
@@ -337,7 +385,7 @@ impl Remote for Sftp {
         }))
     }
 
-    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
+    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, crate::i18n::Msg> {
         let absolute = self.absolute(path);
         self.pull(&absolute, 0, sink)
     }
@@ -345,12 +393,22 @@ impl Remote for Sftp {
     /// 从 `offset` 接着下载：SFTP 的读是带偏移的，把文件光标
     /// `seek` 到断点再照常读就行——russh 那边只是每次读多带一个 offset，
     /// 服务器该回哪一段回哪一段。
-    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+    fn download_from(
+        &self,
+        path: &str,
+        offset: u64,
+        sink: &mut dyn Write,
+    ) -> Result<u64, crate::i18n::Msg> {
         let absolute = self.absolute(path);
         self.pull(&absolute, offset, sink)
     }
 
-    fn upload(&self, path: &str, reader: &mut dyn Read, _length: u64) -> Result<(), String> {
+    fn upload(
+        &self,
+        path: &str,
+        reader: &mut dyn Read,
+        _length: u64,
+    ) -> Result<(), crate::i18n::Msg> {
         let absolute = self.absolute(path);
         self.push(&absolute, reader, None)
     }
@@ -366,22 +424,21 @@ impl Remote for Sftp {
         reader: &mut dyn Read,
         _length: u64,
         offset: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::i18n::Msg> {
         let absolute = self.absolute(path);
         self.push(&absolute, reader, Some(offset))
     }
 
-    fn mkdir(&self, path: &str) -> Result<(), String> {
+    fn mkdir(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         let absolute = self.absolute(path);
         self.runtime.block_on(async {
-            self.session
-                .create_dir(&absolute)
-                .await
-                .map_err(|error| format!("建目录失败：{error}"))
+            self.session.create_dir(&absolute).await.map_err(|error| {
+                crate::i18n::Message::caused("建目录失败：{error}", error.to_string())
+            })
         })
     }
 
-    fn remove(&self, path: &str) -> Result<(), String> {
+    fn remove(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         let absolute = self.absolute(path);
         // 目录得先把里面清空：RMDIR 也只删空目录，
         // 而用户按删除时想的是"这个文件夹没了"。
@@ -393,31 +450,28 @@ impl Remote for Sftp {
                 self.remove(&child.path)?;
             }
             return self.runtime.block_on(async {
-                self.session
-                    .remove_dir(&absolute)
-                    .await
-                    .map_err(|error| format!("删目录失败：{error}"))
+                self.session.remove_dir(&absolute).await.map_err(|error| {
+                    crate::i18n::Message::caused("删目录失败：{error}", error.to_string())
+                })
             });
         }
         self.runtime.block_on(async {
-            self.session
-                .remove_file(&absolute)
-                .await
-                .map_err(|error| format!("删除失败：{error}"))
+            self.session.remove_file(&absolute).await.map_err(|error| {
+                crate::i18n::Message::caused("删除失败：{error}", error.to_string())
+            })
         })
     }
 
-    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+    fn rename(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         let (from, to) = (self.absolute(from), self.absolute(to));
         self.runtime.block_on(async {
-            self.session
-                .rename(&from, &to)
-                .await
-                .map_err(|error| format!("改名失败：{error}"))
+            self.session.rename(&from, &to).await.map_err(|error| {
+                crate::i18n::Message::caused("改名失败：{error}", error.to_string())
+            })
         })
     }
 
-    fn copy(&self, from: &str, to: &str) -> Result<(), String> {
+    fn copy(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         // SFTP 标准里没有复制指令：只能下到临时文件再传上去。
         match self.stat(from)? {
             Some(info) if info.is_dir => {
@@ -535,17 +589,17 @@ fn absolute(base: &str, path: &str) -> String {
 }
 
 /// `sftp://host:22/起始目录` → （主机, 端口）。没写端口就按 22。
-fn address_of(url: &str) -> Result<(String, u16), String> {
+fn address_of(url: &str) -> Result<(String, u16), crate::i18n::Msg> {
     let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let host = rest.split('/').next().unwrap_or_default();
     if host.is_empty() {
-        return Err("地址里没有主机名".to_string());
+        return Err(crate::i18n::Message::msg("地址里没有主机名"));
     }
     match host.rsplit_once(':') {
         Some((host, port)) => {
-            let port = port
-                .parse::<u16>()
-                .map_err(|_| format!("端口号不对：{port}"))?;
+            let port = port.parse::<u16>().map_err(|_| {
+                crate::i18n::Message::args("端口号不对：{port}", &[("port", port.to_string())])
+            })?;
             Ok((host.trim_matches(['[', ']']).to_string(), port))
         }
         None => Ok((host.to_string(), 22)),
@@ -1109,7 +1163,10 @@ mod tests {
             "me".to_string(),
         );
         let error = Sftp::connect(&config, "secret", known).err().unwrap();
-        assert!(error.contains("公钥"), "该说清楚是钥匙换了：{error}");
+        assert!(
+            error.to_string().contains("公钥"),
+            "该说清楚是钥匙换了：{error}"
+        );
     }
 
     #[test]

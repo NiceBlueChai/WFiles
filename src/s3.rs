@@ -38,7 +38,7 @@ pub struct S3 {
 }
 
 impl S3 {
-    pub fn new(config: &Config, password: &str) -> Result<Self, String> {
+    pub fn new(config: &Config, password: &str) -> Result<Self, crate::i18n::Msg> {
         let url = with_slash(&config.url);
         let (host, bucket, virtual_host) = split_endpoint(&url)?;
         let agent = ureq::AgentBuilder::new()
@@ -94,7 +94,7 @@ impl S3 {
         query: &[(&str, String)],
         extra: &[(&str, &str)],
         payload: Payload<'_>,
-    ) -> Result<ureq::Response, String> {
+    ) -> Result<ureq::Response, crate::i18n::Msg> {
         let mut url = self.url_of(key);
         if !query.is_empty() {
             url.push('?');
@@ -206,7 +206,7 @@ impl S3 {
         &self,
         prefix: &str,
         after: Option<&str>,
-    ) -> Result<(Vec<Entry>, bool, String), String> {
+    ) -> Result<(Vec<Entry>, bool, String), crate::i18n::Msg> {
         let mut query: Vec<(&str, String)> = vec![
             ("delimiter", "/".to_string()),
             ("max-keys", "1000".to_string()),
@@ -219,16 +219,19 @@ impl S3 {
         let status = response.status();
         let text = response
             .into_string()
-            .map_err(|error| format!("列目录：读不回响应：{error}"))?;
+            .map_err(|error| crate::i18n::Message::caused("列目录：读不回响应：{error}", error))?;
         if !(200..300).contains(&status) {
-            return Err(format!("列目录：服务器回 {status}：{}", reason_of(&text)));
+            return Err(crate::i18n::Message::args(
+                "列目录：服务器回 {status}：{reason}",
+                &[("status", status.to_string()), ("reason", reason_of(&text))],
+            ));
         }
         let page = parse_listing(&text, prefix)?;
         Ok(page)
     }
 
     /// 前缀底下的每一个对象键（删文件夹、拷文件夹都要一个个来）。
-    fn keys_under(&self, prefix: &str) -> Result<Vec<String>, String> {
+    fn keys_under(&self, prefix: &str) -> Result<Vec<String>, crate::i18n::Msg> {
         let mut out = Vec::new();
         let mut after = String::new();
         loop {
@@ -241,11 +244,14 @@ impl S3 {
             }
             let response = self.call("GET", "", &query, &[], Payload::none())?;
             let status = response.status();
-            let text = response
-                .into_string()
-                .map_err(|error| format!("列目录：读不回响应：{error}"))?;
+            let text = response.into_string().map_err(|error| {
+                crate::i18n::Message::caused("列目录：读不回响应：{error}", error)
+            })?;
             if !(200..300).contains(&status) {
-                return Err(format!("列目录：服务器回 {status}：{}", reason_of(&text)));
+                return Err(crate::i18n::Message::args(
+                    "列目录：服务器回 {status}：{reason}",
+                    &[("status", status.to_string()), ("reason", reason_of(&text))],
+                ));
             }
             let (keys, more, next) = parse_keys(&text)?;
             out.extend(keys);
@@ -267,9 +273,12 @@ impl S3 {
                 let status = response.status();
                 let text = response
                     .into_string()
-                    .map_err(|error| format!("读不回响应：{error}"))?;
+                    .map_err(|error| crate::i18n::Message::caused("读不回响应：{error}", error))?;
                 if !(200..300).contains(&status) {
-                    return Err(format!("服务器回 {status}"));
+                    return Err(crate::i18n::Message::args(
+                        "服务器回 {status}",
+                        &[("status", status.to_string())],
+                    ));
                 }
                 let (keys, _, _) = parse_keys(&text)?;
                 Ok(!keys.is_empty())
@@ -278,7 +287,7 @@ impl S3 {
     }
 
     /// 单个对象的服务端复制（不下载再上传）。
-    fn copy_object(&self, from: &str, to: &str) -> Result<(), String> {
+    fn copy_object(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         let source = self.copy_source(from);
         let response = self.call(
             "PUT",
@@ -292,10 +301,13 @@ impl S3 {
             return Ok(());
         }
         let text = response.into_string().unwrap_or_default();
-        Err(format!("复制：服务器回 {status}：{}", reason_of(&text)))
+        Err(crate::i18n::Message::args(
+            "复制：服务器回 {status}：{reason}",
+            &[("status", status.to_string()), ("reason", reason_of(&text))],
+        ))
     }
 
-    fn copy_prefix(&self, from: &str, to: &str) -> Result<(), String> {
+    fn copy_prefix(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         let base = with_slash(from);
         for key in self.keys_under(&base)? {
             let rest = key.strip_prefix(&base).unwrap_or(&key);
@@ -305,14 +317,17 @@ impl S3 {
     }
 
     /// 上传一个"文件夹标记"：以 `/` 结尾的空对象。
-    fn put_marker(&self, key: &str) -> Result<(), String> {
+    fn put_marker(&self, key: &str) -> Result<(), crate::i18n::Msg> {
         let response = self.call("PUT", &with_slash(key), &[], &[], Payload::empty())?;
         let status = response.status();
         if (200..300).contains(&status) {
             Ok(())
         } else {
             let text = response.into_string().unwrap_or_default();
-            Err(format!("建目录：服务器回 {status}：{}", reason_of(&text)))
+            Err(crate::i18n::Message::args(
+                "建目录：服务器回 {status}：{reason}",
+                &[("status", status.to_string()), ("reason", reason_of(&text))],
+            ))
         }
     }
 }
@@ -384,7 +399,7 @@ impl Remote for S3 {
         true
     }
 
-    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
+    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, crate::i18n::Msg> {
         self.get(path, None, sink)
     }
 
@@ -393,11 +408,16 @@ impl Remote for S3 {
     /// 对象存储的 GET 也认 `Range`（回 206 加 `Content-Range`）。
     /// 头要走签名：`extra` 里的每一项都会被算进 `SignedHeaders`，
     /// 所以这里照常传进去就行，不用额外张罗。
-    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+    fn download_from(
+        &self,
+        path: &str,
+        offset: u64,
+        sink: &mut dyn Write,
+    ) -> Result<u64, crate::i18n::Msg> {
         self.get(path, Some(offset), sink)
     }
 
-    fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
+    fn list(&self, path: &str) -> Result<Vec<Entry>, crate::i18n::Msg> {
         // 列一层要把前缀写成 "dir/"；根就是空前缀。
         let prefix = if path.is_empty() {
             String::new()
@@ -421,7 +441,7 @@ impl Remote for S3 {
         }
     }
 
-    fn stat(&self, path: &str) -> Result<Option<Entry>, String> {
+    fn stat(&self, path: &str) -> Result<Option<Entry>, crate::i18n::Msg> {
         if path.is_empty() {
             return Ok(Some(Entry {
                 name: String::new(),
@@ -462,22 +482,30 @@ impl Remote for S3 {
         Ok(None)
     }
 
-    fn upload(&self, path: &str, reader: &mut dyn Read, length: u64) -> Result<(), String> {
+    fn upload(
+        &self,
+        path: &str,
+        reader: &mut dyn Read,
+        length: u64,
+    ) -> Result<(), crate::i18n::Msg> {
         let response = self.call("PUT", path, &[], &[], Payload::stream(reader, length))?;
         let status = response.status();
         if (200..300).contains(&status) {
             Ok(())
         } else {
             let text = response.into_string().unwrap_or_default();
-            Err(format!("上传：服务器回 {status}：{}", reason_of(&text)))
+            Err(crate::i18n::Message::args(
+                "上传：服务器回 {status}：{reason}",
+                &[("status", status.to_string()), ("reason", reason_of(&text))],
+            ))
         }
     }
 
-    fn mkdir(&self, path: &str) -> Result<(), String> {
+    fn mkdir(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         self.put_marker(path)
     }
 
-    fn remove(&self, path: &str) -> Result<(), String> {
+    fn remove(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         // 文件夹是前缀：底下的对象得一个个删，不然"删掉了"其实还在。
         let children = self.keys_under(&with_slash(path))?;
         for key in children {
@@ -492,7 +520,7 @@ impl Remote for S3 {
         Ok(())
     }
 
-    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+    fn rename(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         let info = self.stat(from)?;
         match info {
             Some(info) if info.is_dir => {
@@ -507,7 +535,7 @@ impl Remote for S3 {
         }
     }
 
-    fn copy(&self, from: &str, to: &str) -> Result<(), String> {
+    fn copy(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         match self.stat(from)? {
             Some(info) if info.is_dir => {
                 self.copy_prefix(from, to)?;
@@ -519,7 +547,12 @@ impl Remote for S3 {
 }
 
 impl S3 {
-    fn get(&self, path: &str, offset: Option<u64>, sink: &mut dyn Write) -> Result<u64, String> {
+    fn get(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        sink: &mut dyn Write,
+    ) -> Result<u64, crate::i18n::Msg> {
         let extra: Vec<(&str, String)> = match offset {
             Some(offset) => vec![("range", format!("bytes={offset}-"))],
             None => Vec::new(),
@@ -531,9 +564,13 @@ impl S3 {
         let wanted = if offset.is_some() { 206 } else { 200 };
         if status != wanted {
             let text = response.into_string().unwrap_or_default();
-            return Err(format!(
-                "下载：服务器回 {status}（要的是 {wanted}）：{}",
-                reason_of(&text)
+            return Err(crate::i18n::Message::args(
+                "下载：服务器回 {status}（要的是 {wanted}）：{reason}",
+                &[
+                    ("status", status.to_string()),
+                    ("wanted", wanted.to_string()),
+                    ("reason", reason_of(&text)),
+                ],
             ));
         }
         let mut reader = response.into_reader();
@@ -542,17 +579,17 @@ impl S3 {
         loop {
             let read = reader
                 .read(&mut buffer)
-                .map_err(|error| format!("下载：读不回来：{error}"))?;
+                .map_err(|error| crate::i18n::Message::caused("下载：读不回来：{error}", error))?;
             if read == 0 {
                 return Ok(total);
             }
             sink.write_all(&buffer[..read])
-                .map_err(|error| format!("下载：写不下去：{error}"))?;
+                .map_err(|error| crate::i18n::Message::caused("下载：写不下去：{error}", error))?;
             total += read as u64;
         }
     }
 
-    fn delete_one(&self, key: &str) -> Result<(), String> {
+    fn delete_one(&self, key: &str) -> Result<(), crate::i18n::Msg> {
         let response = self.call("DELETE", key, &[], &[], Payload::none())?;
         let status = response.status();
         // 404 说明本来就没有：删一个不存在的东西不算失败。
@@ -560,25 +597,28 @@ impl S3 {
             Ok(())
         } else {
             let text = response.into_string().unwrap_or_default();
-            Err(format!("删除：服务器回 {status}：{}", reason_of(&text)))
+            Err(crate::i18n::Message::args(
+                "删除：服务器回 {status}：{reason}",
+                &[("status", status.to_string()), ("reason", reason_of(&text))],
+            ))
         }
     }
 }
 
 /// 把 `https://bucket.s3.cn-north-1.amazonaws.com.cn/` 或
 /// `https://s3.us-east-1.amazonaws.com/bucket/` 拆成主机、桶名与写法。
-fn split_endpoint(url: &str) -> Result<(String, String, bool), String> {
+fn split_endpoint(url: &str) -> Result<(String, String, bool), crate::i18n::Msg> {
     let host_part = url
         .find("://")
         .map(|at| &url[..at + 3])
-        .ok_or_else(|| "地址要写成 https://… 这样".to_string())?;
+        .ok_or_else(|| crate::i18n::Message::msg("地址要写成 https://… 这样"))?;
     let rest = &url[host_part.len()..];
     let (authority, path) = match rest.find('/') {
         Some(at) => (&rest[..at], rest[at..].trim_matches('/').to_string()),
         None => (rest.trim_end_matches('/'), String::new()),
     };
     if authority.is_empty() {
-        return Err("地址里没有主机名".to_string());
+        return Err(crate::i18n::Message::msg("地址里没有主机名"));
     }
     // 路径里第一段是桶名 → path 式；否则桶名在主机名的最前面 → 虚拟主机式。
     if let Some((bucket, _)) = path.split_once('/') {
@@ -597,7 +637,9 @@ fn split_endpoint(url: &str) -> Result<(String, String, bool), String> {
         .map(|(first, _)| first.to_string())
         .unwrap_or_else(|| authority.to_string());
     if bucket.is_empty() {
-        return Err("认不出桶名：把桶名写在地址里，如 https://host/bucket/".to_string());
+        return Err(crate::i18n::Message::msg(
+            "认不出桶名：把桶名写在地址里，如 https://host/bucket/",
+        ));
     }
     Ok((format!("{host_part}{authority}/"), bucket, true))
 }
@@ -737,7 +779,7 @@ fn doing_of(method: &str) -> &'static str {
 }
 
 /// 解析列目录的 XML：返回（这一层的条目、还有没有下一页、下一页的 token）。
-fn parse_listing(text: &str, prefix: &str) -> Result<(Vec<Entry>, bool, String), String> {
+fn parse_listing(text: &str, prefix: &str) -> Result<(Vec<Entry>, bool, String), crate::i18n::Msg> {
     use quick_xml::Reader;
     use quick_xml::events::Event;
 
@@ -812,7 +854,12 @@ fn parse_listing(text: &str, prefix: &str) -> Result<(Vec<Entry>, bool, String),
                 }
             }
             Ok(Event::Eof) => break,
-            Err(error) => return Err(format!("列目录：这份 XML 读不了：{error}")),
+            Err(error) => {
+                return Err(crate::i18n::Message::args(
+                    "列目录：这份 XML 读不了：{error}",
+                    &[("error", error.to_string())],
+                ));
+            }
             _ => {}
         }
         buffer.clear();
@@ -821,7 +868,7 @@ fn parse_listing(text: &str, prefix: &str) -> Result<(Vec<Entry>, bool, String),
 }
 
 /// 解析"前缀底下有哪些键"，不分层级。
-fn parse_keys(text: &str) -> Result<(Vec<String>, bool, String), String> {
+fn parse_keys(text: &str) -> Result<(Vec<String>, bool, String), crate::i18n::Msg> {
     use quick_xml::Reader;
     use quick_xml::events::Event;
 
@@ -848,7 +895,12 @@ fn parse_keys(text: &str) -> Result<(Vec<String>, bool, String), String> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(error) => return Err(format!("列目录：这份 XML 读不了：{error}")),
+            Err(error) => {
+                return Err(crate::i18n::Message::args(
+                    "列目录：这份 XML 读不了：{error}",
+                    &[("error", error.to_string())],
+                ));
+            }
             _ => {}
         }
         buffer.clear();

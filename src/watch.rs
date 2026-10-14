@@ -15,7 +15,7 @@ use notify::{RecursiveMode, Watcher as _};
 /// watcher 被丢弃时监听停止，调用方通常把它移交给一个长驻任务持有。
 pub fn watch_directory(
     path: &Path,
-) -> Result<(notify::RecommendedWatcher, async_channel::Receiver<()>), String> {
+) -> Result<(notify::RecommendedWatcher, async_channel::Receiver<()>), crate::i18n::Msg> {
     let (tx, rx) = async_channel::bounded(8);
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         // 监听失败（目录被删掉等）也当一次变化，让界面去面对新的现实。
@@ -23,11 +23,11 @@ pub fn watch_directory(
             let _ = tx.try_send(());
         }
     })
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| crate::i18n::Message::from(error.to_string()))?;
 
     watcher
         .watch(path, RecursiveMode::NonRecursive)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| crate::i18n::Message::from(error.to_string()))?;
 
     Ok((watcher, rx))
 }

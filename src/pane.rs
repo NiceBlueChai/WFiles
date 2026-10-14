@@ -394,7 +394,7 @@ struct ArchiveState {
     name: String,
     entries: Vec<archive::Entry>,
     /// 读不出来时把原因摆在面板里，而不是弹一个对话框打断操作。
-    error: Option<String>,
+    error: Option<crate::i18n::Msg>,
 }
 
 /// 正在给哪个文件做标记：路径、显示名、标签输入框。
@@ -482,7 +482,7 @@ pub struct Pane {
     filter: Entity<InputState>,
     focus: FocusHandle,
     /// 最近一次读取目录失败的原因，显示在状态栏里。
-    error: Option<String>,
+    error: Option<crate::i18n::Msg>,
     status: String,
     scroll: VirtualListScrollHandle,
     /// 虚拟列表要一份逐行高度，行数或行高变化时才重建。
@@ -912,7 +912,7 @@ impl Pane {
     fn update_status(&mut self, cx: &gpui_kit::App) {
         if let Some(error) = &self.error {
             self.status =
-                crate::i18n::tr_args(cx, "无法打开：{error}", &[("error", error.clone())]);
+                crate::i18n::tr_args(cx, "无法打开：{error}", &[("error", error.say(cx))]);
             return;
         }
 
@@ -1197,7 +1197,7 @@ impl Pane {
             // 压缩包不交给系统：自己就能看得见里面，还能解得出来。
             self.open_archive(path, cx);
         } else if let Err(error) = open::that(&path) {
-            self.error = Some(error.to_string());
+            self.error = Some(error.into());
             self.update_status(cx);
             cx.notify();
         }
@@ -1230,7 +1230,7 @@ impl Pane {
     /// 与其默默什么都不做，不如把原因写进状态栏。
     fn edit_remote(&mut self, cx: &mut Context<Self>) {
         let Some((id, sub)) = Self::editable_remote(&self.selection, &self.listing) else {
-            self.error = Some(crate::i18n::tr(cx, "先选中一个远程文件"));
+            self.error = Some(crate::i18n::Message::msg("先选中一个远程文件"));
             self.update_status(cx);
             cx.notify();
             return;
@@ -1460,7 +1460,7 @@ impl Pane {
                 );
             }
             Err(error) => {
-                self.status = error;
+                self.status = error.say(cx);
             }
         }
         cx.notify();
@@ -1992,7 +1992,7 @@ impl Pane {
     /// 干活的线程只负责干，结论通过通道送回来再改界面状态。
     fn run_archive_job(
         &mut self,
-        rx: async_channel::Receiver<Result<(PathBuf, usize), String>>,
+        rx: async_channel::Receiver<Result<(PathBuf, usize), crate::i18n::Msg>>,
         cx: &mut Context<Self>,
     ) {
         let task = cx.spawn(async move |this: WeakEntity<Pane>, cx: &mut AsyncApp| {
@@ -2008,7 +2008,7 @@ impl Pane {
 
     fn finish_archive_job(
         &mut self,
-        result: Result<(PathBuf, usize), String>,
+        result: Result<(PathBuf, usize), crate::i18n::Msg>,
         cx: &mut Context<Self>,
     ) {
         self.archive_busy = None;
@@ -3459,7 +3459,7 @@ impl Pane {
                         if is_dir {
                             this.navigate_to(path.clone(), true, window, cx);
                         } else if let Err(error) = open::that(&path) {
-                            this.error = Some(error.to_string());
+                            this.error = Some(error.into());
                             this.update_status(cx);
                             cx.notify();
                         }
@@ -4200,7 +4200,7 @@ impl Pane {
             Some(error) => div()
                 .id("archive-error")
                 .test_support()
-                .aria_label(error.clone())
+                .aria_label(error.say(cx))
                 .flex_1()
                 .min_h_0()
                 .flex()
@@ -4208,7 +4208,7 @@ impl Pane {
                 .justify_center()
                 .text_sm()
                 .text_color(muted)
-                .child(error.clone())
+                .child(error.say(cx))
                 .into_any_element(),
             None if state.entries.is_empty() => div()
                 .flex_1()

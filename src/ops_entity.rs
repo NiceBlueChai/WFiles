@@ -91,7 +91,7 @@ pub struct Prompt {
     pub label: String,
     pub initial: String,
     /// 上一次提交被拒的原因，显示在输入框下方。
-    pub error: Option<String>,
+    pub error: Option<crate::i18n::Msg>,
     pub action: PendingAction,
 }
 
@@ -240,7 +240,7 @@ enum JobResult {
     /// 批量重命名的结果。
     BulkRenamed {
         renamed: Vec<(PathBuf, PathBuf)>,
-        failed: Vec<(PathBuf, String)>,
+        failed: Vec<(PathBuf, crate::i18n::Msg)>,
     },
     /// 粘贴前的冲突预检结果：目标在远程时，判重得问服务器，
     /// 所以这一趟也跑在后台线程上。
@@ -255,7 +255,7 @@ enum JobResult {
     Undone {
         history: History,
         involved: Vec<PathBuf>,
-        result: Result<String, String>,
+        result: Result<String, crate::i18n::Msg>,
     },
 }
 
@@ -711,7 +711,7 @@ impl Ops {
     }
 
     /// 输入不合法：把原因写进 prompt 自己，对话框不关。
-    fn reject_prompt(&mut self, error: String, cx: &mut Context<Self>) {
+    fn reject_prompt(&mut self, error: crate::i18n::Msg, cx: &mut Context<Self>) {
         if let Some(prompt) = self.prompt.as_mut() {
             prompt.error = Some(error);
         }

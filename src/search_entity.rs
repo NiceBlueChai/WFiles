@@ -58,7 +58,7 @@ pub struct SearchPanel {
     /// 解析好的查询；语法有错或者还是空的时候是 `None`。
     query: Option<Query>,
     /// 语法错误，红字显示在输入框下面。
-    error: Option<String>,
+    error: Option<crate::i18n::Msg>,
     hits: Vec<Hit>,
     cursor: usize,
     /// 上一趟走完的账，用来写"找到几个、扫了多少项"。
@@ -307,7 +307,7 @@ impl SearchPanel {
     /// 结果区上面那一行字：正在搜 / 找到几个 / 出错 / 还没输东西。
     fn status(&self) -> String {
         if let Some(error) = &self.error {
-            return error.clone();
+            return error.to_string();
         }
         if self.query.is_none() {
             return "输入要找的东西。content: 会连文件内容一起找。".to_string();

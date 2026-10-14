@@ -103,7 +103,7 @@ pub struct Terminal {
     /// 子进程已经结束了：退出码或信号名。
     exited: Option<String>,
     /// 起不来时给个能看懂的原因，而不是"按了没反应"。
-    error: Option<String>,
+    error: Option<crate::i18n::Msg>,
     output: Option<Task<()>>,
     watching: Option<Task<()>>,
 }
@@ -149,7 +149,7 @@ impl Terminal {
         let program = self.program.clone();
         let dir = self.dir.clone();
 
-        let opened = (|| -> Result<Opened, String> {
+        let opened = (|| -> Result<Opened, crate::i18n::Msg> {
             let system = portable_pty::native_pty_system();
             let pair = system
                 .openpty(portable_pty::PtySize {
@@ -370,10 +370,10 @@ impl Terminal {
                     .and_then(|_| process.writer.flush())
                     .is_err()
                 {
-                    self.error = Some("写不进终端".to_string());
+                    self.error = Some(crate::i18n::Message::msg("写不进终端"));
                 }
             }
-            None => self.error = Some("终端没在跑".to_string()),
+            None => self.error = Some(crate::i18n::Message::msg("终端没在跑")),
         }
         cx.notify();
     }

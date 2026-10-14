@@ -20,16 +20,19 @@ pub enum RemotesEvent {
     /// 一个远程目录列出来了（`error` 非空就是列失败了）。
     Listed {
         path: PathBuf,
-        error: Option<String>,
+        error: Option<crate::i18n::Msg>,
     },
     /// 连上了并已保存（密码进了系统钥匙串）。
     Connected { id: String, name: String },
     /// 连接失败。
-    Failed(String),
+    Failed(crate::i18n::Msg),
     /// 编辑中的远程文件：改了就会自动回传，这里只是让界面知道有这一回事。
     Editing { name: String },
     /// 一次自动回传的结果。
-    Uploaded { name: String, error: Option<String> },
+    Uploaded {
+        name: String,
+        error: Option<crate::i18n::Msg>,
+    },
 }
 
 pub struct Remotes {
@@ -104,7 +107,7 @@ impl Remotes {
         config: Config,
         password: &str,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::i18n::Msg> {
         remote::save_password(&config, password)?;
         Settings::update(cx, |settings| {
             if let Some(at) = settings.remotes.iter().position(|it| it.id == config.id) {
@@ -184,7 +187,10 @@ impl Remotes {
                 tx.try_send(result).ok();
             });
         if let Err(error) = spawn {
-            cx.emit(RemotesEvent::Failed(format!("起不了后台线程：{error}")));
+            cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
+                "起不了后台线程：{error}",
+                &[("error", error.to_string())],
+            )));
             return;
         }
 
@@ -303,7 +309,10 @@ impl Remotes {
                 tx.try_send(result).ok();
             });
         if let Err(error) = spawn {
-            cx.emit(RemotesEvent::Failed(format!("起不了后台线程：{error}")));
+            cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
+                "起不了后台线程：{error}",
+                &[("error", error.to_string())],
+            )));
             return;
         }
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -372,13 +381,18 @@ impl Remotes {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client(id, cx) else {
-            cx.emit(RemotesEvent::Failed("没有这条连接".to_string()));
+            cx.emit(RemotesEvent::Failed(crate::i18n::Message::msg(
+                "没有这条连接",
+            )));
             return;
         };
         let name = sub.rsplit('/').next().unwrap_or("file").to_string();
         let local = temp_file(id, &name);
         if let Err(error) = std::fs::create_dir_all(local.parent().unwrap_or(Path::new("."))) {
-            cx.emit(RemotesEvent::Failed(format!("建不了临时目录：{error}")));
+            cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
+                "建不了临时目录：{error}",
+                &[("error", error.to_string())],
+            )));
             return;
         }
         let sub = sub.to_string();
@@ -394,7 +408,10 @@ impl Remotes {
                 tx.try_send(result).ok();
             });
         if let Err(error) = spawn {
-            cx.emit(RemotesEvent::Failed(format!("起不了后台线程：{error}")));
+            cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
+                "起不了后台线程：{error}",
+                &[("error", error.to_string())],
+            )));
             return;
         }
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -411,14 +428,20 @@ impl Remotes {
                 if !for_editing {
                     // 只看：打开就完事，不登记、不监听。
                     if let Err(error) = open::that(&opened) {
-                        cx.emit(RemotesEvent::Failed(format!("打不开：{error}")));
+                        cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
+                            "打不开：{error}",
+                            &[("error", error.to_string())],
+                        )));
                     }
                     cx.notify();
                     return;
                 }
                 let name = remotes.note_edit(owner, sub, &opened, cx);
                 if let Err(error) = open::that(&opened) {
-                    cx.emit(RemotesEvent::Failed(format!("打不开：{error}")));
+                    cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
+                        "打不开：{error}",
+                        &[("error", error.to_string())],
+                    )));
                 } else {
                     cx.emit(RemotesEvent::Editing { name });
                 }
@@ -527,7 +550,10 @@ impl Remotes {
                 });
             if let Err(error) = spawn {
                 self.editing[at].busy = false;
-                cx.emit(RemotesEvent::Failed(format!("起不了后台线程：{error}")));
+                cx.emit(RemotesEvent::Failed(crate::i18n::Message::args(
+                    "起不了后台线程：{error}",
+                    &[("error", error.to_string())],
+                )));
                 continue;
             }
             cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -588,29 +614,33 @@ fn temp_file(id: &str, name: &str) -> PathBuf {
 
 /// 下载到临时文件（跑在后台线程上）。打开是主线程的事——
 /// 系统调用不能在 worker 线程里做，那是平台层的规矩。
-fn download_to(client: &dyn remote::Remote, sub: &str, local: &Path) -> Result<(), String> {
-    let mut file =
-        std::fs::File::create(local).map_err(|error| format!("写不了临时文件：{error}"))?;
+fn download_to(
+    client: &dyn remote::Remote,
+    sub: &str,
+    local: &Path,
+) -> Result<(), crate::i18n::Msg> {
+    let mut file = std::fs::File::create(local)
+        .map_err(|error| crate::i18n::Message::caused("写不了临时文件：{error}", error))?;
     let result = client
         .download(sub, &mut file)
         .map(|_| ())
-        .map_err(|error| format!("下载失败：{error}"));
+        .map_err(|error| crate::i18n::Message::caused("下载失败：{error}", error));
     // 先放手这个文件：Windows 上握着的话，半截文件删不掉。
     drop(file);
     result
 }
 
 /// 把本地文件传回服务器（跑在后台线程上）。
-fn upload_to(client: &dyn remote::Remote, sub: &str, local: &Path) -> Result<(), String> {
-    let mut file =
-        std::fs::File::open(local).map_err(|error| format!("读不了临时文件：{error}"))?;
+fn upload_to(client: &dyn remote::Remote, sub: &str, local: &Path) -> Result<(), crate::i18n::Msg> {
+    let mut file = std::fs::File::open(local)
+        .map_err(|error| crate::i18n::Message::caused("读不了临时文件：{error}", error))?;
     let length = file
         .metadata()
-        .map_err(|error| format!("看不了临时文件：{error}"))?
+        .map_err(|error| crate::i18n::Message::caused("看不了临时文件：{error}", error))?
         .len();
     client
         .upload(sub, &mut file, length)
-        .map_err(|error| format!("回传失败：{error}"))
+        .map_err(|error| crate::i18n::Message::caused("回传失败：{error}", error))
 }
 
 #[cfg(test)]

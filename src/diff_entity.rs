@@ -65,8 +65,8 @@ pub enum DiffEvent {
 #[derive(Debug)]
 pub enum LoadEvent {
     Loaded {
-        left: Result<Loaded, String>,
-        right: Result<Loaded, String>,
+        left: Result<Loaded, crate::i18n::Msg>,
+        right: Result<Loaded, crate::i18n::Msg>,
     },
 }
 
@@ -78,7 +78,7 @@ pub struct DiffPanel {
     left: Option<Loaded>,
     right: Option<Loaded>,
     /// 读不出来（或压根不是文本）的原因。
-    error: Option<String>,
+    error: Option<crate::i18n::Msg>,
     text_rows: Vec<TextRow>,
     text_stats: diff::TextStats,
     hex_rows: Vec<HexRow>,
@@ -181,9 +181,9 @@ impl DiffPanel {
                 self.hex_rows = rows;
                 self.hex_stats = stats;
                 if left.truncated || right.truncated {
-                    self.error = Some(format!(
-                        "文件太大，只比了前 {}",
-                        crate::format::file_size(diff::MAX_BYTES as u64)
+                    self.error = Some(crate::i18n::Message::args(
+                        "文件太大，只比了前 {size}",
+                        &[("size", crate::format::file_size(diff::MAX_BYTES as u64))],
                     ));
                 }
                 self.left = Some(left);

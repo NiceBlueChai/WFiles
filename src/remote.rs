@@ -153,13 +153,19 @@ impl Config {
 const SERVICE: &str = "wfiles";
 
 /// 存密码。存不进去就报错，调用方负责把原因显示出来。
-pub fn save_password(config: &Config, password: &str) -> Result<(), String> {
+pub fn save_password(config: &Config, password: &str) -> Result<(), crate::i18n::Msg> {
     match keyring::Entry::new(SERVICE, &config.secret_key()) {
         Ok(entry) => match entry.set_password(password) {
             Ok(()) => Ok(()),
-            Err(error) => Err(format!("钥匙串写不进去：{error}")),
+            Err(error) => Err(crate::i18n::Message::args(
+                "钥匙串写不进去：{error}",
+                &[("error", error.to_string())],
+            )),
         },
-        Err(error) => Err(format!("打不开钥匙串：{error}")),
+        Err(error) => Err(crate::i18n::Message::args(
+            "打不开钥匙串：{error}",
+            &[("error", error.to_string())],
+        )),
     }
 }
 
@@ -214,17 +220,22 @@ pub trait Remote: Send + Sync {
     fn id(&self) -> &str;
 
     /// 列一个目录（`""` 是根）。
-    fn list(&self, path: &str) -> Result<Vec<Entry>, String>;
+    fn list(&self, path: &str) -> Result<Vec<Entry>, crate::i18n::Msg>;
 
     /// 问一项在不在；`None` 是没有这一项。
-    fn stat(&self, path: &str) -> Result<Option<Entry>, String>;
+    fn stat(&self, path: &str) -> Result<Option<Entry>, crate::i18n::Msg>;
 
     /// 下载一项，`sink` 收到的是原始字节，返回写出去的字节数。
-    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String>;
+    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, crate::i18n::Msg>;
 
     /// 上传一项。`reader` 从头读到尾，内容不先进内存；
     /// `length` 必须已知——对象存储要知道一次收多少。
-    fn upload(&self, path: &str, reader: &mut dyn Read, length: u64) -> Result<(), String>;
+    fn upload(
+        &self,
+        path: &str,
+        reader: &mut dyn Read,
+        length: u64,
+    ) -> Result<(), crate::i18n::Msg>;
 
     /// 下载能不能从半路接着来。
     ///
@@ -247,9 +258,14 @@ pub trait Remote: Send + Sync {
     ///
     /// 只在 [`Self::resumes_download`] 为真时调用；服务器要是回了整个文件
     /// （把 `Range` 当没看见），算失败——把整个文件拼在半截后面更糟。
-    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+    fn download_from(
+        &self,
+        path: &str,
+        offset: u64,
+        sink: &mut dyn Write,
+    ) -> Result<u64, crate::i18n::Msg> {
         let _ = (path, offset, sink);
-        Err("这条连接不支持续传".to_string())
+        Err(crate::i18n::Message::msg("这条连接不支持续传"))
     }
 
     /// 从 `offset` 接着上传：服务器上已经有前 `offset` 个字节，
@@ -262,22 +278,22 @@ pub trait Remote: Send + Sync {
         reader: &mut dyn Read,
         length: u64,
         offset: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::i18n::Msg> {
         let _ = (path, reader, length, offset);
-        Err("这条连接不支持续传".to_string())
+        Err(crate::i18n::Message::msg("这条连接不支持续传"))
     }
 
     /// 建目录。父目录必须已经存在。
-    fn mkdir(&self, path: &str) -> Result<(), String>;
+    fn mkdir(&self, path: &str) -> Result<(), crate::i18n::Msg>;
 
     /// 删文件或目录。
-    fn remove(&self, path: &str) -> Result<(), String>;
+    fn remove(&self, path: &str) -> Result<(), crate::i18n::Msg>;
 
     /// 改名/移动。
-    fn rename(&self, from: &str, to: &str) -> Result<(), String>;
+    fn rename(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg>;
 
     /// 复制一份（服务器自己拷，不用下载再上传）。
-    fn copy(&self, from: &str, to: &str) -> Result<(), String>;
+    fn copy(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg>;
 }
 
 /// 一个连上的远程位置。
@@ -287,7 +303,7 @@ pub trait Remote: Send + Sync {
 pub type Client = std::sync::Arc<dyn Remote>;
 
 /// 按配置建一个客户端（不联网，成功不代表地址对）。
-pub fn open(config: &Config, password: &str) -> Result<Client, String> {
+pub fn open(config: &Config, password: &str) -> Result<Client, crate::i18n::Msg> {
     let client: Client = match config.kind {
         Kind::WebDav => std::sync::Arc::new(Dav::new(config, password)?),
         Kind::S3 => std::sync::Arc::new(crate::s3::S3::new(config, password)?),
@@ -301,7 +317,7 @@ pub fn open(config: &Config, password: &str) -> Result<Client, String> {
 ///
 /// 不验的话，用户填错一个字母要等到第一次刷新列表才发现，
 /// 那时候的报错（"列不出来"）远不如"连不上"好懂。
-pub fn probe(config: &Config, password: &str) -> Result<Client, String> {
+pub fn probe(config: &Config, password: &str) -> Result<Client, crate::i18n::Msg> {
     let client = open(config, password)?;
     client.list("")?;
     Ok(client)
@@ -327,7 +343,7 @@ pub struct Dav {
 
 impl Dav {
     /// 建一个客户端（不联网，成功不代表地址对）。
-    pub fn new(config: &Config, password: &str) -> Result<Self, String> {
+    pub fn new(config: &Config, password: &str) -> Result<Self, crate::i18n::Msg> {
         let base = with_slash(&config.url);
         let base_path = path_of(&base);
         // 远程可能很慢，但一直转圈比报错更难排查：
@@ -368,7 +384,7 @@ impl Dav {
     }
 
     /// 列一个目录（`""` 是根）。
-    pub fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
+    pub fn list(&self, path: &str) -> Result<Vec<Entry>, crate::i18n::Msg> {
         const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:"><d:prop>
 <d:displayname/><d:getcontentlength/><d:getlastmodified/><d:resourcetype/>
@@ -385,7 +401,10 @@ impl Dav {
             .map_err(|error| explain("列目录", error))?;
         let status = response.status();
         if !(200..300).contains(&status) {
-            return Err(format!("列目录：服务器回 {status}"));
+            return Err(crate::i18n::Message::args(
+                "列目录：服务器回 {status}",
+                &[("status", status.to_string())],
+            ));
         }
         let text = response
             .into_string()
@@ -406,11 +425,16 @@ impl Dav {
     }
 
     /// 下载一个文件，写进 `sink`，返回写了多少字节。
-    pub fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
+    pub fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, crate::i18n::Msg> {
         self.get(path, None, sink)
     }
 
-    fn get(&self, path: &str, offset: Option<u64>, sink: &mut dyn Write) -> Result<u64, String> {
+    fn get(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        sink: &mut dyn Write,
+    ) -> Result<u64, crate::i18n::Msg> {
         let url = self.url_of(path);
         let mut request = self
             .agent
@@ -424,11 +448,18 @@ impl Dav {
         // 206 = 真的给了半截；200 = 服务器把 Range 当耳边风。
         let wanted = if offset.is_some() { 206 } else { 200 };
         if status != wanted {
-            return Err(format!("下载：服务器回 {status}（要的是 {wanted}）"));
+            return Err(crate::i18n::Message::args(
+                "下载：服务器回 {status}（要的是 {wanted}）",
+                &[
+                    ("status", status.to_string()),
+                    ("wanted", wanted.to_string()),
+                ],
+            ));
         }
         let mut reader = response.into_reader();
         // 一边收一边写：一个 2 GB 的文件不该先在内存里整个摊开。
-        std::io::copy(&mut reader, sink).map_err(|error| format!("下载：写盘失败：{error}"))
+        std::io::copy(&mut reader, sink)
+            .map_err(|error| crate::i18n::Message::caused("下载：写盘失败：{error}", error))
     }
 
     /// 问一项在不在、是文件还是目录、有多大。
@@ -436,7 +467,7 @@ impl Dav {
     /// `None` = 没有这一项（服务器回了 404）。搬运前判冲突靠它，
     /// 不能靠"列一遍父目录再看里头有没有"——父目录可能很大，
     /// 而问这一项本身只要一趟 Depth:0 的 PROPFIND。
-    pub fn stat(&self, path: &str) -> Result<Option<Entry>, String> {
+    pub fn stat(&self, path: &str) -> Result<Option<Entry>, crate::i18n::Msg> {
         const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:"><d:prop>
 <d:displayname/><d:getcontentlength/><d:getlastmodified/><d:resourcetype/>
@@ -456,12 +487,16 @@ impl Dav {
             return Ok(None);
         }
         if !(200..300).contains(&status) {
-            return Err(format!("查询：服务器回 {status}"));
+            return Err(crate::i18n::Message::args(
+                "查询：服务器回 {status}",
+                &[("status", status.to_string())],
+            ));
         }
         let text = response
             .into_string()
-            .map_err(|error| format!("查询：读不回响应：{error}"))?;
-        let entries = parse_propfind(text.as_bytes()).map_err(|error| format!("查询：{error}"))?;
+            .map_err(|error| crate::i18n::Message::caused("查询：读不回响应：{error}", error))?;
+        let entries = parse_propfind(text.as_bytes())
+            .map_err(|error| crate::i18n::Message::caused("查询：{error}", error))?;
         Ok(entries.into_iter().next().map(|mut entry| {
             entry.path = self.relative(&entry.path);
             entry
@@ -481,7 +516,7 @@ impl Dav {
         path: &str,
         reader: impl std::io::Read,
         length: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::i18n::Msg> {
         let url = self.url_of(path);
         self.agent
             .request("PUT", &url)
@@ -493,27 +528,27 @@ impl Dav {
     }
 
     /// 建目录。父目录必须已经存在——WebDAV 不会像 `mkdir -p` 那样一路建下去。
-    pub fn mkdir(&self, path: &str) -> Result<(), String> {
+    pub fn mkdir(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         self.empty_of("MKCOL", "建目录", path)
     }
 
     /// 删文件或目录（目录必须是空的：WebDAV 的 DELETE 是"删这一项"）。
-    pub fn remove(&self, path: &str) -> Result<(), String> {
+    pub fn remove(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         self.empty_of("DELETE", "删除", path)
     }
 
     /// 改名/移动。`Destination` 必须是完整 URL（RFC 4918 的规定）。
-    pub fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         self.move_of("MOVE", "改名", from, to)
     }
 
     /// 复制一份（服务器自己拷，不用下载再上传）。
-    pub fn copy(&self, from: &str, to: &str) -> Result<(), String> {
+    pub fn copy(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         self.move_of("COPY", "复制", from, to)
     }
 
     /// 发一个没有请求体的动作（MKCOL / DELETE）。
-    fn empty_of(&self, method: &str, doing: &str, path: &str) -> Result<(), String> {
+    fn empty_of(&self, method: &str, doing: &str, path: &str) -> Result<(), crate::i18n::Msg> {
         let url = self.url_of(path);
         self.agent
             .request(method, &url)
@@ -524,7 +559,13 @@ impl Dav {
     }
 
     /// MOVE / COPY：目标必须是完整 URL，且默认不覆盖（覆盖与否交给冲突处理）。
-    fn move_of(&self, method: &str, doing: &str, from: &str, to: &str) -> Result<(), String> {
+    fn move_of(
+        &self,
+        method: &str,
+        doing: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), crate::i18n::Msg> {
         let url = self.url_of(from);
         let destination = self.url_of(to);
         self.agent
@@ -553,39 +594,49 @@ impl Remote for Dav {
     /// 续传就靠 `Range: bytes=<offset>-` 这一个头：服务器认就回 206
     /// 和剩下的字节，不认就回 200 和整个文件——后者算失败，
     /// 因为把整个文件拼在半截后面比重新下一趟更糟。
-    fn download_from(&self, path: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+    fn download_from(
+        &self,
+        path: &str,
+        offset: u64,
+        sink: &mut dyn Write,
+    ) -> Result<u64, crate::i18n::Msg> {
         self.get(path, Some(offset), sink)
     }
 
-    fn list(&self, path: &str) -> Result<Vec<Entry>, String> {
+    fn list(&self, path: &str) -> Result<Vec<Entry>, crate::i18n::Msg> {
         self.list(path)
     }
 
-    fn stat(&self, path: &str) -> Result<Option<Entry>, String> {
+    fn stat(&self, path: &str) -> Result<Option<Entry>, crate::i18n::Msg> {
         self.stat(path)
     }
 
-    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, String> {
+    fn download(&self, path: &str, sink: &mut dyn Write) -> Result<u64, crate::i18n::Msg> {
         self.download(path, sink)
     }
 
-    fn upload(&self, path: &str, reader: &mut dyn Read, length: u64) -> Result<(), String> {
+    fn upload(
+        &self,
+        path: &str,
+        reader: &mut dyn Read,
+        length: u64,
+    ) -> Result<(), crate::i18n::Msg> {
         self.upload_stream(path, reader, length)
     }
 
-    fn mkdir(&self, path: &str) -> Result<(), String> {
+    fn mkdir(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         self.mkdir(path)
     }
 
-    fn remove(&self, path: &str) -> Result<(), String> {
+    fn remove(&self, path: &str) -> Result<(), crate::i18n::Msg> {
         self.remove(path)
     }
 
-    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+    fn rename(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         self.rename(from, to)
     }
 
-    fn copy(&self, from: &str, to: &str) -> Result<(), String> {
+    fn copy(&self, from: &str, to: &str) -> Result<(), crate::i18n::Msg> {
         self.copy(from, to)
     }
 }
@@ -594,12 +645,15 @@ impl Remote for Dav {
 ///
 /// 它自带的 `Display` 会把状态码、IO 错误、TLS 错误全糊在一起，
 /// 用户看到的是一长串看不懂的东西。这里只留最关键的那一条。
-pub(crate) fn explain(doing: &str, error: ureq::Error) -> String {
+pub(crate) fn explain(doing: &str, error: ureq::Error) -> crate::i18n::Msg {
     let detail = match &error {
-        ureq::Error::Status(code, _) => format!("服务器回 {code}"),
+        ureq::Error::Status(code, _) => code.to_string(),
         ureq::Error::Transport(transport) => transport.to_string(),
     };
-    format!("{doing}失败：{detail}")
+    crate::i18n::Message::args(
+        "{doing}失败：{detail}",
+        &[("doing", doing.to_string()), ("detail", detail)],
+    )
 }
 
 /// `path` 那一段 URL 编码：只动该动的字符。
@@ -706,7 +760,7 @@ fn path_of(url: &str) -> String {
 ///
 /// 只用正经 XML 解析器：手写正则式扫描会在命名空间前缀（`d:`、`D:`、没有前缀）
 /// 上翻车，而各家服务器恰恰在这些地方花样最多。
-fn parse_propfind(body: &[u8]) -> Result<Vec<Entry>, String> {
+fn parse_propfind(body: &[u8]) -> Result<Vec<Entry>, crate::i18n::Msg> {
     use quick_xml::Reader;
     use quick_xml::events::Event;
 
@@ -776,12 +830,17 @@ fn parse_propfind(body: &[u8]) -> Result<Vec<Entry>, String> {
                 }
                 tag = Tag::Other;
             }
-            Err(error) => return Err(format!("XML 读不懂：{error}")),
+            Err(error) => {
+                return Err(crate::i18n::Message::args(
+                    "XML 读不懂：{error}",
+                    &[("error", error.to_string())],
+                ));
+            }
             _ => {}
         }
     }
     if out.is_empty() {
-        return Err("服务器回的东西里没有文件".to_string());
+        return Err(crate::i18n::Message::msg("服务器回的东西里没有文件"));
     }
     Ok(out)
 }
@@ -1380,7 +1439,10 @@ mod tests {
         // 端口 1 上什么都没有：该立刻报"连不上"，不是卡住。
         let dav = Dav::new(&fake::config("http://127.0.0.1:1/dav/"), "secret").unwrap();
         let error = dav.list("").expect_err("该报错");
-        assert!(error.contains("列目录失败"), "报错要带上在干什么：{error}");
+        assert!(
+            error.to_string().contains("列目录失败"),
+            "报错要带上在干什么：{error}"
+        );
     }
 
     #[test]

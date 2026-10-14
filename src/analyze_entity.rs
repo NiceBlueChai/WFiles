@@ -118,7 +118,7 @@ pub struct AnalyzePanel {
     dup_stats: Option<DupStats>,
     sums: Vec<Sums>,
     /// 算不出来的文件与原因。列在最后，别让一个读不了的文件把整趟说成失败。
-    failures: Vec<(PathBuf, String)>,
+    failures: Vec<(PathBuf, crate::i18n::Msg)>,
     running: bool,
     /// 后台那一趟的把手。中止就是 `abort()`。
     control: Option<Control>,

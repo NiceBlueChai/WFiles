@@ -355,8 +355,9 @@ pub struct Sums {
 ///
 /// 读不出来就报原因（`Err`），中止也走同一条路：
 /// 界面只需要知道"这一个没算出来"，不需要区分是权限还是用户点的中止。
-pub fn checksums(path: &Path, control: &Control) -> Result<Sums, String> {
-    let mut file = fs::File::open(path).map_err(|error| format!("读不了：{error}"))?;
+pub fn checksums(path: &Path, control: &Control) -> Result<Sums, crate::i18n::Msg> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| crate::i18n::Message::caused("读不了：{error}", error))?;
     let bytes = file.metadata().map(|it| it.len()).unwrap_or_default();
     let mut md5 = md5::Context::new();
     let mut sha1 = sha1::Sha1::new();
@@ -365,11 +366,11 @@ pub fn checksums(path: &Path, control: &Control) -> Result<Sums, String> {
 
     loop {
         if !control.should_continue() {
-            return Err("已中止".to_string());
+            return Err(crate::i18n::Message::aborted());
         }
         let read = file
             .read(&mut buffer)
-            .map_err(|error| format!("读不了：{error}"))?;
+            .map_err(|error| crate::i18n::Message::caused("读不了：{error}", error))?;
         if read == 0 {
             break;
         }
@@ -447,7 +448,7 @@ pub enum SumEvent {
     /// 这一个没算出来：权限不够、文件没了、或者中止了。
     Failed {
         path: PathBuf,
-        error: String,
+        error: crate::i18n::Msg,
     },
     Finished,
 }
@@ -758,7 +759,10 @@ mod tests {
     fn a_file_that_cannot_be_read_says_why() {
         let sums = checksums(Path::new("/并不存在的文件"), &go());
         assert!(sums.is_err(), "读不了就该报错，而不是给个空字符串");
-        assert!(sums.unwrap_err().contains("读不了"));
+        // 判中文原文：`Display` 恒给中文，跟语言无关。
+        // **别给 `Message` 加 `contains`**——那正是 `is()` 要顶掉的坑：
+        // 拿显示文案当判据，切到英文就永远不成立。
+        assert!(sums.unwrap_err().to_string().contains("读不了"));
     }
 
     #[test]
@@ -769,7 +773,8 @@ mod tests {
         let control = Control::new();
         control.abort();
         let error = checksums(&path, &control).expect_err("该中止");
-        assert_eq!(error, "已中止");
+        // 判 key 不判文案：这条判据在英文下也必须成立。
+        assert!(error.is_aborted(), "实际错误：{error}");
     }
 
     #[test]

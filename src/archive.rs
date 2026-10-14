@@ -35,13 +35,15 @@ pub fn is_archive(path: &Path) -> bool {
 }
 
 /// 读出压缩包里的条目，按包内路径排好序。
-pub fn entries(path: &Path) -> Result<Vec<Entry>, String> {
+pub fn entries(path: &Path) -> Result<Vec<Entry>, crate::i18n::Msg> {
     if !is_archive(path) {
-        return Err("不是 zip 压缩包".to_string());
+        return Err(crate::i18n::Message::msg("不是 zip 压缩包"));
     }
-    let file = File::open(path).map_err(|error| format!("打不开：{error}"))?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|error| format!("读不了这个压缩包：{error}"))?;
+    let file =
+        File::open(path).map_err(|error| crate::i18n::Message::caused("打不开：{error}", error))?;
+    let mut archive = ZipArchive::new(file).map_err(|error| {
+        crate::i18n::Message::caused("读不了这个压缩包：{error}", error.to_string())
+    })?;
 
     let mut entries = Vec::with_capacity(archive.len());
     for index in 0..archive.len() {
@@ -67,14 +69,17 @@ pub fn entries(path: &Path) -> Result<Vec<Entry>, String> {
 ///
 /// `wanted` 留空就是全部。目录条目只建目录，不计进返回值——
 /// 给用户报"解出来几个文件"，目录不算文件。
-pub fn extract(path: &Path, dest: &Path, wanted: &[String]) -> Result<usize, String> {
+pub fn extract(path: &Path, dest: &Path, wanted: &[String]) -> Result<usize, crate::i18n::Msg> {
     if !is_archive(path) {
-        return Err("不是 zip 压缩包".to_string());
+        return Err(crate::i18n::Message::msg("不是 zip 压缩包"));
     }
-    std::fs::create_dir_all(dest).map_err(|error| format!("建不了目标目录：{error}"))?;
-    let file = File::open(path).map_err(|error| format!("打不开：{error}"))?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|error| format!("读不了这个压缩包：{error}"))?;
+    std::fs::create_dir_all(dest)
+        .map_err(|error| crate::i18n::Message::caused("建不了目标目录：{error}", error))?;
+    let file =
+        File::open(path).map_err(|error| crate::i18n::Message::caused("打不开：{error}", error))?;
+    let mut archive = ZipArchive::new(file).map_err(|error| {
+        crate::i18n::Message::caused("读不了这个压缩包：{error}", error.to_string())
+    })?;
 
     let mut files = 0;
     for index in 0..archive.len() {
@@ -93,16 +98,38 @@ pub fn extract(path: &Path, dest: &Path, wanted: &[String]) -> Result<usize, Str
             continue;
         };
         if entry.is_dir() || name.ends_with('/') {
-            std::fs::create_dir_all(&out).map_err(|error| format!("建不了 {name}：{error}"))?;
+            std::fs::create_dir_all(&out).map_err(|error| {
+                crate::i18n::Message::caused_with(
+                    "建不了 {name}：{error}",
+                    &[("name", name.to_string())],
+                    error,
+                )
+            })?;
             continue;
         }
         if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("建不了 {name} 的上级目录：{error}"))?;
+            std::fs::create_dir_all(parent).map_err(|error| {
+                crate::i18n::Message::caused_with(
+                    "建不了 {name} 的上级目录：{error}",
+                    &[("name", name.to_string())],
+                    error,
+                )
+            })?;
         }
-        let mut out_file = File::create(&out).map_err(|error| format!("写不了 {name}：{error}"))?;
-        std::io::copy(&mut entry, &mut out_file)
-            .map_err(|error| format!("解 {name} 解到一半：{error}"))?;
+        let mut out_file = File::create(&out).map_err(|error| {
+            crate::i18n::Message::caused_with(
+                "写不了 {name}：{error}",
+                &[("name", name.to_string())],
+                error,
+            )
+        })?;
+        std::io::copy(&mut entry, &mut out_file).map_err(|error| {
+            crate::i18n::Message::caused_with(
+                "解 {name} 解到一半：{error}",
+                &[("name", name.to_string())],
+                error,
+            )
+        })?;
         files += 1;
     }
     Ok(files)
@@ -135,11 +162,12 @@ fn safe_destination(dest: &Path, name: &str) -> Option<PathBuf> {
 ///
 /// `base` 是这批文件的共同父目录。选中三个散落的文件打包时，
 /// 用当前目录当 base：包里就不会出现一长串 `Users/xxx/Downloads/...`。
-pub fn create(zip: &Path, base: &Path, sources: &[PathBuf]) -> Result<usize, String> {
+pub fn create(zip: &Path, base: &Path, sources: &[PathBuf]) -> Result<usize, crate::i18n::Msg> {
     if sources.is_empty() {
-        return Err("先选中要打包的东西".to_string());
+        return Err(crate::i18n::Message::msg("先选中要打包的东西"));
     }
-    let file = File::create(zip).map_err(|error| format!("建不了 {zip:?}：{error}"))?;
+    let file = File::create(zip)
+        .map_err(|error| crate::i18n::Message::caused("建不了 {zip:?}：{error}", error))?;
     let mut writer = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
@@ -150,9 +178,9 @@ pub fn create(zip: &Path, base: &Path, sources: &[PathBuf]) -> Result<usize, Str
     }
     writer
         .finish()
-        .map_err(|error| format!("收尾写坏了：{error}"))?;
+        .map_err(|error| crate::i18n::Message::caused("收尾写坏了：{error}", error.to_string()))?;
     if files == 0 {
-        return Err("没有可打包的内容".to_string());
+        return Err(crate::i18n::Message::msg("没有可打包的内容"));
     }
     Ok(files)
 }
@@ -182,7 +210,7 @@ fn add_path<W: Write + std::io::Seek>(
     relative: &Path,
     archive: &Path,
     options: SimpleFileOptions,
-) -> Result<usize, String> {
+) -> Result<usize, crate::i18n::Msg> {
     // 把自己装进去会一边写一边读，越打越大，最后是个废包。
     if same_path(source, archive) {
         return Ok(0);
@@ -191,18 +219,26 @@ fn add_path<W: Write + std::io::Seek>(
         .to_str()
         .map(|name| name.replace('\\', "/"))
         .ok_or_else(|| format!("{source:?} 的名字不是合法 Unicode"))?;
-    let metadata =
-        std::fs::symlink_metadata(source).map_err(|error| format!("看不了 {source:?}：{error}"))?;
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|error| crate::i18n::Message::caused("看不了 {source:?}：{error}", error))?;
 
     if metadata.is_dir() {
         writer
             .add_directory(format!("{name}/"), options)
-            .map_err(|error| format!("写不了目录 {name}：{error}"))?;
+            .map_err(|error| {
+                crate::i18n::Message::caused_with(
+                    "写不了目录 {name}：{error}",
+                    &[("name", name.to_string())],
+                    error.to_string(),
+                )
+            })?;
         let mut files = 0;
-        let children =
-            std::fs::read_dir(source).map_err(|error| format!("列不出 {source:?}：{error}"))?;
+        let children = std::fs::read_dir(source)
+            .map_err(|error| crate::i18n::Message::caused("列不出 {source:?}：{error}", error))?;
         for child in children {
-            let child = child.map_err(|error| format!("列不出 {source:?}：{error}"))?;
+            let child = child.map_err(|error| {
+                crate::i18n::Message::caused("列不出 {source:?}：{error}", error)
+            })?;
             let child_path = child.path();
             let child_relative = relative.join(child.file_name());
             files += add_path(writer, &child_path, &child_relative, archive, options)?;
@@ -215,11 +251,22 @@ fn add_path<W: Write + std::io::Seek>(
         return Ok(0);
     }
 
-    writer
-        .start_file(name.clone(), options)
-        .map_err(|error| format!("写不了 {name}：{error}"))?;
-    let mut input = File::open(source).map_err(|error| format!("读不了 {source:?}：{error}"))?;
-    std::io::copy(&mut input, writer).map_err(|error| format!("写 {name} 写到一半：{error}"))?;
+    writer.start_file(name.clone(), options).map_err(|error| {
+        crate::i18n::Message::caused_with(
+            "写不了 {name}：{error}",
+            &[("name", name.to_string())],
+            error.to_string(),
+        )
+    })?;
+    let mut input = File::open(source)
+        .map_err(|error| crate::i18n::Message::caused("读不了 {source:?}：{error}", error))?;
+    std::io::copy(&mut input, writer).map_err(|error| {
+        crate::i18n::Message::caused_with(
+            "写 {name} 写到一半：{error}",
+            &[("name", name.to_string())],
+            error,
+        )
+    })?;
     Ok(1)
 }
 

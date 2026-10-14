@@ -60,26 +60,28 @@ impl RestoreSet {
         serde_json::from_str(&text).ok()
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> Result<(), crate::i18n::Msg> {
         let Some(path) = Self::file_path() else {
-            return Err("找不到恢复文件位置".to_string());
+            return Err(crate::i18n::Message::msg("找不到恢复文件位置"));
         };
         self.save_to(&path)
     }
 
-    pub fn save_to(&self, path: &Path) -> Result<(), String> {
+    pub fn save_to(&self, path: &Path) -> Result<(), crate::i18n::Msg> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            fs::create_dir_all(parent).map_err(crate::i18n::Message::from)?;
         }
-        let json = serde_json::to_string_pretty(self).map_err(|error| error.to_string())?;
+        let json = serde_json::to_string_pretty(self).map_err(|error| {
+            crate::i18n::Message::caused("序列化失败：{error}", error.to_string())
+        })?;
         // 跟会话同一套写法：先写临时文件再改名。
         // 崩溃恢复这件事本身就是在处理"崩溃写了一半"，
         // 这里再留一个写一半的恢复文件就太讽刺了。
         let temp = path.with_extension("json.tmp");
-        let mut file = fs::File::create(&temp).map_err(|error| error.to_string())?;
+        let mut file = fs::File::create(&temp).map_err(crate::i18n::Message::from)?;
         file.write_all(json.as_bytes())
-            .map_err(|error| error.to_string())?;
-        fs::rename(&temp, path).map_err(|error| error.to_string())
+            .map_err(crate::i18n::Message::from)?;
+        fs::rename(&temp, path).map_err(crate::i18n::Message::from)
     }
 
     /// 恢复文件放在哪儿。

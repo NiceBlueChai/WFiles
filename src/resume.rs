@@ -355,7 +355,7 @@ fn hex_char(nibble: u8) -> char {
 /// 先试改名：同一个卷上是一瞬间的事，而且目标要么是旧的要么是新的，
 /// 不会出现半新半旧。跨卷（移动硬盘、另一块磁盘）改名不成立，
 /// 那就老实拷贝一份再把暂存的删掉。
-pub fn finish(staging: &Path, target: &Path) -> Result<(), String> {
+pub fn finish(staging: &Path, target: &Path) -> Result<(), crate::i18n::Msg> {
     match fs::rename(staging, target) {
         Ok(()) => Ok(()),
         Err(rename_error) => match fs::copy(staging, target) {
@@ -363,10 +363,13 @@ pub fn finish(staging: &Path, target: &Path) -> Result<(), String> {
                 fs::remove_file(staging).ok();
                 Ok(())
             }
-            Err(_) => Err(format!(
-                "落不了盘（{} → {}）：{rename_error}",
-                staging.display(),
-                target.display()
+            Err(_) => Err(crate::i18n::Message::args(
+                "落不了盘（{from} → {to}）：{rename_error}",
+                &[
+                    ("from", staging.display().to_string()),
+                    ("to", target.display().to_string()),
+                    ("rename_error", rename_error.to_string()),
+                ],
             )),
         },
     }
