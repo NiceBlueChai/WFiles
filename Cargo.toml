@@ -46,6 +46,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "
 # 全平台写在 `[dependencies]` 里就等于让 macOS 和 Windows 的二进制也背上它们。
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
+# 恢复回收站时要拼出 Finder 给重名项加的时间戳后缀（`主干 时.分.秒.扩展名`，
+# 本地时间）。gpui 已经把 chrono 带进来了，声明它不会多编译一份；自己写
+# `localtime_r` 的 unsafe FFI 反而更重。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }

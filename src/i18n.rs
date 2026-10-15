@@ -980,8 +980,8 @@ static EN: &[(&str, &str)] = &[
         "Can't locate your home folder, so the trash is out of reach",
     ),
     (
-        "回收站里找不到这次删掉的项，请手动打开回收站放回",
-        "That item isn't in the trash; put it back from the trash yourself",
+        "回收站里没找到这次删掉的项：请手动到回收站放回；若本应用读不到回收站，请在系统设置里给它完全磁盘访问权限",
+        "That item isn't in the trash; put it back from the Trash yourself. If this app can't read your Trash, give it Full Disk Access in System Settings.",
     ),
     (
         "这个平台不支持从回收站撤销，请手动打开回收站放回",

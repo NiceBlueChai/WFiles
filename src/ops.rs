@@ -227,9 +227,13 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, crate::i18n::Msg> 
 /// 删除时刻是撤销的关键依据：回收站里的同名项可能不止一个
 /// （删过一次又删一次），只有“这次删的”才该被放回来。
 pub fn trash(paths: &[PathBuf]) -> Vec<(PathBuf, SystemTime)> {
-    let trashed_at = SystemTime::now();
     let mut trashed = Vec::new();
     for path in paths {
+        // **一个文件记一次时刻，不是一批共用一个**：Finder 给重名项加的后缀
+        // 用的是移进回收站那一刻的墙上时钟，而 `trash::delete` 一次只处理
+        // 一个路径（每次一个 osascript），批量删十个前后能差好几秒。
+        // 共用时刻的话，恢复时就只能把时间窗开得很宽，容易捞到别的同名项。
+        let trashed_at = SystemTime::now();
         if trash::delete(path).is_ok() {
             trashed.push((path.clone(), trashed_at));
         }
@@ -240,8 +244,9 @@ pub fn trash(paths: &[PathBuf]) -> Vec<(PathBuf, SystemTime)> {
 /// 从回收站放回原处。
 ///
 /// - Linux/Windows：`trash` crate 的 `os_limited` 能直接列出并放回，可靠。
-/// - macOS：系统不提供查询接口，改为扫描 `~/.Trash` 里同名、且 inode 变更时间
-///   （ctime，移入回收站会刷新）不早于删除时刻的项，取最新的一个放回。
+/// - macOS：系统不提供查询接口，也不允许枚举 `~/.Trash` 的目录项
+///   （TCC）。改为**按候选名逐个 stat**：同名、且 inode 变更时间（ctime，
+///   移入回收站会刷新）不早于删除时刻的项，取最新的一个 `rename` 回去。
 ///   这是启发式：万一失败会给出明确错误，让用户去回收站手动放回。
 pub fn restore_from_trash(original: &Path, trashed_at: SystemTime) -> Result<(), crate::i18n::Msg> {
     #[cfg(any(
@@ -288,7 +293,36 @@ pub fn restore_from_trash(original: &Path, trashed_at: SystemTime) -> Result<(),
     }
 }
 
+/// 兜底的编号式候选探多少个（见 [`trash_candidate_names`]）。
+#[cfg(target_os = "macos")]
+const TRASH_NAME_PROBES: u32 = 200;
+
+/// 时间戳候选在删除时刻前后各探几秒。
+///
+/// `trashed_at` 是调 `trash::delete` 之前记的，而真正落进回收站是那次
+/// AppleScript 跑完的时候（实测一次约 0.3 秒）；留几秒余量吸收调度抖动。
+#[cfg(target_os = "macos")]
+const TRASH_STAMP_SPREAD_SECS: i64 = 3;
+
 /// macOS 的回收站恢复实现，回收站目录由调用方给出（测试里用临时目录）。
+///
+/// # 为什么不 `read_dir`
+///
+/// macOS 的 TCC **不给普通进程读 `~/.Trash` 的目录项**：`fs::read_dir`
+/// 直接 `Operation not permitted`。而**按已知路径 `symlink_metadata` /
+/// `rename` 是放行的**（实测：shell、launchd 用户代理、打包成 `.app` 由
+/// LaunchServices 启动，三种上下文下 `read_dir` 全被拒，按名 `stat` 全通）。
+///
+/// 所以这里不枚举目录，改成**按候选名逐个 `stat`**——被拦住的恰恰只有
+/// 枚举那一步。候选名见 [`trash_candidate_names`]。这条路径不依赖
+/// 「完全磁盘访问权限」，也就不会让「可撤销」这个卖点在默认权限下静默失效。
+///
+/// # 为什么不去问 Finder
+///
+/// Finder 的 Apple Events **能**列出回收站（`every item of trash whose …`），
+/// 名字不用猜。实测下来太慢：一次带过滤的查询 0.6 秒起、要逐个取
+/// `POSIX path` 的那种 2.7 秒——撤销是当场做的（`ops_entity::undo_now`
+/// 就在界面线程上），这个价钱付不起。逐个 `stat` 是微秒级。
 #[cfg(target_os = "macos")]
 fn restore_from_trash_dir(
     trash_dir: &Path,
@@ -305,33 +339,37 @@ fn restore_from_trash_dir(
     let (stem, extension) = split_name(&name);
 
     // 留 2 秒余量，吸收“删除动作先记时刻、系统后落盘”的时钟误差。
-    let cutoff = trashed_at - Duration::from_secs(2);
-    let mut best: Option<(i64, PathBuf)> = None;
+    let cutoff = cutoff_seconds(trashed_at - Duration::from_secs(2));
+    // 出局的判据是 ctime，挑出哪个也是 ctime：早于删除时刻的同名项是
+    // 更早删的，剩下的里面最新那个就是这次删的。
+    //
+    // **用 `(ctime, ctime_nsec)` 而不是 `ctime`**：后者只有秒，而同一次
+    // 批量删除里两个同名项完全可能落在同一秒——那一刻两者靠秒级时间不分
+    // 高下，就会把更早删的那个放回来。
+    let mut best: Option<((i64, i64), PathBuf)> = None;
 
-    let entries = fs::read_dir(trash_dir).map_err(crate::i18n::Message::from)?;
-    for entry in entries.flatten() {
-        let entry_name = entry.file_name().to_string_lossy().into_owned();
-        if !trash_name_matches(&entry_name, &stem, &extension) {
-            continue;
-        }
-
-        let Ok(metadata) = entry.metadata() else {
+    for candidate_name in trash_candidate_names(&name, &stem, &extension, trashed_at) {
+        let candidate = trash_dir.join(&candidate_name);
+        // 候选不存在是常态（大多数号都空着），跳过就是——不把它当错误，
+        // 否则一个空号就会把整个恢复判死。
+        let Ok(metadata) = fs::symlink_metadata(&candidate) else {
             continue;
         };
-        // 移入回收站会刷新 inode 的 ctime；早于删除时刻的是更早删的，不动。
-        if metadata.ctime() < cutoff_seconds(cutoff) {
+        // 移进回收站会刷新 inode 的 ctime；早于删除时刻的是更早删的，不动。
+        let ctime = metadata.ctime();
+        if ctime < cutoff {
             continue;
         }
-        if best
-            .as_ref()
-            .is_none_or(|(seen, _)| metadata.ctime() > *seen)
-        {
-            best = Some((metadata.ctime(), entry.path()));
+        let seen = (ctime, metadata.ctime_nsec());
+        if best.as_ref().is_none_or(|(newest, _)| seen > *newest) {
+            best = Some((seen, candidate));
         }
     }
 
     let (_, candidate) = best.ok_or_else(|| {
-        crate::i18n::Message::msg("回收站里找不到这次删掉的项，请手动打开回收站放回")
+        crate::i18n::Message::msg(
+            "回收站里没找到这次删掉的项：请手动到回收站放回；若本应用读不到回收站，请在系统设置里给它完全磁盘访问权限",
+        )
     })?;
 
     if original.exists() {
@@ -345,23 +383,63 @@ fn restore_from_trash_dir(
     fs::rename(&candidate, original).map_err(crate::i18n::Message::from)
 }
 
-/// 回收站里的名字是“原名”或“原名 N”（macOS 遇到同名项时自动加序号）。
+/// 回收站里这一项可能叫什么名字。
+///
+/// 挑出哪个由 [`restore_from_trash_dir`] 按 ctime 定：早于删除时刻的
+/// 出局，剩下的里面取最新的那个。所以这里只管**把所有可能的叫法列全**。
+///
+/// # 命名法是怎么定的
+///
+/// 回收站里第一次删某个名字，就叫原名；**再删一次** Finder 会给它加后缀：
+/// `主干 时.分.秒.扩展名`（本地时间）。这台机器上实测：
+///
+/// - 后缀是**移进回收站那一刻**的墙上时钟——把文件的 mtime 改成 2020 年、
+///   创建与删除相隔 20 秒，后缀仍然等于删除当时的时间；
+/// - 不是代码里原来猜的 `主干 2.扩展名`。那个命名法一个样本都没见到。
+///
+/// 小时的补零与否没样本（只见过 22、23 点），所以两种都拼上。
 #[cfg(target_os = "macos")]
-fn trash_name_matches(entry_name: &str, stem: &str, extension: &str) -> bool {
-    if entry_name == format!("{stem}{extension}") {
-        return true;
+fn trash_candidate_names(
+    name: &str,
+    stem: &str,
+    extension: &str,
+    trashed_at: SystemTime,
+) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+
+    // 0 秒、±1 秒、±2 秒……
+    let mut offsets = vec![0i64];
+    for step in 1..=TRASH_STAMP_SPREAD_SECS {
+        offsets.push(step);
+        offsets.push(-step);
     }
-    let Some(rest) = entry_name.strip_prefix(stem) else {
-        return false;
-    };
-    let Some(rest) = rest.strip_suffix(extension) else {
-        return false;
-    };
-    // 名字和扩展名之间只允许一个空格加数字，例如 " 2"。
-    match rest.strip_prefix(' ') {
-        Some(digits) => !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()),
-        None => false,
+    for offset in offsets {
+        let moment = if offset >= 0 {
+            trashed_at.checked_add(Duration::from_secs(offset as u64))
+        } else {
+            trashed_at.checked_sub(Duration::from_secs(offset.unsigned_abs()))
+        };
+        let Some(moment) = moment else {
+            continue;
+        };
+        let local = chrono::DateTime::<chrono::Local>::from(moment);
+        let unpadded = local.format("%-H.%M.%S").to_string();
+        let padded = local.format("%H.%M.%S").to_string();
+        let mut stamps = vec![unpadded];
+        if !stamps.contains(&padded) {
+            stamps.push(padded);
+        }
+        for stamp in stamps {
+            out.push(format!("{stem} {stamp}{extension}"));
+        }
     }
+
+    // 兜底：编号式「主干 2.扩展名」。这台机器上没见 Finder 用过，但它便宜
+    // （几百次 stat 是微秒级），留着防别的系统版本换过命名法。
+    for round in 2..=TRASH_NAME_PROBES {
+        out.push(format!("{stem} {round}{extension}"));
+    }
+    out
 }
 
 #[cfg(target_os = "macos")]
@@ -2738,16 +2816,76 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn trash_name_matches_accepts_originals_and_numbered_duplicates() {
-        assert!(trash_name_matches("a.txt", "a", ".txt"));
-        assert!(trash_name_matches("a 2.txt", "a", ".txt"));
-        assert!(trash_name_matches("a 10.txt", "a", ".txt"));
-        // 点号开头的名字整体是主干，不是扩展名。
-        assert!(trash_name_matches(".gitignore", ".gitignore", ""));
-        // 别的名字、别的序号格式都不算。
-        assert!(!trash_name_matches("ab.txt", "a", ".txt"));
-        assert!(!trash_name_matches("a2.txt", "a", ".txt"));
-        assert!(!trash_name_matches("a x.txt", "a", ".txt"));
+    fn trash_candidate_names_cover_the_plain_name_and_finders_timestamp() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_860_000);
+        let local = chrono::DateTime::<chrono::Local>::from(at);
+        let names = trash_candidate_names("报告.txt", "报告", ".txt", at);
+        let has = |text: String| names.contains(&text);
+
+        // 第一次删这个名字，回收站里就叫原名。
+        assert!(has("报告.txt".to_string()));
+        // 重名时 Finder 加的是「主干 时.分.秒.扩展名」，用的是**删除那一刻**
+        // 的本地时间（实测，见 `trash_candidate_names` 的注释）。
+        let stamp = local.format("%-H.%M.%S").to_string();
+        assert!(
+            has(format!("报告 {stamp}.txt")),
+            "该拼出 Finder 的时间戳后缀，实际候选里没有「报告 {stamp}.txt」"
+        );
+        // 删除时刻是调 AppleScript **之前**记的，所以前后几秒都要探。
+        let earlier = (local - chrono::Duration::seconds(2))
+            .format("%-H.%M.%S")
+            .to_string();
+        assert!(has(format!("报告 {earlier}.txt")));
+        // 编号式那套留着兜底，防别的系统版本换过命名法。
+        assert!(has("报告 2.txt".to_string()));
+
+        // 点号开头的名字整体是主干，不是扩展名，所以尾巴是空的。
+        let dot = trash_candidate_names(".gitignore", ".gitignore", "", at);
+        assert!(dot.contains(&".gitignore".to_string()));
+        assert!(dot.contains(&format!(".gitignore {stamp}")));
+        // 没有扩展名的名字，时间戳直接缀在末尾。
+        let plain = trash_candidate_names("README", "README", "", at);
+        assert!(plain.contains(&format!("README {stamp}")));
+    }
+
+    /// 重名时 Finder 加的是时间戳后缀，恢复得认出它来。
+    ///
+    /// 钉住的是实测发现的那个坑：代码原来以为 Finder 用「 2」「 3」编号，
+    /// 于是**同一个名字删第二次就再也撤不回来**——回收站里明明有，
+    /// 候选名里一个都对不上。grep 全文也找不到「 2」这种名字的样本。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_from_trash_dir_finds_the_timestamp_named_duplicate() {
+        let root = temp();
+        let original_parent = root.path().join("work");
+        fs::create_dir(&original_parent).unwrap();
+        let original = original_parent.join("报告.txt");
+
+        let trash_dir = root.path().join(".Trash");
+        fs::create_dir(&trash_dir).unwrap();
+        // 早先删过一次，占着原名。
+        fs::write(trash_dir.join("报告.txt"), "older").unwrap();
+
+        // 这次删的：Finder 给加了时间戳。时刻就取 `trash()` 记下的那个。
+        let trashed_at = SystemTime::now();
+        let stamp = chrono::DateTime::<chrono::Local>::from(trashed_at)
+            .format("%-H.%M.%S")
+            .to_string();
+        let landed = trash_dir.join(format!("报告 {stamp}.txt"));
+        fs::write(&landed, "newer").unwrap();
+
+        restore_from_trash_dir(&trash_dir, &original, trashed_at).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&original).unwrap(),
+            "newer",
+            "该放回这次删的那个，不是更早删的同名项"
+        );
+        assert!(!landed.exists(), "放回之后回收站里那一份就不该还在");
+        assert!(
+            trash_dir.join("报告.txt").exists(),
+            "更早删的同名项不该被顺手动掉"
+        );
     }
 
     #[cfg(target_os = "macos")]
