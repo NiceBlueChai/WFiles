@@ -1129,6 +1129,9 @@ mod tests {
         assert_eq!(selection.single(), None);
     }
 
+    // 链接相关的测试都得挂 `#[cfg(unix)]`：`std::os::unix` 在 Windows 上
+    // 根本不存在，而漏了门在 macOS 上是全绿的——本地编译器看不见另一半。
+    #[cfg(unix)]
     #[test]
     fn symlink_to_directory_reports_as_directory() {
         let root = tempfile::tempdir().unwrap();
@@ -1144,6 +1147,7 @@ mod tests {
         assert!(listing.entry(&link).is_some_and(|entry| entry.is_dir));
     }
 
+    #[cfg(unix)]
     #[test]
     fn broken_symlink_stays_listed() {
         let root = tempfile::tempdir().unwrap();

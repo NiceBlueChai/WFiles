@@ -32,6 +32,12 @@ scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug
   `fatal: unable to mark recent objects`。清掉重跑就行
   （`find .git -name '._*' -delete && git gc --prune=now`），
   但它是写一次补一次，得边清边跑，别指望清一遍就完事。
+- **别从 macOS 交叉编译另外两个平台，试过了，走不通。** Windows 侧卡在
+  `ring` 的 C 代码要 MSVC 运行库头文件（`assert.h` 找不到），Linux 侧卡在
+  `wayland-backend` 的 build script 要编 C。`llvm-rc` 那道门倒是能绕
+  （gpui 的 `embed-resource` 只探测 `llvm-rc -V /?` 的 stdout 开头、
+  不检查产物，`RC_x86_64_pc_windows_msvc` 指个占位脚本就过去了），
+  但绕不过真正的 C 依赖。要真验另外两个平台就上 VM 或 CI。
 
 ## 仓库结构
 
@@ -158,6 +164,14 @@ scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug
 - **新加快捷键前先把已占用的键列出来**（`grep -oE '"(cmd|ctrl|...)-...' src/keymap.rs`）。
   `cmd-alt-i` 是分析面板、`cmd-alt-e` 是编辑远程文件——抢了键的那个功能会
   **永远按不出来**，而且没人会去查另一处绑在哪。
+- **测试代码也要过另外两个平台的编译。** `std::os::unix` / `std::os::windows`
+  这类路径必须紧跟同名 `#[cfg(unix)]` / `#[cfg(windows)]`——连 `#[test]`
+  也一起门掉，Windows 上 `cargo test` 会把测试模块整个编进去。
+  这一处漏过一次：`model.rs` 里两个用 `std::os::unix::fs::symlink` 的链接
+  测试没加门，macOS 上全绿——**本地编译器看不见的那一半才是会漏的那一半**。
+  手上没有另一个平台的编译器时，挡得住的只有静态审计：
+  `grep -rn 'std::os\.' src/`、`grep -rn '#\[cfg(target_os' src/` 逐条对
+  引用点前面的 `#[cfg`（`cfg(平台)` 门着的项，引用点也必须在门里）。
 
 ## 架构与范围纪律
 
