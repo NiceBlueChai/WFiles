@@ -6065,3 +6065,740 @@ fn clicking_a_favorite_folder_goes_there(cx: &mut TestAppContext) {
         "点收藏的目录该进去并看到里面的东西，实际 {names:?}"
     );
 }
+
+// ---- 键盘主流程：新建 / 重命名 / 删除 / 撤销 / 粘贴 / 批量改名 ----
+//
+// 这一批补的是**真实键盘路径上的落盘结果**。补之前的情况：
+//
+//   * `f2` 只在两条 i18n 测试里顺带走过，断言的是按钮/状态栏**文案**，
+//     没有一条断言"文件真的改了名"；
+//   * `cmd-backspace` 只验过确认框的英文，删完到底删没删、能不能撤销，
+//     没有任何断言；
+//   * **`cmd-z` 从来没有被按过**——而「可撤销」是这个项目写在侧栏上的
+//     第一条卖点。`ops.rs` 里那批 `undo_*` 单测覆盖的是纯逻辑层，
+//     "键 → handler → 确认框 → 落盘"这条接线断了它们照样全绿。
+//
+// 每条都同时断言**磁盘**与**界面**：列表刷新了但文件没改名（或反过来）
+// 是两条独立的链路，只验一条会漏掉另一条。
+
+/// 目录里此刻的文件名，排好序——用来断言"磁盘上真的变了"。
+fn names_on_disk(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("读目录")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// 等一个磁盘上的条件成立。
+///
+/// 回收站与搬运都在后台任务里跑，而 `settle()` 只重画界面、不推进任务。
+/// 每轮得先 `run_until_parked` 让后台结果回流，再画帧让订阅者消费——
+/// 跟 [`wait_for`] 是同一套道理，只是判据落在磁盘上而不是某个元素上。
+fn wait_for_disk(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    mut probe: impl FnMut() -> bool,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        let done = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                probe()
+            })
+            .expect("窗口还在");
+        if done || Instant::now() > deadline {
+            return done;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 等到**应用状态栏**（`status-message`）满足 `ready` 为止，返回最终那句话。
+///
+/// **等的是"这一步真的收尾了"，不是磁盘上的中间态。** 两者差着一段时间：
+/// 文件已经从原目录消失（磁盘探测已经成功），但 `ops_entity::finish_job`
+/// 还没跑，撤销栈还是空的。这时候按 `cmd-z` 会得到「没有可撤销的操作」，
+/// 于是「该弹确认框」那步就成了薛定谔的。状态栏是 `finish_job` 写的，
+/// 等它才是等对了。
+///
+/// 注意别和 [`wait_for_status`] 混了：那个读的是**搜索面板**的
+/// `search-status`，还顺带推虚拟时钟（搜索有 180 ms 防抖）。这里的删除
+/// 任务跑在真正的 OS 线程上，推时钟没用，得给它真实时间。
+fn wait_for_app_status(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    ready: impl Fn(&str) -> bool,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        let text = cx
+            .update_window(handle.into(), |_, window, cx| {
+                settle(window, cx);
+                a11y_label_at(window, "status-message")
+            })
+            .expect("窗口还在");
+        if ready(&text) || Instant::now() > deadline {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `cmd-shift-n` 新建文件夹：走完输入框，目录里真的多一个。
+///
+/// 顺带守住"预填名不冲突"：`ops::fresh_folder_path` 预填
+/// 「未命名文件夹」，所以真实用户按一下回车就能建出来。
+#[gpui_kit::test]
+fn cmd_shift_n_creates_a_folder_on_disk(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-shift-n", cx);
+    });
+
+    let asked = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.try_find("prompt-ok").is_some()
+    });
+    assert!(asked, "Cmd+Shift+N 该弹出新建文件夹的输入框");
+
+    // 预填名已经是不冲突的，直接确认——这就是"按一下回车"那条路。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("prompt-ok", cx);
+    });
+
+    let on_disk = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        names_on_disk(&dir)
+    });
+    assert_eq!(
+        on_disk,
+        vec!["未命名文件夹"],
+        "确认之后磁盘上该多出一个文件夹"
+    );
+
+    let listed = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        row_names(window)
+    });
+    assert_eq!(listed, vec!["未命名文件夹"], "新建的文件夹该出现在列表里");
+}
+
+/// `f2` 改名：输入新名字、回车，磁盘上真的换了名。
+///
+/// 输入框预填的是原名、光标落在开头，所以先 `cmd-a` 全选再打字
+/// ——跟真实用户"F2 之后直接敲新名字"是同一个效果。
+#[gpui_kit::test]
+fn f2_renames_the_selected_file_on_disk(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::write(dir.join("old.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("f2", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("renamed.txt", cx);
+        window.press("enter", cx);
+        settle(window, cx);
+    });
+
+    let on_disk = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        names_on_disk(&dir)
+    });
+    assert_eq!(
+        on_disk,
+        vec!["renamed.txt"],
+        "F2 改名该真的落到磁盘上，旧名不该还在"
+    );
+
+    let listed = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        row_names(window)
+    });
+    assert_eq!(listed, vec!["renamed.txt"], "列表该跟着显示新名字");
+}
+
+/// 按 Esc 关掉改名框：名字一个字都不该变。
+///
+/// 边界场景——"打开对话框"与"关掉对话框"是两条路，只验前者的话
+/// 关闭路径断了（比如 Esc 没接上 dismiss）不会有测试变红。
+#[gpui_kit::test]
+fn escape_leaves_the_name_untouched(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::write(dir.join("keep.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("f2", cx);
+    });
+    // 先把对话框改得面目全非，再按 Esc —— 这样"没生效"才有说服力。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("should-not-stick.txt", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("escape", cx);
+    });
+
+    let (closed, on_disk) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (window.try_find("prompt-ok").is_none(), names_on_disk(&dir))
+    });
+    assert!(closed, "Esc 该把改名框关掉");
+    assert_eq!(on_disk, vec!["keep.txt"], "取消之后磁盘上不该有任何变化");
+}
+
+/// 改名撞上已有的名字：对话框留着，磁盘一个字不动。
+///
+/// 异常场景。判据是"被拒"而不是"报了什么错"——错误那句挂在
+/// `render_prompt` 里一个没有 element id 的 div 上，读不到 a11y 文案，
+/// 所以退回两个**能观测**的事实：框还开着、旧文件还在。
+#[gpui_kit::test]
+fn renaming_onto_a_taken_name_changes_nothing(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::write(dir.join("a.txt"), "a").expect("造文件");
+    std::fs::write(dir.join("b.txt"), "b").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir);
+
+    // 升序第一行是 a.txt，把它改成已经存在的 b.txt。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("f2", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("b.txt", cx);
+        window.press("enter", cx);
+        settle(window, cx);
+    });
+
+    let (still_asking, on_disk) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (window.try_find("prompt-ok").is_some(), names_on_disk(&dir))
+    });
+    assert!(
+        still_asking,
+        "名字被占了该把对话框留着让人改，而不是静默关掉"
+    );
+    assert_eq!(on_disk, vec!["a.txt", "b.txt"], "被拒时不该动磁盘上的东西");
+}
+
+/// 删除到回收站，再用 `cmd-z` 把它拿回来。
+///
+/// **这是这个项目第一卖点的端到端验证**：`cmd-backspace` → 确认 →
+/// 文件进回收站 → `cmd-z` → 确认 → 文件回到原处。
+/// 纯逻辑层的 `undo_move_puts_everything_back` 验的是 `ops::` 里的恢复
+/// 算法，验不到"用户按 Cmd+Z 到底走不走到它"。
+///
+/// **这条曾经必挂，原因是两处，都查清了**（别再写成"缺权限"糊过去）：
+/// 1. 删除本身没坏——`trash` crate 走 AppleScript 驱动 Finder，文件确实
+///    进了回收站。一度以为是"没给终端自动化 Finder 权限（`-10004`）"，
+///    实测不是那个拦路虎。
+/// 2. 真正坏的是**撤销**：那时用 `fs::read_dir` 枚举 `~/.Trash` 找同名项，
+///    而 macOS 的 TCC **不给普通进程读回收站的目录项**
+///    （`Operation not permitted`，shell / launchd 用户代理 / `.app`
+///    三种上下文实测一致）。现在改成按候选名逐个 `stat`
+///    （见 `ops::restore_from_trash_dir`）——被拒的只有"枚举"这一步，
+///    按已知路径 `stat` / `rename` 是放行的，所以**不需要「完全磁盘访问
+///    权限」也能放回**。
+///
+/// 计时上也不能偷懒：**别等磁盘上的中间态**。文件从原目录消失时
+/// `ops_entity::finish_job` 还没跑，撤销栈还是空的，那时候按 `cmd-z`
+/// 会得到「没有可撤销的操作」。要等状态栏——它是 `finish_job` 写的。
+///
+/// 往别的机器 / CI 上搬之前先确认 `trash::delete` 这条路可用
+/// （探针：建个临时文件调一次，看返回值）。
+#[gpui_kit::test]
+fn cmd_backspace_trashes_the_selection_and_undo_puts_it_back(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::write(dir.join("doomed.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir);
+    // 删除跑在后台，回调线程要能唤醒任务。
+    cx.background_executor.allow_parking();
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-backspace", cx);
+    });
+
+    // 破坏性操作：先问一句，不能默默就删。
+    let asked = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        a11y_label_at(window, "confirm-message")
+    });
+    assert!(
+        asked.contains("回收站"),
+        "移到回收站前该先确认，实际确认框写的是 {asked:?}"
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("confirm-ok", cx);
+    });
+
+    // 等 `finish_job`：它写状态栏，也在这时把撤销记录压栈。
+    let status = wait_for_app_status(cx, handle, |text| {
+        text.contains("已移到回收站") || text.contains("没有项目能移进回收站")
+    });
+    assert!(
+        !status.contains("没有项目能移进回收站"),
+        "确认之后文件该进回收站，状态栏却写着 {status:?}。\n\
+         先怀疑这台机器上 `trash::delete` 的 Finder 路径不通：\n\
+         建个临时文件直接调一次，看返回的 Err。"
+    );
+    assert!(
+        !dir.join("doomed.txt").exists(),
+        "状态栏说进了回收站，原目录里却还在：{status:?}"
+    );
+
+    // ---- 撤销 ----
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-z", cx);
+    });
+    let (undo_asks, message) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            window.try_find("confirm-ok").is_some(),
+            a11y_label_at(window, "confirm-message"),
+        )
+    });
+    assert!(
+        undo_asks,
+        "撤销前也该确认一句。没弹说明撤销栈是空的——那就是「等磁盘中间态」\n\
+         又冒出来了，得等 `finish_job` 写的状态栏。实际消息 {message:?}"
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("confirm-ok", cx);
+    });
+
+    let undone = wait_for_app_status(cx, handle, |text| {
+        text.contains("已撤销") || text.contains("撤销失败")
+    });
+    assert!(
+        !undone.contains("撤销失败"),
+        "撤销该成功，状态栏却写着 {undone:?}"
+    );
+    assert!(
+        dir.join("doomed.txt").exists(),
+        "撤销该把文件放回原处——「之后还可以撤销」是确认框自己给出的承诺"
+    );
+}
+
+/// 没东西可撤销时按 `cmd-z`：说清楚，而不是弹一个空确认框。
+#[gpui_kit::test]
+fn undo_with_nothing_to_undo_says_so(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-z", cx);
+    });
+
+    let (said, asked) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            a11y_label_at(window, "status-message"),
+            window.try_find("confirm-ok").is_some(),
+        )
+    });
+    assert!(
+        said.contains("没有可撤销"),
+        "空栈时该告诉用户没得撤，实际状态栏写的是 {said:?}"
+    );
+    assert!(!asked, "没东西可撤销时不该弹确认框");
+}
+
+/// 复制到另一栏粘贴：文件真的落进目标目录。
+///
+/// 这条走的是 `cmd-c` / `cmd-v` 而不是 F5——`f5_copies_...` 已经覆盖了
+/// F5，但"复制 + 切栏 + 粘贴"是另一条键路，中间多了一次焦点切换，
+/// 而焦点没切过去的话粘贴会落在原目录（静默地复制成"X 2"）。
+#[gpui_kit::test]
+fn copying_in_one_pane_and_pasting_in_the_other_lands_the_file(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let left = root.path().join("left");
+    let right = root.path().join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    std::fs::write(left.join("report.txt"), "hi").unwrap();
+
+    cx.background_executor.allow_parking();
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![left.clone(), right.clone()],
+            active: 0,
+            split: Some(1),
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    // 焦点栏选中左栏那一项，复制。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(slot_label(window, 0), "焦点栏");
+        window
+            .within(("pane-slot", 0usize))
+            .click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-c", cx);
+    });
+
+    // 焦点挪到另一栏——这一步漏了的话，粘贴会落在左栏自己身上。
+    step(cx, handle, |window, cx| {
+        window.press("tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(slot_label(window, 1), "焦点栏", "焦点该挪到右栏了");
+        window.press("cmd-v", cx);
+    });
+
+    let landed = wait_for_disk(cx, handle, || right.join("report.txt").exists());
+    assert!(landed, "粘贴之后目标目录该多出这个文件");
+    assert!(
+        left.join("report.txt").exists(),
+        "复制（不是剪切）不该动源文件"
+    );
+    // 界面也该跟着刷新出这一行。
+    let landed_in_ui = wait_for_row(cx, handle, 1, "report.txt");
+    assert!(landed_in_ui, "右栏列表该刷新出粘进来的文件");
+}
+
+/// 批量重命名：改一次模板，选中的每个文件都跟着改。
+///
+/// 此前 `cmd-shift-r` 只在三条**布局**测试里出现，都是量对话框宽度
+/// （`every_dialog_stays_inside_a_narrow_window` 一类），预览算得对不对、
+/// 点"执行"有没有落盘，没有任何断言。
+#[gpui_kit::test]
+fn batch_renaming_renames_the_whole_selection(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    for name in ["a.txt", "b.txt"] {
+        std::fs::write(dir.join(name), "x").expect("造文件");
+    }
+    let (_session, handle) = open_in(cx, &dir);
+    cx.background_executor.allow_parking();
+
+    // 全选 → 打开批量重命名。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-shift-r", cx);
+    });
+
+    // 模板默认是 `{name}{ext}`（什么都不改），换成加个后缀。
+    // 打开时焦点就在模板框上（`create_bulk_inputs` 末尾那次 focus），
+    // 先全选再打字。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("{name}-2026{ext}", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("bulk-ok", cx);
+    });
+
+    let expected = vec!["a-2026.txt".to_string(), "b-2026.txt".to_string()];
+    let done = wait_for_disk(cx, handle, || names_on_disk(&dir) == expected);
+    assert!(
+        done,
+        "两个文件都该按模板改名，实际磁盘上是 {:?}",
+        names_on_disk(&dir)
+    );
+}
+
+// ---- 粘贴冲突 ----
+//
+// 「冲突四策略」是这个项目的横切主题，而 UI 层此前**一条都没有**：
+// 纯逻辑层的 `resolve_conflict` 有单测，"对话框弹没弹出来、按下去走的
+// 是不是那个策略"没人守——把 `render_conflict` 从浮层列表里摘掉，
+// 粘贴会直接覆盖目标，而所有测试照样绿。
+
+/// 两栏各有一份同名文件（`left/a.txt` 与 `right/a.txt` 内容不同）。
+fn two_panes_with_a_clash() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let left = root.path().join("left");
+    let right = root.path().join("right");
+    std::fs::create_dir(&left).expect("建目录");
+    std::fs::create_dir(&right).expect("建目录");
+    // 内容故意不同：这样"覆盖了 / 没覆盖"一眼分得开。
+    std::fs::write(left.join("a.txt"), "from-left").expect("造文件");
+    std::fs::write(right.join("a.txt"), "from-right").expect("造文件");
+    (root, left, right)
+}
+
+/// 开成双栏（焦点在左），把左栏那一项复制、挪到右栏粘贴。
+fn copy_from_left_into_right(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>) {
+    cx.background_executor.allow_parking();
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window
+            .within(("pane-slot", 0usize))
+            .click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-c", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(slot_label(window, 1), "焦点栏", "焦点该挪到右栏了");
+        window.press("cmd-v", cx);
+    });
+}
+
+/// 撞上同名文件：先把选择权交回给用户，三条路都摆出来。
+#[gpui_kit::test]
+fn pasting_over_an_existing_name_asks_first(cx: &mut TestAppContext) {
+    let (_root, left, right) = two_panes_with_a_clash();
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![left.clone(), right.clone()],
+            active: 0,
+            split: Some(1),
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    copy_from_left_into_right(cx, handle);
+
+    let asked = wait_for(cx, handle, "conflict-skip");
+    assert!(asked, "目标里有同名文件时该先问，而不是默默覆盖或默默跳过");
+
+    let (has_replace, has_keep_both) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            window.try_find("conflict-replace").is_some(),
+            window.try_find("conflict-keep-both").is_some(),
+        )
+    });
+    assert!(has_replace, "该有「替换」这一条路");
+    assert!(has_keep_both, "该有「保留两者」这一条路");
+}
+
+/// 选「跳过」：目标一个字节都不动。
+#[gpui_kit::test]
+fn choosing_skip_leaves_the_target_untouched(cx: &mut TestAppContext) {
+    let (_root, left, right) = two_panes_with_a_clash();
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![left.clone(), right.clone()],
+            active: 0,
+            split: Some(1),
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    copy_from_left_into_right(cx, handle);
+    assert!(wait_for(cx, handle, "conflict-skip"), "该先问怎么处理");
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("conflict-skip", cx);
+    });
+    wait_until_gone(cx, handle, "overlay-card");
+
+    let content = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        std::fs::read_to_string(right.join("a.txt")).unwrap_or_default()
+    });
+    assert_eq!(
+        content, "from-right",
+        "跳过就该什么都不动，实际目标文件是 {content:?}"
+    );
+}
+
+/// 选「替换」：目标被覆盖成源的那份。
+#[gpui_kit::test]
+fn choosing_replace_overwrites_the_target(cx: &mut TestAppContext) {
+    let (_root, left, right) = two_panes_with_a_clash();
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![left.clone(), right.clone()],
+            active: 0,
+            split: Some(1),
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    copy_from_left_into_right(cx, handle);
+    assert!(wait_for(cx, handle, "conflict-replace"), "该先问怎么处理");
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("conflict-replace", cx);
+    });
+
+    let replaced = wait_for_disk(cx, handle, || {
+        std::fs::read_to_string(right.join("a.txt"))
+            .map(|text| text == "from-left")
+            .unwrap_or(false)
+    });
+    assert!(
+        replaced,
+        "替换之后目标该是源那份，实际 {:?}",
+        std::fs::read_to_string(right.join("a.txt"))
+    );
+    assert!(
+        left.join("a.txt").exists(),
+        "替换不该动源文件（这是粘贴不是移动）"
+    );
+}
+
+/// 选「保留两者」：多出一个带序号的兄弟，原来的那份不动。
+#[gpui_kit::test]
+fn choosing_keep_both_adds_a_numbered_sibling(cx: &mut TestAppContext) {
+    let (_root, left, right) = two_panes_with_a_clash();
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![left.clone(), right.clone()],
+            active: 0,
+            split: Some(1),
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    copy_from_left_into_right(cx, handle);
+    assert!(wait_for(cx, handle, "conflict-keep-both"), "该先问怎么处理");
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("conflict-keep-both", cx);
+    });
+
+    let both = wait_for_disk(cx, handle, || names_on_disk(&right).len() == 2);
+    assert!(
+        both,
+        "保留两者之后该有两份，实际 {:?}",
+        names_on_disk(&right)
+    );
+    // 原来那份的内容不该被动过。
+    assert_eq!(
+        std::fs::read_to_string(right.join("a.txt")).unwrap_or_default(),
+        "from-right",
+        "保留两者不该动原来的那份"
+    );
+}
+
+/// 破坏性操作必须**先确认**：确认框弹出来的那一刻，磁盘上一个字都还没动。
+///
+/// 这一条刻意不碰"真删成功"——[`cmd_backspace_trashes_the_selection_and_undo_puts_it_back`]
+/// 那条要走系统回收站，而 macOS 上的 `trash` crate 是靠 AppleScript 驱动
+/// **Finder** 干的（实测错误：`“Finder”遇到一个错误：发生权限违例 (-10004)`）。
+/// 没给终端授予"自动化 Finder / 辅助功能"的机器上它必然失败，
+/// 那是环境前提不是产品缺陷，所以能在这台机器上验证的那一半单独放这里。
+#[gpui_kit::test]
+fn trashing_asks_before_touching_the_disk(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::write(dir.join("doomed.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-backspace", cx);
+    });
+
+    // 确认框出来了，但文件还好好地在。
+    let (asked, on_disk) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (window.try_find("confirm-ok").is_some(), names_on_disk(&dir))
+    });
+    assert!(asked, "移到回收站前该先弹确认框");
+    assert_eq!(on_disk, vec!["doomed.txt"], "确认之前不该动磁盘");
+
+    // 取消：也是什么都不动。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("confirm-cancel", cx);
+    });
+    let (closed, after) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (window.try_find("confirm-ok").is_none(), names_on_disk(&dir))
+    });
+    assert!(closed, "点取消该把确认框关掉");
+    assert_eq!(after, vec!["doomed.txt"], "取消之后文件该还在");
+}
