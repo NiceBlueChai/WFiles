@@ -202,21 +202,55 @@ fn sorting_by_size_stays_linear() {
 /// 重排出来的结果跟原来一模一样——10 万项实测 19 ms/次，
 /// 一帧的预算是 16.7 ms，光这一下就把它吃光了。
 ///
-/// 判据是**清空比打一字快多少倍**，不是绝对值，也不是"n 翻几倍涨几倍"：
+/// # 判据为什么数 `resort` 的次数，而不是拿耗时比
 ///
-/// - debug 下过滤一趟 8 ms、CI 上可能 20 ms，两边都"不算慢"，
-///   所以绝对值钉不住。
-/// - 拿两个规模算倍数也不可靠：小规模那趟只有几毫秒，计时噪声就能
-///   把它推到 2 倍或 6 倍（实测两轮给出过两个数）。
-/// - 但**同一个 listing 上，清空 vs 打一字**这个比值是稳的：
-///   清空只是一次拷贝，打一字要一趟字符串扫描，重排则在两边都加上排序。
-///   实测不重排约 10 倍、重排约 1.7 倍。
+/// 老判据比的是「打一个字母 / 清空过滤」的耗时，前提是"清空只是一次
+/// 拷贝"。但 [`Listing::refilter`] 无条件扫一遍 `sorted` 再全量 collect，
+/// **清空同样要走完整一趟**，两次共享掉大部分成本。实测 release
+/// 1.66 ms / 0.63 ms = 2.6 倍、debug 11 ms / 4.0 ms = 2.75 倍，而老判据
+/// 要 3 倍——这个比值取决于"扫描"与"收集"在这台机器上的相对成本，
+/// 换台机器就变。后果是它在这台机器上长期红着，而过滤并没有退化。
 ///
-/// 反复交替着量，因为 `set_query` 有"条件没变就直接返回"的短路：
-/// 只量一次的话，第二轮量到的是那条短路。
+/// 中间试过换成「换排序键（必然重排）vs 打一字」的耗时比，一样钉不住：
+/// 夹具生成的名字与大小都是单调递增的，`sort_by` 走了"近似有序"的快
+/// 路径（实测按 Name 重排只要 16 ms，跟过滤的 10 ms 一个量级），
+/// 比值 1.6；换成数值键的 Size 也只有 1.9。**耗时间接推断这条路本身不稳。**
+///
+/// 所以改成直接数：`resort()` 里有一个只在 test 构建里存在的计数器
+/// （`Listing::resort_calls`），"过滤有没有排序"变成一个确定的数。
+/// 判据里还必须有一条"换排序键确实 +1"，否则把那句自增摘掉的话
+/// "没重排"和"验不到重排"长得一模一样。
 #[test]
 fn filtering_does_not_resort_the_whole_listing() {
     let mut listing = a_listing(BIG);
+
+    // ---- 性质：过滤不该重排 ----
+    let before = listing.resort_calls;
+    for query in ["file0001", ""] {
+        listing.set_query(query);
+        assert_eq!(
+            listing.resort_calls, before,
+            "设查询条件「{query}」不该重排——排序键一个字符都没变"
+        );
+    }
+
+    // **计数器本身得是活的**：把 `resort` 里那句自增摘掉，上面两条永远
+    // 绿而这条会红。没有这一条，"没重排"跟"验不到重排"长得一模一样。
+    // 键要跟默认（Name 升序）不同，否则 `set_sort` 直接短路返回。
+    listing.set_sort(Sort {
+        key: SortKey::Name,
+        descending: true,
+    });
+    assert_eq!(
+        listing.resort_calls,
+        before + 1,
+        "换排序键该重排一次（计数器没在动的话上面两条断言是假的）"
+    );
+
+    // ---- 上限：清空过滤得够快 ----
+    //
+    // 反复交替着量，因为 `set_query` 有"条件没变就直接返回"的短路：
+    // 只量一次的话，第二轮量到的是那条短路。
     let mut filtering = Duration::MAX;
     let mut clearing = Duration::MAX;
     for _ in 0..3 {
@@ -228,23 +262,19 @@ fn filtering_does_not_resort_the_whole_listing() {
         listing.set_query("");
         clearing = clearing.min(start.elapsed());
     }
-    println!("打一个字母 {filtering:?} vs 清空 {clearing:?}");
+    println!("打一字 {filtering:?} / 清空 {clearing:?}");
 
-    let ratio = filtering.as_secs_f64() / clearing.as_secs_f64();
-    assert!(
-        ratio > 3.0,
-        "清空过滤只比重打快 {ratio:.1} 倍——重排的实现里两次都在排序，\
-         清空并没有省下什么（不重排约 10 倍）"
-    );
-    // 上限按 release 实测定：清空过滤 release 实测 0.20 ms，
-    // 打一个字母 2.9 ms。清空是"刚敲完退格"的即时反馈，
-    // 给 30 倍余量（≈ 6 ms）已经很宽了。
-    // release 实测 159 µs（打一个字母是 4.0 ms）。清空是"刚敲完退格"的
-    // 即时反馈，给 1 ms：余量 6 倍，离一帧还差 16 倍。
-    let limit = budget(1);
+    // 上限只是"挡住数量级退化"那一档，不追求钉住毫秒数——
+    // 文件开头就写了：钉绝对值的结果是每隔几周红一次，然后大家学会
+    // 忽略它。实测这台机器上 release 清空 10 万项在 0.6 ~ 1.34 ms 之间
+    // 来回跳（同一份代码、连着两次跑），所以 1 ms 那道门槛正好卡在噪声
+    // 上，会偶发失败。给 4 ms：离一帧 16.7 ms 还差 4 倍，仍然只放过
+    // "慢了一个数量级"那种退化。真正的防线是上面那条性质断言和
+    // `filtering_a_hundred_thousand_entries_stays_linear` 的规模比。
+    let limit = budget(4);
     assert!(
         clearing < limit,
-        "清空过滤花了 {clearing:?}，上限 {limit:?}（release 实测 159 µs）"
+        "清空过滤花了 {clearing:?}，上限 {limit:?}（release 实测 0.6 ~ 1.3 ms）"
     );
 }
 

@@ -276,6 +276,12 @@ pub struct Listing {
     sort: Sort,
     /// 要不要显示隐藏项（见 [`FileEntry::hidden`]）。
     show_hidden: bool,
+    /// [`Self::resort`] 被调了几次。**只在 test 构建里存在**：
+    /// "过滤不该重排"这条基准要靠它把"有没有排序"变成一个能直接断言的
+    /// 数，而不是拿耗时去间接推断——耗时比值取决于"扫描"与"收集"在这台
+    /// 机器上的相对成本，换台机器就变，钉不住。
+    #[cfg(test)]
+    pub(crate) resort_calls: u32,
 }
 
 impl Listing {
@@ -343,6 +349,8 @@ impl Listing {
             query: String::new(),
             sort: Sort::default(),
             show_hidden,
+            #[cfg(test)]
+            resort_calls: 0,
         };
         listing.resort();
         listing
@@ -360,11 +368,17 @@ impl Listing {
             query: String::new(),
             sort: Sort::default(),
             show_hidden: false,
+            #[cfg(test)]
+            resort_calls: 0,
         }
     }
 
     /// 按当前排序键把全部条目排一遍（过滤条件不变，顺序变了就整体重排）。
     fn resort(&mut self) {
+        #[cfg(test)]
+        {
+            self.resort_calls += 1;
+        }
         let entries = &self.entries;
         let sort = self.sort;
         let mut order: Vec<usize> = (0..entries.len()).collect();
