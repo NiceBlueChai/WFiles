@@ -14,11 +14,19 @@ cargo run            # 运行（当前仅验证 macOS）
 cargo test           # 测试（dev-deps: tempfile）
 cargo clippy --all-targets
 cargo fmt --check
+scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug 可选）
 ```
 
 - Rust edition **2024**，工具链用 stable，无 nightly 特性。
 - `target/` 已 gitignore，禁止提交。
 - 三平台同等优先：**任何代码不允许假设只在 macOS 跑**。`#[cfg(target_os = ...)]` 每个平台分支都要能编译。
+- macOS 上**别指望 `cargo run` 出来的窗口能正常用**：裸二进制被系统当成
+  "后台 App"（窗口顶不到最前，还会弹「正在后台运行」）。要看真实观感、
+  要试权限相关的路径（自动化 Finder、完全磁盘访问），就跑
+  `scripts/bundle-macos.sh` 再用 `open` 打开那个 `.app`。
+- 这个项目可能放在外置卷（如 Ventoy）上：**macOS 会在那里给每个文件
+  生成 `._xxx` 资源叉伴生文件**，`.gitignore` 已忽略、代码里按名前缀跳过。
+  打 `.app` 时那种文件会让 `codesign` 拒签，脚本里已经先清一遍。
 
 ## 仓库结构
 
@@ -84,6 +92,8 @@ cargo fmt --check
 8. **中止信号不许用 `io::ErrorKind::Interrupted`。** 那个种类的含义是"被信号打断，重试一次就好"，`write_all` / `read_exact` / `io::copy` 都会把它当成该重试的错误——用户按了中止会变成无限重试，一直写到磁盘满。用 `ops::aborted()`（`ErrorKind::Other`），判别走 `ops::is_aborted()`。
 9. **凡是"后台线程 + 共享暂存/缓存目录"的组合，写之前先占住。** 文件先建出来、账本后补上，中间那段空窗里并发的清扫会把正在写的数据当垃圾删掉。参照 `resume::Journal::hold()` 的守卫写法（`Drop` 自动放开，不靠手动配对）。
 10. **测试里改进程级状态（override / 全局根目录 / 环境变量）必须拿锁串行化。** 两个测试各改一份、并行跑就会互相顶掉，症状是"单跑必过、全量并行挂"。统一用 `test_guard()`（`volumes::test_guard()` / `offline::test_guard()`），守卫对象在 `Drop` 里恢复现场。**测试等待后台任务时只等"进行中"的状态，绝不要把"终态"（如 `failed`）也算进去**——那会永远等下去。
+11. **`~/.Trash` 只能按已知路径读，不能枚举。** macOS 的 TCC 不给普通进程 `read_dir` 回收站（`Operation not permitted`，shell / launchd 用户代理 / `.app` 三种上下文实测一致），但**按已知路径 `stat` / `rename` 是放行的**。所以「从回收站放回」只能靠拼候选名（见 `ops::trash_candidate_names`），别写 `fs::read_dir`——那条路在真机上必挂，而单测里用临时目录跑却是绿的（临时目录不受 TCC 管），典型的"测试过、用户挂"。
+12. **Finder 给回收站里的重名项加的是时间戳后缀，不是编号。** 同一个名字删第二次，它叫 `主干 时.分.秒.扩展名`（例如 `报告 23.17.03.txt`），那个时刻是**移进回收站那一刻**的墙上时钟（实测：把 mtime 改成 2020 年、创建与删除相隔 20 秒，后缀都还是删除当时）。别照直觉写成 `主干 2.扩展名`——那个命名法在真机上采样到 0 次。要拿它做判断，先记着测试纪律里那句**探针比推理可靠**——`osascript -e 'tell application "Finder" to get name of every item of trash'` 能列出真东西（但一次 0.6 秒起，别放进界面线程）。
 
 ## 测试纪律
 
