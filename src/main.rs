@@ -14,6 +14,7 @@ mod drag;
 mod format;
 mod ftp;
 mod i18n;
+mod instance;
 mod keymap;
 mod logfile;
 mod marks;
@@ -89,8 +90,22 @@ fn main() {
     // 不该因为配置文件里存着别的语言就跑偏。
     let cli = cli::parse(std::env::args_os().skip(1));
     i18n::set_cli_locale(cli.locale);
+
+    // 位子只有一个：抢到的那一份当主实例，负责听后面来的启动。
+    // 抢不到说明已经开着一份（锁是进程活着期间一直拿着的，崩溃也会放）。
+    let mut claim = instance::claim();
+    // 已经开着一份，而这一次启动又有话要说（要开哪儿）——交给它去办，
+    // 说完自己退，用户得到的是"那扇窗跳过去"而不是第二扇一模一样的窗。
+    // 送不到（对面正开着还没挂门牌、正在退、版本对不上）就走下面的老路：
+    // 自己开窗。**不能**把用户敲的那条路径默默吞掉。
+    if claim.is_none() && instance::hand_off(&cli) {
+        return;
+    }
+
     let application = gpui_kit::application().with_assets(WFilesAssets);
-    application.run(|cx| {
+    // `move`：这一段要活到应用退出，里面用到的 `cli`、`claim` 都得跟着走
+    // （`gpui_kit::application().run` 收的是 `'static` 闭包）。
+    application.run(move |cx| {
         gpui_kit::init(cx);
         app::init(cx);
         pane::init(cx);
@@ -121,7 +136,13 @@ fn main() {
             window.set_window_title("WFiles");
             // 命令行说开到哪儿，就落在**这一次**开出来的那一栏上；
             // 没给就照上次的会话恢复（那是 `WFilesApp::new` 的默认走法）。
-            cx.new(|cx| WFilesApp::new(window, cx, cli.launch))
+            let app = cx.new(|cx| WFilesApp::new(window, cx, cli.launch));
+            // 主实例：门牌现在就挂出去，后面来的启动都找得到这扇窗。
+            // 挂门牌失败（端口绑不上、状态目录写不了）就不做转发，窗口照开。
+            if let Some(claim) = claim.take() {
+                app.update(cx, |app, cx| app.serve_forwarding(claim, window, cx));
+            }
+            app
         })
         .expect("无法打开 WFiles 窗口");
     });

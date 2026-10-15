@@ -3981,6 +3981,113 @@ fn a_new_tab_target_joins_the_rest_instead_of_replacing_it(cx: &mut TestAppConte
     );
 }
 
+/// 第二次启动把那句话交给已经开着的窗口——真的走一趟回环 socket。
+///
+/// 这条是单实例转发的全链路：主实例抢位子、挂门牌、听；"第二份"读门牌、
+/// 连上去、说一句话、等一声"收到了"；界面那一头把请求落下去。
+/// 中间任何一段（解析、队列、跨线程唤醒）坏了，这里都会挂。
+#[gpui_kit::test]
+fn a_second_launch_lands_in_the_window_that_is_already_open(cx: &mut TestAppContext) {
+    let running = tempfile::tempdir().unwrap();
+    let asked = tempfile::tempdir().unwrap();
+    std::fs::write(running.path().join("a.txt"), "a").unwrap();
+    std::fs::write(asked.path().join("目标.txt"), "hi").unwrap();
+    let isolation = isolate_session();
+    write_session(isolation.path(), running.path());
+
+    let (handle, app) = open_app_of_width(cx, 1180.);
+    // 这一份就是主实例：位子抢到手，门牌挂出去。
+    let claim = crate::instance::claim().expect("隔离目录里该抢得到位子");
+    step(cx, handle, |window, cx| {
+        app.update(cx, |app, cx| app.serve_forwarding(claim, window, cx));
+    });
+
+    // 第二次启动：说的话交给那一份。这里不等界面——回话是在"排进队列"
+    // 之后才发的，所以下面等的才是界面那一头。
+    let asked_path = asked.path().join("目标.txt");
+    let handed = crate::instance::hand_off(&crate::cli::Cli {
+        locale: None,
+        launch: Some(crate::cli::Launch {
+            target: crate::cli::Target::Reveal(asked_path.clone()),
+            new_tab: false,
+        }),
+    });
+    assert!(handed, "已经开着的那一份该应答");
+
+    assert!(
+        wait_until(cx, |cx| {
+            cx.update(|cx| app.read(cx).tab_paths(cx))
+                .iter()
+                .any(|dir| same_dir(dir, asked.path()))
+        }),
+        "转过来的目标该落在当前那一栏上"
+    );
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["目标.txt"],
+        "说要定位的那一个也该选中"
+    );
+}
+
+/// 转发过来的 `--new-tab`：另开一栏，不是把当前那一栏挪走。
+#[gpui_kit::test]
+fn a_forwarded_new_tab_joins_the_rest(cx: &mut TestAppContext) {
+    let running = tempfile::tempdir().unwrap();
+    let asked = tempfile::tempdir().unwrap();
+    std::fs::write(asked.path().join("b.txt"), "b").unwrap();
+    let isolation = isolate_session();
+    write_session(isolation.path(), running.path());
+
+    let (handle, app) = open_app_of_width(cx, 1180.);
+    let claim = crate::instance::claim().expect("隔离目录里该抢得到位子");
+    step(cx, handle, |window, cx| {
+        app.update(cx, |app, cx| app.serve_forwarding(claim, window, cx));
+    });
+
+    let handed = crate::instance::hand_off(&crate::cli::Cli {
+        locale: None,
+        launch: Some(crate::cli::Launch {
+            target: crate::cli::Target::Open(asked.path().to_path_buf()),
+            new_tab: true,
+        }),
+    });
+    assert!(handed, "已经开着的那一份该应答");
+
+    assert!(
+        wait_until(cx, |cx| {
+            cx.update(|cx| app.read(cx).tab_paths(cx)).len() == 2
+        }),
+        "该多出一栏"
+    );
+    let paths = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert!(
+        paths.iter().any(|dir| same_dir(dir, running.path())),
+        "原来那一栏不该被顶掉：{paths:?}"
+    );
+    assert!(
+        paths.get(1).is_some_and(|dir| same_dir(dir, asked.path())),
+        "新开的那一栏该开在目标上，而且排在最后（焦点所在）：{paths:?}"
+    );
+}
+
+/// 等一件事在界面上成立。
+///
+/// 转发是在后台线程上排的队，界面这一头要走一趟跨线程唤醒——测试里
+/// 只能给它一点真实时间（同 `wait_for`，理由也一样）。
+fn wait_until(cx: &mut TestAppContext, mut ready: impl FnMut(&mut TestAppContext) -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        cx.run_until_parked();
+        if ready(cx) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// 两个路径是不是同一个目录（可以是不同的路径字符串）。
 fn same_dir(left: &Path, right: &Path) -> bool {
     if left == right {

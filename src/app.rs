@@ -25,6 +25,7 @@ use crate::compare_entity::{CompareEvent, ComparePanel};
 use crate::diff_entity::{DiffEvent, DiffPanel};
 use crate::drag::{self, DraggedPaths};
 use crate::format;
+use crate::instance;
 use crate::meta::{Field as MetaField, Metadata};
 use crate::ops::{ConflictPolicy, ControlState};
 use crate::ops_entity::{Ops, OpsEvent, PendingAction};
@@ -1747,6 +1748,79 @@ impl WFilesApp {
         self.compare = None;
         self.tabs[self.active].update(cx, |pane, cx| pane.reveal_path(path, window, cx));
         cx.notify();
+    }
+
+    /// 开始听转发：抢到主实例位子的那一份，窗口开着就一直听着。
+    ///
+    /// 界面线程不做网络：绑端口、收连接、读请求全在后台线程上，只有
+    /// "把请求落到界面上"这一小步经通道回来（同搬运那套）。
+    pub fn serve_forwarding(
+        &self,
+        claim: instance::Claim,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = claim.listen() else {
+            // 门牌挂不出去（端口绑不上、状态目录写不了）：这一次不做转发。
+            // 窗口照开——转发是顺手带的功能，不是开窗的前提。
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(launch) = requests.recv().await {
+                // 窗口关了就没得可办：这条任务到此为止，再收到也没人接。
+                if this
+                    .update_in(cx, |app, window, cx| {
+                        app.apply_forwarded(launch, window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 第二份启动把"要开到哪儿"说到这儿来了。
+    ///
+    /// 落法跟命令行启动时一样（规则在 `cli::Target::resolve` 里，那边有
+    /// 测试），只是这一次落在**已经开着**的窗口上：不碰恢复现场那一套，
+    /// 直接挪当前那一栏，或者另开一栏。
+    pub fn apply_forwarded(
+        &mut self,
+        launch: cli::Launch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let opening = launch.target.resolve(Self::on_disk(launch.target.path()));
+        // 记一句：主实例这一头收到了什么。跟 `instance::hand_off` 那行合起来
+        // 就能看出"送出去没有、收到了没有"。
+        crate::logfile::info(&format!(
+            "转发：收到第二次启动的目标「{}」{}",
+            launch.target.path().display(),
+            if launch.new_tab {
+                "（另开一栏）"
+            } else {
+                ""
+            }
+        ));
+        // 用户是在别的程序里（终端、脚本、别的窗口的"用 WFiles 打开"）
+        // 点的这一下：窗口该到前面来，不然他还得自己去找。系统文件管理器
+        // 对这个动作都是这个反应。
+        window.activate_window();
+        // 用户要去别处了，比较面板留着只会碍事——它说的还是刚才那两栏的事。
+        self.compare = None;
+        if launch.new_tab {
+            self.add_tab(opening.dir, window, cx);
+        } else {
+            self.navigate_active_tab(opening.dir, window, cx);
+        }
+        if let Some(path) = opening.select {
+            // 刚换目录，列表已经就位（本地目录是同步读的）；里面真要没有
+            // 这一项，`select_path` 自己就什么都不做。
+            let pane = self.tabs[self.active].clone();
+            pane.update(cx, |pane, cx| pane.select_path(&path, cx));
+        }
     }
 
     /// 同步浏览：焦点那一栏换了目录，另一栏跟着走。
