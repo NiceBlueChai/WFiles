@@ -40,11 +40,35 @@ const MAX_STAGING: u64 = 8 * 1024 * 1024 * 1024;
 /// 扫过去，会把这个文件当成没人要的垃圾删掉——半截数据没了，
 /// 账本却还记着"传到哪儿了"，下一次就接了个空。
 /// 并行跑测试时稳定复现，真机上并发搬运时同样中招。
+///
+/// **这张表只管得住自己这个进程。** 另开一份应用（用户双击两次、
+/// 脚本各调一次）里那趟搬运，它那边的 `Hold` 这边看不见——跨进程那
+/// 一半只能问文件系统自己：写文件的那一侧握着排他锁，这边拿不到就
+/// 放手。见 [`being_written`]。
 static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::OnceLock::new();
 
 fn in_flight() -> &'static std::sync::Mutex<HashSet<String>> {
     IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// 这个暂存文件是不是**别的进程**正在写。
+///
+/// 进程内那几趟由 [`IN_FLIGHT`] 挡住；另一个进程里的那趟看不见这张表，
+/// 只能问文件系统：真正在写的那些进程会一直握着排他锁（`ops.rs` 里
+/// 打开暂存文件之后那句 `try_lock`），这里试一下拿不到就是有人在写。
+///
+/// **为什么不按时间猜**（"刚建出来几分钟之内别删"）：一趟正常的搬运
+/// 从头到尾都没有账本（见 [`Journal::sweep`]），跑到几小时也有可能，
+/// 所以"没有账本"跟"刚建出来"之间根本没有必然关系，按时间猜必然猜错。
+/// 锁不一样：它跟着那个进程活着，进程没了锁自动就没了。
+fn being_written(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        // 打不开（权限、刚好被删掉）：当作没人写，让下面的删除自己去
+        // 失败——那条路上本来就接着 `.ok()`。
+        return false;
+    };
+    matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
 }
 
 /// 这一对的暂存正在被写：拿着它，清扫就不会来动这块数据。
@@ -80,6 +104,15 @@ pub struct Record {
     pub modified: Option<u64>,
     /// 已经传过去的字节数——下一个起点。
     pub done: u64,
+    /// 数据在**服务器那一端**（上传）。
+    ///
+    /// 普通账本的数据躺在本地暂存文件里，所以"有账本、本地却没数据"
+    /// 就等于"这份进度没用了"，清扫可以连账一起收走。上传不是这样：
+    /// 那一半在服务器上，本地没有暂存文件**本来就是对的**——
+    /// 照普通账本判，一次清扫就会把上传的断点抹掉，
+    /// 而客户端明明刚刚记下"传到 40% 了"（`ftp` / `sftp` 两边都支持接着传）。
+    #[serde(default)]
+    pub server_side: bool,
 }
 
 impl Record {
@@ -151,24 +184,23 @@ impl Journal {
 
     /// 清扫：把再也用不上的暂存清掉，并把总量压回预算内。
     ///
-    /// 三条规矩，按这个顺序：
-    /// 1. **正在写的暂存一律不碰**（见 [`Self::hold`）。这一段是
-    ///    "文件已经建出来、账本还没补上"的空窗，扫过去就会把别人
-    ///    正在写的半截数据当垃圾删掉。
+    /// 几条规矩，按这个顺序：
+    /// 1. **正在写的暂存一律不碰**。进程内那几趟靠 [`Self::hold`] 记着，
+    ///    别的进程里的那趟只能问文件系统（排他锁，见 [`being_written`]）。
+    ///    这一段是"文件已经建出来、账本还没补上"的空窗，扫过去就会把
+    ///    别人正在写的半截数据当垃圾删掉。
     /// 2. **没有账本的暂存一律删**。正常流程里暂存和账本同生共死，
     ///    只剩一个说明上一回写到一半进程就没了（断电、崩溃）。
     /// 3. **源已经不在的账本连锅端**。续传的前提是源还在；
     ///    源没了还留着一大截数据，纯属占地方。
-    /// 4. **超预算就丢最久没动的**。暂存是按"最近用过"排序的：
+    /// 4. **有账本、本地却没有数据**：账本也没意义——除非这一趟的
+    ///    数据本来就在服务器上（上传，见 [`Record::server_side`]）。
+    /// 5. **超预算就丢最久没动的**。暂存是按"最近用过"排序的：
     ///    用户刚中止的那一趟排在最后，所以它永远是最后被丢的那个。
     ///
     /// 返回删掉了多少字节。
     pub fn sweep(&self) -> u64 {
         let mut freed = 0u64;
-        let staging_dir = self.root.join("staging");
-        let Ok(entries) = fs::read_dir(&staging_dir) else {
-            return 0;
-        };
 
         // 先把账本过一遍：源不在的，连暂存一起删。
         let mut keep: Vec<(String, u64, Option<SystemTime>)> = Vec::new();
@@ -198,6 +230,11 @@ impl Journal {
                     freed += self.drop_one(&key);
                     continue;
                 }
+                // 上传的进度在服务器上，本地没有暂存文件是正常的：
+                // 它既不占本地空间，也不该被"本地没数据"这条判据清掉。
+                if record.server_side {
+                    continue;
+                }
                 let staging = Self::staging_of(&self.root, &key);
                 let (size, touched) = fs::metadata(&staging)
                     .map(|it| (it.len(), it.modified().ok()))
@@ -212,6 +249,13 @@ impl Journal {
         }
 
         // 再扫暂存目录：没有账本的，删。
+        //
+        // 目录本身可能压根不存在（一次本地搬运都没做过，或者被系统清过）：
+        // 那不是错——账本该清的那一趟上面已经走完了，这里没得扫而已。
+        let staging_dir = self.root.join("staging");
+        let Ok(entries) = fs::read_dir(&staging_dir) else {
+            return freed;
+        };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.ends_with(".tmp") {
@@ -221,9 +265,13 @@ impl Journal {
                 continue;
             }
             // 正在写的这一对，它特意不在 `keep` 里（账本可能还没落盘），
-            // 所以这里必须单独问一句——否则会被当成没人要的垃圾删掉，
+            // 所以这里必须单独问两句——否则会被当成没人要的垃圾删掉，
             // 而删的正是这一趟还没传完的那半截。
-            if self.held(&name) {
+            //
+            // 一句问进程内（`Hold`），一句问文件系统（别的实例正拿着锁，
+            // 见 `being_written`）。**一趟正常的搬运从头到尾都没有账本**
+            // （只有中断时才记），所以只按"有没有账本"判是不够的。
+            if self.held(&name) || being_written(&entry.path()) {
                 continue;
             }
             if !keep.iter().any(|(key, _, _)| *key == name) {
@@ -385,6 +433,7 @@ mod tests {
             size: 100,
             modified: Some(42),
             done,
+            server_side: false,
         }
     }
 
@@ -395,6 +444,7 @@ mod tests {
             size,
             modified,
             done,
+            server_side: false,
         }
     }
 
@@ -534,5 +584,72 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let journal = Journal::new(root.path().to_path_buf());
         assert_eq!(journal.sweep(), 0, "什么都没有不该报错");
+    }
+
+    #[test]
+    fn sweeping_keeps_a_staging_file_another_instance_is_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = Journal::new(root.path().to_path_buf());
+        let staging = journal.staging("busy");
+        fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        fs::write(&staging, b"another instance is here").unwrap();
+
+        // 另开的那一份应用正握着这个文件的排他锁（`ops.rs` 里写暂存的那
+        // 一侧就是这么锁的）。**它那边的 `Hold` 我们看不见**——这正是
+        // 要试的那条路：清扫只能问文件系统。
+        let other = fs::File::open(&staging).unwrap();
+        other.try_lock().expect("测试先自己锁上");
+
+        journal.sweep();
+        assert!(staging.exists(), "别人正在写的暂存不能删");
+
+        // 那一趟结束了（进程没了锁自动就没了，这里是手动放掉）：
+        // 这下它才是普通孤儿。
+        drop(other);
+        journal.sweep();
+        assert!(!staging.exists(), "没人写了就该收走");
+    }
+
+    #[test]
+    fn sweeping_keeps_a_ledger_whose_data_lives_on_the_server() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = Journal::new(root.path().to_path_buf());
+        let source = root.path().join("待上传.bin");
+        fs::write(&source, vec![0u8; 10]).unwrap();
+        let size = 10;
+        let modified = done_of(&source);
+
+        // 上传：数据在服务器上，本地连暂存文件都没有——那是对的。
+        let uploading = key(&source.display().to_string(), "sftp://nas/big.bin");
+        let mut record = record_for(&source.display().to_string(), size, modified, 4);
+        record.server_side = true;
+        journal.save(&uploading, &record);
+        // 对照：同样没有暂存，但这一趟的数据本该落在本地——那才是
+        // "有账本没数据，账本也就没意义"。
+        let copying = key(&source.display().to_string(), "/to/big.bin");
+        journal.save(
+            &copying,
+            &record_for(&source.display().to_string(), size, modified, 4),
+        );
+
+        journal.sweep();
+
+        assert!(
+            journal.load(&uploading).is_some(),
+            "上传的断点在服务器上，本地没有暂存文件本来就是对的"
+        );
+        assert!(
+            journal.load(&copying).is_none(),
+            "本地那趟的数据没了，账本就该清掉"
+        );
+
+        // 源没了则一视同仁：要传的就是这个本地文件，源没了，
+        // "传到哪儿了"对谁都没意义。
+        fs::remove_file(&source).unwrap();
+        journal.sweep();
+        assert!(
+            journal.load(&uploading).is_none(),
+            "源都没了，上传的断点也该清"
+        );
     }
 }

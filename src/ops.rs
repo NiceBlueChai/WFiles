@@ -542,6 +542,12 @@ fn copy_file(
         .write(true)
         .create(true)
         .open(&staging)?;
+    // 锁上：**别的进程**的清扫靠这把锁认出"这一块有人正在写"
+    // （见 `resume::being_written`）。进程内那一半是 `Hold` 管的，
+    // 它连文件都还没建出来的时候就开始管了。拿不到锁（同一对已经被
+    // 搬了第二趟）就照旧往下写——那种情况下数据本来就已经两趟交错着了，
+    // 不是这把锁要解决的问题。
+    writer.try_lock().ok();
     // 不管原来有多长，就认前 `done` 个字节：多出来的当垃圾截掉，
     // 然后**读写都从断点起**。少任何一半都会出事——
     // 只 seek 读不 seek 写，接出来的文件是错位的；
@@ -562,6 +568,7 @@ fn copy_file(
                 size: total,
                 modified,
                 done,
+                server_side: false,
             },
         );
         journal.sweep();
@@ -600,6 +607,7 @@ fn copy_file(
                     size: total,
                     modified,
                     done,
+                    server_side: false,
                 },
             );
             // 暂存变大了：顺手扫一遍，别让它悄悄把磁盘吃干。
@@ -1066,6 +1074,9 @@ fn download_entry(
                 &[("error", error.to_string())],
             ))
         })?;
+    // 同一趟下载的进程内保护是上面那个 `Hold`；跨进程靠这把锁
+    // （见 `resume::being_written`），拿不到就照旧写。
+    file.try_lock().ok();
     // 同上：只认前 `done` 个字节，读写都从断点起。
     file.set_len(done).map_err(|error| {
         TransferError::Failed(crate::i18n::Message::args(
@@ -1160,6 +1171,7 @@ fn note_download(
             size: info.size,
             modified: info.modified,
             done,
+            server_side: false,
         },
     );
 }
@@ -1324,15 +1336,24 @@ fn upload_entry(
                 return Ok(());
             }
             // 用户叫停：服务器上那一段是资产，留着，下次接着传。
-            journal.save(
-                &key,
-                &resume::Record {
-                    source: show(source),
-                    size: length,
-                    modified,
-                    done: sent,
-                },
-            );
+            // 只有协议支持接着传（`ftp` / `sftp`）才值得记：WebDAV 的
+            // `PUT` 只有"整个盖掉"一种写法，记下来的断点没人会用，
+            // 只会在账本目录里一直躺着（它带着 `server_side`，
+            // 清扫不会把它当垃圾收走）。
+            if can_resume {
+                journal.save(
+                    &key,
+                    &resume::Record {
+                        source: show(source),
+                        size: length,
+                        modified,
+                        done: sent,
+                        // 这一半在服务器上，本地没有暂存文件是对的：
+                        // 清扫别拿"本地没数据"这条去清它（见 `Record::server_side`）。
+                        server_side: true,
+                    },
+                );
+            }
             journal.sweep();
             return Err(TransferError::Aborted);
         }
