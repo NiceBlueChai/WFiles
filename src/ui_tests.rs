@@ -39,6 +39,18 @@ fn open_app_of_width(
     cx: &mut TestAppContext,
     width: f32,
 ) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<WFilesApp>) {
+    open_app_at(cx, width, None)
+}
+
+/// 带着命令行目标开一个窗口：验"启动时落到哪儿"那几条路。
+///
+/// 目标从外面喂进来而不是真去读 `std::env::args`：命令行解析那一层
+/// 在 `cli` 里有自己的测试，这里只验**落点**——两件事分开钉。
+fn open_app_at(
+    cx: &mut TestAppContext,
+    width: f32,
+    launch: Option<crate::cli::Launch>,
+) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<WFilesApp>) {
     cx.background_executor.allow_parking();
     // 每个测试的状态目录隔开。放在这里而不是让每个测试自己记得调：
     // 原来只有 22 / 75 个测试调了 `isolate_session`，剩下的会读写用户
@@ -60,7 +72,7 @@ fn open_app_of_width(
                 ..Default::default()
             },
             cx,
-            |window, cx| cx.new(|cx| WFilesApp::new(window, cx)),
+            |window, cx| cx.new(|cx| WFilesApp::new(window, cx, launch)),
         )
         .expect("打开测试窗口");
         (window.downcast::<Root>().expect("Base Root"), app)
@@ -3860,6 +3872,113 @@ fn closing_a_tab_forgets_what_would_have_been_restored(cx: &mut TestAppContext) 
             "还开着的那个目录不该被牵连（{kept:?}）"
         );
     }
+}
+
+/// 命令行说开到哪儿，窗口就落在哪儿——不用用户再点一遍。
+///
+/// 这是"能写脚本调起来"里最要紧的一条：`wfiles /某个目录` 开出来的窗口
+/// 必须真的在那个目录上，而不是"恢复上次会话，然后你猜"。
+#[gpui_kit::test]
+fn a_command_line_target_replaces_the_restored_tab(cx: &mut TestAppContext) {
+    let asked = tempfile::tempdir().unwrap();
+    let restored = tempfile::tempdir().unwrap();
+    for dir in [asked.path(), restored.path()] {
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+    }
+    // 先摆一份**别的**目录的会话：命令行的目标要压过它，
+    // 不然这条测试验的还是会话恢复。
+    let isolation = isolate_session();
+    write_session(isolation.path(), restored.path());
+
+    let (_handle, app) = open_app_at(
+        cx,
+        1180.,
+        Some(crate::cli::Launch {
+            target: crate::cli::Target::Open(asked.path().to_path_buf()),
+            new_tab: false,
+        }),
+    );
+    let paths = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert!(
+        paths.iter().any(|dir| same_dir(dir, asked.path())),
+        "那一栏该开在命令行给的目录上，实际是 {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|dir| same_dir(dir, restored.path())),
+        "命令行说了去哪儿，上次会话那个目录就不该还占着一栏：{paths:?}"
+    );
+}
+
+/// 命令行给的是一个文件（或者 `--reveal`）：开到父目录，选中它。
+///
+/// 同一段里先开一次**不带目标**的做对照：不然"选中了目标"可能只是
+/// 恢复现场恰好也是它，这条测试就什么都没钉住。
+#[gpui_kit::test]
+fn a_command_line_file_is_selected_in_its_folder(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "目标.txt"] {
+        std::fs::write(dir.path().join(name), name).unwrap();
+    }
+    let isolation = isolate_session();
+    write_session(isolation.path(), dir.path());
+
+    // 对照：没有目标就没有选中项。
+    let (_handle, app) = open_app_at(cx, 1180., None);
+    assert!(
+        selected_names(cx, &app).is_empty(),
+        "没有命令行目标，就不该凭空选中什么"
+    );
+
+    let target = dir.path().join("目标.txt");
+    let (_handle, app) = open_app_at(
+        cx,
+        1180.,
+        Some(crate::cli::Launch {
+            target: crate::cli::Target::Reveal(target.clone()),
+            new_tab: false,
+        }),
+    );
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["目标.txt"],
+        "定位到的就该是选中的那一个，而且只有它"
+    );
+}
+
+/// `--new-tab`：多开一栏，不是把原来那一栏挪走——焦点落在新的这一栏上。
+#[gpui_kit::test]
+fn a_new_tab_target_joins_the_rest_instead_of_replacing_it(cx: &mut TestAppContext) {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(first.path().join("a.txt"), "a").unwrap();
+    std::fs::write(second.path().join("目标.txt"), "hi").unwrap();
+    let isolation = isolate_session();
+    write_session(isolation.path(), first.path());
+
+    let (_handle, app) = open_app_at(
+        cx,
+        1180.,
+        Some(crate::cli::Launch {
+            target: crate::cli::Target::Reveal(second.path().join("目标.txt")),
+            new_tab: true,
+        }),
+    );
+    let paths = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert_eq!(
+        paths.len(),
+        2,
+        "原来那一栏还在，目标是另加的一栏：{paths:?}"
+    );
+    assert!(
+        paths.iter().any(|dir| same_dir(dir, first.path())),
+        "会话里那一栏不该被顶掉：{paths:?}"
+    );
+    // 读的是**活动**那一栏的选中项，所以这也验了焦点落在新开的那一栏。
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["目标.txt"],
+        "新开的那一栏该是焦点所在"
+    );
 }
 
 /// 两个路径是不是同一个目录（可以是不同的路径字符串）。

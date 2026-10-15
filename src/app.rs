@@ -3,7 +3,7 @@
 //! 标签页与会话恢复在这一层：每个标签是一个独立的 `Entity<Pane>`，
 //! 打开的目录列表在变化时写盘，下次启动原样恢复。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -18,6 +18,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::bulk_rename::BulkRename;
+use crate::cli;
 use crate::clipboard::name_of;
 use crate::compare::Options as CompareOptions;
 use crate::compare_entity::{CompareEvent, ComparePanel};
@@ -277,7 +278,7 @@ pub struct WFilesApp {
 }
 
 impl WFilesApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, launch: Option<cli::Launch>) -> Self {
         // 设置要在建窗格之前装好：窗格渲染时要读“默认终端”。
         Settings::install(cx);
         let remotes = cx.new(|_| Remotes::new());
@@ -288,36 +289,62 @@ impl WFilesApp {
 
         // 恢复上次的标签；一个都不剩就开主页。
         let session = Session::load().sanitized();
+        // 命令行指定的目标，算成"开哪个目录 + 选中哪一个"。
+        // 规则在 `cli` 里（裸路径给目录就开它、给文件就定位到它，
+        // `--reveal` 一律定位），那边有测试。
+        let opening = launch
+            .as_ref()
+            .map(|it| it.target.resolve(Self::on_disk(it.target.path())));
+
+        // 这一次要开哪几栏。
+        let mut openings: Vec<(PathBuf, Option<PathBuf>)> = session
+            .tabs
+            .iter()
+            .map(|path| (path.clone(), None))
+            .collect();
+        match (&launch, opening) {
+            // `--new-tab`：多开一栏，别的照旧。
+            (Some(it), Some(open)) if it.new_tab => openings.push((open.dir, open.select)),
+            // 默认：把**当前那一栏**换成目标，其余照常恢复。不先恢复再跳——
+            // 那会闪一下，远程路径还得白连一趟。
+            (Some(_), Some(open)) if !openings.is_empty() => {
+                let active = session.active.min(openings.len() - 1);
+                openings[active] = (open.dir, open.select);
+            }
+            // 会话是空的（或者标签全指向已经不存在的目录）：目标就是全部。
+            (_, Some(open)) => openings.push((open.dir, open.select)),
+            (_, None) => {}
+        }
+        if openings.is_empty() {
+            openings.push((Self::initial_dir(), None));
+        }
+
         let mut tabs: Vec<Entity<Pane>> = Vec::new();
-        for path in &session.tabs {
+        for (dir, select) in openings {
             let tab = cx.new(|cx| {
-                Pane::new(
-                    path.clone(),
+                let mut pane = Pane::new(
+                    dir,
                     ops.clone(),
                     thumbs.clone(),
                     meta.clone(),
                     remotes.clone(),
                     window,
                     cx,
-                )
+                );
+                // 命令行说"定位到这个文件"：选中它、滚到它。这条压过恢复
+                // 现场——用户刚敲的命令比上次退出时的现场新。
+                if let Some(path) = &select {
+                    pane.select_path(path, cx);
+                }
+                pane
             });
             tabs.push(tab);
         }
-        if tabs.is_empty() {
-            let tab = cx.new(|cx| {
-                Pane::new(
-                    Self::initial_dir(),
-                    ops.clone(),
-                    thumbs.clone(),
-                    meta.clone(),
-                    remotes.clone(),
-                    window,
-                    cx,
-                )
-            });
-            tabs.push(tab);
-        }
-        let active = session.active.min(tabs.len() - 1);
+        let active = match &launch {
+            // `--new-tab` 开出来的那一栏就是焦点所在。
+            Some(it) if it.new_tab => tabs.len() - 1,
+            _ => session.active.min(tabs.len() - 1),
+        };
         let split = session
             .split
             .filter(|&index| index < tabs.len() && index != active);
@@ -453,6 +480,20 @@ impl WFilesApp {
     fn save_layout(&self, cx: &mut App) {
         let layout = self.layout;
         Settings::update(cx, |settings| settings.layout = layout);
+    }
+
+    /// 磁盘上这个是目录、是文件，还是已经不在了。
+    ///
+    /// 只回答"怎么开"（见 [`cli::Target::resolve`]），不回答"认不认这个参数"。
+    /// 跟着符号链接走：`wfiles ~/桌面/某个链接` 指的是链接指向的那个目录，
+    /// 打开它比在桌面里选中它更接近用户的意思——真要选中链接本身，
+    /// `--reveal` 就在那儿。
+    fn on_disk(path: &Path) -> cli::OnDisk {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_dir() => cli::OnDisk::Dir,
+            Ok(_) => cli::OnDisk::File,
+            Err(_) => cli::OnDisk::Missing,
+        }
     }
 
     fn initial_dir() -> PathBuf {

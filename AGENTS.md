@@ -76,6 +76,7 @@ scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug
 | `src/search_entity.rs` | 搜索面板实体：输入 → 查询、结果列表、Enter 跳到那个文件 |
 | `src/term.rs` | 内嵌终端的纯逻辑：按键 → PTY 字节、屏幕与回滚、选中与取文本 |
 | `src/term_entity.rs` | 内嵌终端实体：起 PTY、跨线程收输出、量格子画屏幕、收键盘与鼠标 |
+| `src/cli.rs` | 命令行参数：这次启动开哪个目录、定位哪个文件（纯逻辑，`--lang` 也在这儿） |
 | `src/clipboard.rs` | 剪贴板 |
 | `src/format.rs` | 展示层格式化 |
 | `src/session.rs` | 会话持久化（含状态目录的定位规则） |

@@ -786,6 +786,29 @@ impl Pane {
         cx.notify();
     }
 
+    /// 命令行把这一栏开在某个文件上（`wfiles --reveal …`）：选中它、滚到它。
+    ///
+    /// 跟 [`Self::restore_selection`] 是同一件事的两个来源：那个来自上次
+    /// 退出时的现场，这个来自用户刚敲下的命令。**两个撞上时后到的算数**——
+    /// `Pane::new` 里先按旧现场恢复过一遍，这一下把它整个换掉：
+    /// 用户刚说的话比上次的现场新。
+    pub fn select_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        // 从敲命令到窗口开出来之间，文件可能已经没了：那就只开到目录，
+        // 别去选中一个列表里根本没有的东西。
+        if self.listing.entry(path).is_none() {
+            return;
+        }
+        self.selection.select(path.to_path_buf());
+        self.note_restore();
+        if let Some(position) = self.listing.position_of(path) {
+            // 居中对齐而不是"刚好看得见"：这个文件可能在一万项里的某个
+            // 角落，滚到边际上等于没说清是哪一个。
+            self.scroll.scroll_to_item(position, ScrollStrategy::Center);
+        }
+        self.update_status(cx);
+        cx.notify();
+    }
+
     /// 记下这一栏的现场（选中项 + 光标），供崩溃后恢复。
     ///
     /// 什么时候记：选择变了就记。不是每次按键都记——那是一次写盘，

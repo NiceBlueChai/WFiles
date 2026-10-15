@@ -3,6 +3,7 @@ mod analyze_entity;
 mod app;
 mod archive;
 mod bulk_rename;
+mod cli;
 mod clipboard;
 mod cloud;
 mod compare;
@@ -77,35 +78,17 @@ impl AssetSource for WFilesAssets {
     }
 }
 
-/// 命令行里认得的参数，处理完剩下的（路径之类）可以直接忽略。
-///
-/// **只认 `--lang`，不引一套参数解析库**：全应用就这一个参数，
-/// 而参数解析器会带来它自己的报错格式、`--help` 排版和一批 flags——
-/// 为一件事装一整套框架不划算。看不懂的参数**默默忽略**而不是报错：
-/// 从文件管理器或别的程序启动时，参数不由用户控制，报错退出是帮倒忙。
-fn read_cli_locale() -> Option<i18n::Locale> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        // `--lang=en` 与 `--lang en` 两种写法都认。
-        if let Some(code) = arg.strip_prefix("--lang=") {
-            return i18n::Locale::parse(code);
-        }
-        if arg == "--lang" {
-            return args.next().and_then(|code| i18n::Locale::parse(&code));
-        }
-    }
-    None
-}
-
 fn main() {
-    // 语言定在读设置**之前**记下来，优先级是「命令行 > 设置 > 系统环境 > 中文」。
+    // 命令行认得的东西全在 `cli` 里：语言，以及"这一次要开到哪儿"。
+    // 语言要在读设置**之前**定下来，优先级是「命令行 > 设置 > 系统环境 > 中文」。
     // 存在进程级而不是顺手 `Settings::update` 写进去：那一刻 `Settings`
     // 这个 `Global` 还没装上（装它的是 `WFilesApp::new`，在 open_window 回调里），
     // 而写进设置文件又意味着"跑一次 `--lang=en` 把用户的偏好改了"。
     //
     // 命令行最靠前，因为它说的是"这一次启动我要什么"——一个脚本、一次录屏演示，
     // 不该因为配置文件里存着别的语言就跑偏。
-    i18n::set_cli_locale(read_cli_locale());
+    let cli = cli::parse(std::env::args_os().skip(1));
+    i18n::set_cli_locale(cli.locale);
     let application = gpui_kit::application().with_assets(WFilesAssets);
     application.run(|cx| {
         gpui_kit::init(cx);
@@ -136,7 +119,9 @@ fn main() {
 
         gpui_kit::open_window(window_options, cx, |window, cx| {
             window.set_window_title("WFiles");
-            cx.new(|cx| WFilesApp::new(window, cx))
+            // 命令行说开到哪儿，就落在**这一次**开出来的那一栏上；
+            // 没给就照上次的会话恢复（那是 `WFilesApp::new` 的默认走法）。
+            cx.new(|cx| WFilesApp::new(window, cx, cli.launch))
         })
         .expect("无法打开 WFiles 窗口");
     });
