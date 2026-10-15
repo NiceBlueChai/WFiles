@@ -27,6 +27,11 @@ scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug
 - 这个项目可能放在外置卷（如 Ventoy）上：**macOS 会在那里给每个文件
   生成 `._xxx` 资源叉伴生文件**，`.gitignore` 已忽略、代码里按名前缀跳过。
   打 `.app` 时那种文件会让 `codesign` 拒签，脚本里已经先清一遍。
+  同一个坑会噎住 `git gc`：git 刚写出来的 pack 旁边立刻多一个
+  `._pack-*.idx`，它把那个当索引读，报 `non-monotonic index` 再
+  `fatal: unable to mark recent objects`。清掉重跑就行
+  （`find .git -name '._*' -delete && git gc --prune=now`），
+  但它是写一次补一次，得边清边跑，别指望清一遍就完事。
 
 ## 仓库结构
 
