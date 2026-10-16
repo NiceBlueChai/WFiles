@@ -8,6 +8,10 @@
 //! **看得懂就认、看不懂就当没有**：从文件管理器、别的应用、脚本里启动时，
 //! 参数不由用户控制，为一个没写对的开关拒绝启动是帮倒忙。
 //!
+//! 但"**两句话互相矛盾**"要报出来：`--new-window` 与 `--new-tab` 一起给，
+//! 猜哪个都是替用户做决定——而两种猜法都长得像"照办了"。这一种不开窗，
+//! 退出码 2，用法由 `main` 打印（见 [`Cli::problem`]）。
+//!
 //! 解析这一层不碰文件系统也不读环境：路径存不存在、是文件还是目录，
 //! 由调用方问清楚了喂进来（[`OnDisk`]）——那个判据到开窗那一刻才有意义，
 //! 而这一层能拿三个枚举值把规则测干净。
@@ -104,7 +108,27 @@ pub struct Cli {
     pub locale: Option<i18n::Locale>,
     /// 要开到哪儿；没给就照上次的会话恢复。
     pub launch: Option<Launch>,
+    /// `--new-window`：自己开一扇新窗，别交给已经开着的那一扇。
+    ///
+    /// 别的启动都是"有话交给已经开着的那一扇去办"（见 `instance`），
+    /// 只有它明说自己开：脚本要的是"给我一扇看着这个目录的窗"，
+    /// 而不是"把我正看着的那扇挪走"。
+    ///
+    /// **只有已经开着一份时它才另有意思**：没有别的窗时，这一扇就是主窗，
+    /// 会话、布局照常归它（见 `app::Starting`）。
+    pub new_window: bool,
+    /// 命令行自己打架时的一句话（i18n key）。有值就别开窗。
+    pub problem: Option<&'static str>,
 }
+
+/// 用错了命令行时打印的第一行之后的用法说明。走 i18n，见 [`Cli::problem`]。
+pub const USAGE: &str = "用法：wfiles [路径] [--reveal] [--new-tab | --new-window] [--lang=代码]";
+
+/// `--new-window` 与 `--new-tab` 一起给：两句话互相矛盾。
+///
+/// 新开的那一扇窗里只有一栏——没有"另一栏"可以加。往哪边猜都不对。
+const BOTH_FLAGS: &str =
+    "--new-window 与 --new-tab 不能一起用：新开的那一扇窗里只有一栏，没有「另一栏」可加";
 
 /// 启动目标，以及开法。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,7 +139,7 @@ pub struct Launch {
 }
 
 /// 认识的就这么几个：`--lang`（`=` 与空格两种写法）、`--reveal`、
-/// `--new-tab`，以及一条路径。别的放过。
+/// `--new-tab`、`--new-window`，以及一条路径。别的放过。
 pub fn parse<I>(args: I) -> Cli
 where
     I: IntoIterator<Item = OsString>,
@@ -143,6 +167,8 @@ where
             reveal = true;
         } else if text == "--new-tab" {
             new_tab = true;
+        } else if text == "--new-window" {
+            cli.new_window = true;
         } else if text.starts_with('-') {
             // 认不出来的开关：默默放过，别报错退出。
         } else {
@@ -159,6 +185,12 @@ where
         // 没给路径就没有"新的那一栏"可言，这个开关也就没了着落。
         new_tab,
     });
+    // 两个开关要的都是"这一栏"：一个说另开一栏、一个说另开一窗。
+    // 没给路径时 `--new-tab` 本来就什么都不表示（上面那句），
+    // 于是也没真的打架——只有带着路径时才是在说两件相反的事。
+    if cli.new_window && cli.launch.as_ref().is_some_and(|launch| launch.new_tab) {
+        cli.problem = Some(BOTH_FLAGS);
+    }
     cli
 }
 
@@ -262,6 +294,42 @@ mod tests {
     #[test]
     fn new_tab_without_a_path_means_nothing() {
         assert!(cli(&["--new-tab"]).launch.is_none());
+    }
+
+    #[test]
+    fn new_window_is_remembered_and_does_not_disturb_the_path() {
+        assert!(cli(&["--new-window"]).new_window);
+        assert!(!cli(&["/tmp/x"]).new_window);
+        // 位置随便：开关在路径前面后面都一样。
+        for args in [
+            vec!["--new-window", "/tmp/x"],
+            vec!["/tmp/x", "--new-window"],
+        ] {
+            let cli = cli(&args);
+            assert!(cli.new_window);
+            assert!(cli.problem.is_none());
+            let launch = cli.launch.expect("路径照样认得");
+            assert_eq!(launch.target, Target::Open(PathBuf::from("/tmp/x")));
+            assert!(!launch.new_tab, "另开一窗不是另开一栏");
+        }
+    }
+
+    #[test]
+    fn new_window_and_new_tab_together_is_a_usage_error() {
+        // 两句话互相矛盾：新窗里只有一栏，没有"另一栏"可加。
+        // 猜哪个都是替用户做决定，而两种猜法看起来都像"照办了"。
+        let cli = cli(&["--new-window", "--new-tab", "/tmp/x"]);
+        assert!(cli.problem.is_some(), "该报出来，而不是挑一个照办");
+        assert!(cli.launch.is_some(), "话是听懂了，只是两句话打架");
+    }
+
+    #[test]
+    fn new_tab_without_a_path_is_not_a_conflict() {
+        // `--new-tab` 没给路径时本来就什么都不表示（上面那条测试），
+        // 于是它跟 `--new-window` 没真的打架：那一扇窗照开。
+        let cli = cli(&["--new-window", "--new-tab"]);
+        assert!(cli.problem.is_none());
+        assert!(cli.new_window);
     }
 
     #[cfg(unix)]

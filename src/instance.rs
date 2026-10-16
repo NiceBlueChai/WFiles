@@ -401,7 +401,12 @@ mod tests {
     }
 
     fn cli_of(launch: Option<Launch>, locale: Option<crate::i18n::Locale>) -> cli::Cli {
-        cli::Cli { locale, launch }
+        cli::Cli {
+            locale,
+            launch,
+            new_window: false,
+            problem: None,
+        }
     }
 
     #[test]

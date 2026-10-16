@@ -44,7 +44,7 @@ scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug
 | 路径 | 职责 |
 |---|---|
 | `src/main.rs` | 入口：application 初始化 + 开窗 |
-| `src/app.rs` | `WFilesApp` 应用外壳与全局状态 |
+| `src/app.rs` | `WFilesApp` 应用外壳与全局状态；`Starting` 说明这一扇窗是谁（主窗/副窗）——会话、窗口布局、崩溃恢复现场只有主窗写 |
 | `src/pane.rs` | 面板系统（导航/列表与网格 UI、视图模式、行级拖放） |
 | `src/drag.rs` | 拖放的纯判定逻辑（拖什么、能不能落、移动还是拷贝、悬停多久展开） |
 | `src/analyze.rs` | 分析任务的纯逻辑：文件夹大小、重复文件、校验和（可中止、带进度） |
@@ -76,7 +76,7 @@ scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug
 | `src/search_entity.rs` | 搜索面板实体：输入 → 查询、结果列表、Enter 跳到那个文件 |
 | `src/term.rs` | 内嵌终端的纯逻辑：按键 → PTY 字节、屏幕与回滚、选中与取文本 |
 | `src/term_entity.rs` | 内嵌终端实体：起 PTY、跨线程收输出、量格子画屏幕、收键盘与鼠标 |
-| `src/cli.rs` | 命令行参数：这次启动开哪个目录、定位哪个文件（纯逻辑，`--lang` 也在这儿） |
+| `src/cli.rs` | 命令行参数：这次启动开哪个目录、定位哪个文件，以及 `--reveal` / `--new-tab` / `--new-window` / `--lang`（纯逻辑，用法错误也在这儿判，报错文案走 i18n） |
 | `src/instance.rs` | 单实例转发：位子（状态目录里的排他锁）、门牌（端口）、一句话的线格式（一行 ASCII 头 + 原始路径字节）；第二次启动把"开到哪儿"交给已经开着的那一扇，送不到就自己开窗 |
 | `src/clipboard.rs` | 剪贴板 |
 | `src/format.rs` | 展示层格式化 |
@@ -107,6 +107,7 @@ scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug
 10. **测试里改进程级状态（override / 全局根目录 / 环境变量）必须拿锁串行化。** 两个测试各改一份、并行跑就会互相顶掉，症状是"单跑必过、全量并行挂"。统一用 `test_guard()`（`volumes::test_guard()` / `offline::test_guard()`），守卫对象在 `Drop` 里恢复现场。**测试等待后台任务时只等"进行中"的状态，绝不要把"终态"（如 `failed`）也算进去**——那会永远等下去。
 11. **`~/.Trash` 只能按已知路径读，不能枚举。** macOS 的 TCC 不给普通进程 `read_dir` 回收站（`Operation not permitted`，shell / launchd 用户代理 / `.app` 三种上下文实测一致），但**按已知路径 `stat` / `rename` 是放行的**。所以「从回收站放回」只能靠拼候选名（见 `ops::trash_candidate_names`），别写 `fs::read_dir`——那条路在真机上必挂，而单测里用临时目录跑却是绿的（临时目录不受 TCC 管），典型的"测试过、用户挂"。
 12. **Finder 给回收站里的重名项加的是时间戳后缀，不是编号。** 同一个名字删第二次，它叫 `主干 时.分.秒.扩展名`（例如 `报告 23.17.03.txt`），那个时刻是**移进回收站那一刻**的墙上时钟（实测：把 mtime 改成 2020 年、创建与删除相隔 20 秒，后缀都还是删除当时）。别照直觉写成 `主干 2.扩展名`——那个命名法在真机上采样到 0 次。要拿它做判断，先记着测试纪律里那句**探针比推理可靠**——`osascript -e 'tell application "Finder" to get name of every item of trash'` 能列出真东西（但一次 0.6 秒起，别放进界面线程）。
+13. **同一份状态文件只有一个写者。** `session.json`、窗口布局（`settings.json` 的 `layout`）、崩溃恢复现场的清扫（`sweep_restore`）与关闭标签时的清理（`forget_restore`）**只归主窗**（抢到 `instance.lock` 的那一扇），副窗只读（判据见 `app::Starting.primary`）。这些文件各自只有一份，两扇窗都写就是互相覆盖，症状是"重启后标签少了一半"，而那时已经无从查起。判据是"抢到位子没有"，不是"谁先开的"——抢不到位子就一定另有一份活着，它正管着这些文件。**按目录的选中现场（`restore.json` 的条目）两边都写**：两扇窗看同一个目录时只有一份"上次"，后写的说了算——这是已知取舍，别当缺陷修。
 
 ## 测试纪律
 

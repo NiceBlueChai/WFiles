@@ -249,6 +249,9 @@ pub struct WFilesApp {
     saved_session: Session,
     /// 当前窗口的位置与尺寸，退出时存进设置。
     layout: Option<Layout>,
+    /// 这一扇是不是主窗。副窗**只读不写**：会话、窗口布局、崩溃现场
+    /// 都归主窗（理由见 [`Starting`]）。
+    primary: bool,
     /// 退出时存盘的订阅；必须一直持有，否则回调会被丢弃。
     quit_subscription: Option<Subscription>,
     subscriptions: Vec<Subscription>,
@@ -278,8 +281,47 @@ pub struct WFilesApp {
     secret_note: Option<String>,
 }
 
+/// 这一次开窗的来路：命令行给了什么、这一扇是什么身份。
+///
+/// 打包成一个结构体而不是给 [`WFilesApp::new`] 加三个参数：
+/// `fresh` 与 `primary` 都是"是/否"，两个并排的 `bool` 传起来必然会有人传反。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Starting {
+    /// 命令行说开到哪儿。
+    pub launch: Option<cli::Launch>,
+    /// 从主页起，不恢复上次的会话。
+    ///
+    /// 只有 `--new-window` 且另有一份开着时要这个：用户要的是"给我一扇干净的
+    /// 窗看着这个地方"，不是"把上次那排标签再复制一份"。
+    pub fresh: bool,
+    /// 这一扇是不是主窗（抢到了位子）。
+    ///
+    /// 副窗**只读不写**：会话、窗口布局、崩溃恢复现场都归主窗。三样东西
+    /// 各自只有一份文件，两扇窗都写就是互相覆盖——
+    /// 会话被覆盖的症状是"我的标签怎么少了一半"，而那时已经无从查起。
+    /// 副窗还会写的是**按目录**的选中现场（`restore.json`）：那不是谁的
+    /// 身份，是"这个目录上次选了什么"，两扇窗看着同一个目录时本来就只能存一份。
+    pub primary: bool,
+}
+
+impl Starting {
+    /// 主窗：正常启动的那一扇（抢到了位子，会话与布局都归它）。
+    pub fn primary(launch: Option<cli::Launch>) -> Self {
+        Self {
+            launch,
+            fresh: false,
+            primary: true,
+        }
+    }
+}
+
 impl WFilesApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, launch: Option<cli::Launch>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, starting: Starting) -> Self {
+        let Starting {
+            launch,
+            fresh,
+            primary,
+        } = starting;
         // 设置要在建窗格之前装好：窗格渲染时要读“默认终端”。
         Settings::install(cx);
         let remotes = cx.new(|_| Remotes::new());
@@ -289,7 +331,14 @@ impl WFilesApp {
         let meta = cx.new(|_| Metadata::new());
 
         // 恢复上次的标签；一个都不剩就开主页。
-        let session = Session::load().sanitized();
+        //
+        // `fresh`（`--new-window` 要的那种"新"窗）一份都不恢复：用户要的是
+        // 一扇干净的窗看着某个地方，不是把上次那排标签再复制一份。
+        let session = if fresh {
+            Session::default()
+        } else {
+            Session::load().sanitized()
+        };
         // 命令行指定的目标，算成"开哪个目录 + 选中哪一个"。
         // 规则在 `cli` 里（裸路径给目录就开它、给文件就定位到它，
         // `--reveal` 一律定位），那边有测试。
@@ -364,6 +413,7 @@ impl WFilesApp {
             palette_input: None,
             saved_session: Session::default(),
             layout: None,
+            primary,
             quit_subscription: None,
             subscriptions: Vec::new(),
             term: None,
@@ -461,6 +511,11 @@ impl WFilesApp {
     /// 在渲染时取而不是等到退出时：退出回调拿不到 `Window`，
     /// 而渲染每一帧都有窗口句柄，顺便读一下是零成本的。
     fn capture_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 副窗不记位置：它记下去就是替主窗把窗口挪了——下次启动主窗开在副窗
+        // 当时那个地方（而副窗可能早就关了）。
+        if !self.primary {
+            return;
+        }
         let bounds = window.window_bounds().get_bounds();
         let layout = Layout {
             x: bounds.origin.x.as_f32(),
@@ -479,8 +534,13 @@ impl WFilesApp {
 
     /// 退出前把布局写进设置。记不下来无所谓，下次用默认尺寸。
     fn save_layout(&self, cx: &mut App) {
-        let layout = self.layout;
-        Settings::update(cx, |settings| settings.layout = layout);
+        // **没记过就不写**：副窗从没记过布局（`capture_layout` 拦掉了），
+        // 而把一个 `None` 写下去等于把主窗记着的位置抹了——下次启动
+        // 主窗就从默认大小居中开，用户只会觉得"它自己乱跳"。
+        let Some(layout) = self.layout else {
+            return;
+        };
+        Settings::update(cx, |settings| settings.layout = Some(layout));
     }
 
     /// 磁盘上这个是目录、是文件，还是已经不在了。
@@ -1900,6 +1960,11 @@ impl WFilesApp {
     }
 
     fn sync_session(&mut self, cx: &mut Context<Self>) {
+        // 副窗不留痕：会话文件只有一份（`session.json`），两扇窗都写就是
+        // 互相覆盖——重启后恢复成哪一份全看谁最后导航过。
+        if !self.primary {
+            return;
+        }
         let snapshot = self.snapshot(cx);
         if snapshot == self.saved_session {
             return;
@@ -1913,6 +1978,11 @@ impl WFilesApp {
 
     /// 把某一栏的恢复现场从盘上删掉（标签被关时用）。
     fn forget_restore(&self, dir: &std::path::Path) {
+        // 副窗关标签不删别人的现场：那一条很可能是主窗正在用的
+        // （两扇窗看着同一个目录是常态——副窗恢复的就是同一份会话）。
+        if !self.primary {
+            return;
+        }
         let mut set = crate::restore::RestoreSet::load();
         set.forget(dir);
         if let Err(error) = set.save() {
@@ -1926,6 +1996,11 @@ impl WFilesApp {
     /// 这边兜住"上次崩的时候开着、这次没开"——比如崩之前那批标签对应的
     /// 目录这次没被恢复回来（会话文件也坏了一类的情形）。
     fn sweep_restore(&self, cx: &Context<Self>) {
+        // 副窗不剪：它只开着目标那一栏（或者干脆在主页），剪一遍就等于把主窗
+        // 正在看的那些目录的现场（选中项、光标）全删了。
+        if !self.primary {
+            return;
+        }
         let live: Vec<PathBuf> = self
             .tabs
             .iter()

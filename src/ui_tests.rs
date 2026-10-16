@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::app::WFilesApp;
+use crate::app::{Starting, WFilesApp};
 use crate::model::{Sort, SortKey, ViewMode};
 use crate::session::Session;
 use crate::settings::Settings;
@@ -51,6 +51,16 @@ fn open_app_at(
     width: f32,
     launch: Option<crate::cli::Launch>,
 ) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<WFilesApp>) {
+    open_app_starting(cx, width, Starting::primary(launch))
+}
+
+/// 带着整份"这一次开窗的来路"开一个窗口：副窗（[`Starting::primary`]
+/// 之外的两种身份）只有这里开得出来。
+fn open_app_starting(
+    cx: &mut TestAppContext,
+    width: f32,
+    starting: Starting,
+) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<WFilesApp>) {
     cx.background_executor.allow_parking();
     // 每个测试的状态目录隔开。放在这里而不是让每个测试自己记得调：
     // 原来只有 22 / 75 个测试调了 `isolate_session`，剩下的会读写用户
@@ -72,7 +82,7 @@ fn open_app_at(
                 ..Default::default()
             },
             cx,
-            |window, cx| cx.new(|cx| WFilesApp::new(window, cx, launch)),
+            |window, cx| cx.new(|cx| WFilesApp::new(window, cx, starting)),
         )
         .expect("打开测试窗口");
         (window.downcast::<Root>().expect("Base Root"), app)
@@ -3981,6 +3991,198 @@ fn a_new_tab_target_joins_the_rest_instead_of_replacing_it(cx: &mut TestAppConte
     );
 }
 
+/// 副窗**只读不写**：会话、窗口布局、别的目录的恢复现场都动不得。
+///
+/// 这三样是"两扇窗"今天就会踩的三个文件：两扇各写一份 `session.json`
+/// （重启后恢复成哪一份全看谁最后导航过）、`layout` 互相挪窗口、
+/// 副窗启动时那一遍清扫把主窗正在看的目录的现场整个删掉。
+#[gpui_kit::test]
+fn a_secondary_window_leaves_the_session_and_the_layout_alone(cx: &mut TestAppContext) {
+    let running = tempfile::tempdir().unwrap(); // 主窗在看的地方
+    let elsewhere = tempfile::tempdir().unwrap(); // 副窗要去的地方
+    for dir in [running.path(), elsewhere.path()] {
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+    }
+    let isolation = isolate_session();
+    write_session(isolation.path(), running.path());
+
+    // 主窗此刻的现场：记着一处窗口位置，主窗看的那个目录里有个选中项。
+    let layout = crate::settings::Layout {
+        x: 40.,
+        y: 30.,
+        width: 900.,
+        height: 700.,
+    };
+    Settings {
+        layout: Some(layout),
+        ..Settings::default()
+    }
+    .save_to(&isolation.path().join("settings.json"))
+    .expect("写设置");
+    let mut set = crate::restore::RestoreSet::default();
+    set.note(
+        running.path().to_path_buf(),
+        Vec::new(),
+        Some(running.path().join("a.txt")),
+    );
+    set.save_to(&isolation.path().join("restore.json"))
+        .expect("写恢复现场");
+
+    let session_path = isolation.path().join("session.json");
+    let settings_path = isolation.path().join("settings.json");
+    let session_before = std::fs::read(&session_path).expect("读会话");
+
+    // 副窗：没抢到位子的那一扇。`--new-tab`：别人的会话照旧恢复，目标另加
+    // 一栏——跟主窗长得一样正是它该有的样子，不同的只是**写作的权限**。
+    let (handle, app) = open_app_starting(
+        cx,
+        1180.,
+        Starting {
+            launch: Some(crate::cli::Launch {
+                target: crate::cli::Target::Open(elsewhere.path().to_path_buf()),
+                new_tab: true,
+            }),
+            fresh: false,
+            primary: false,
+        },
+    );
+    let paths = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert_eq!(paths.len(), 2, "会话那一栏 + 命令行那一栏：{paths:?}");
+    assert!(
+        paths.iter().any(|dir| same_dir(dir, elsewhere.path())),
+        "副窗该开在命令行给的地方：{paths:?}"
+    );
+    // 这里**不**断言"清扫没删别人的现场"：副窗恢复的是同一份会话，
+    // 主窗看的那一栏本来就在它自己的标签里，清扫扫不到什么。
+    // 那条断言在 `a_new_window_does_not_copy_the_last_session` 里——
+    // 只有"另起一扇、不恢复会话"的副窗才会把别的目录当垃圾清掉。
+
+    // 动它一下：开一栏。在主窗里这一步会写会话（`add_tab` → `sync_session`）。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, settle);
+    let paths = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert_eq!(paths.len(), 3, "这一步得真的办成了，不然下面钉不住东西");
+
+    // 再关掉**主窗正在看**的那一栏（焦点先挪过去，再点一行落下焦点——
+    // 跟用户一样：先选中一个文件，再关这一栏）。
+    // 在主窗里这一步会清掉那个目录的现场（`forget_restore`）。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("ctrl-tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-w", cx);
+    });
+    step(cx, handle, settle);
+    let paths = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert_eq!(paths.len(), 2, "该正好关掉一栏：{paths:?}");
+    assert!(
+        !paths.iter().any(|dir| same_dir(dir, running.path())),
+        "关掉的该是 `running` 那一栏，不然下面那条断言打的不是这一枪：{paths:?}"
+    );
+
+    assert_eq!(
+        std::fs::read(&session_path).expect("读会话"),
+        session_before,
+        "副窗不该动会话文件"
+    );
+    let saved = Settings::load_from(&settings_path).expect("设置还在");
+    assert_eq!(
+        saved.layout,
+        Some(layout),
+        "副窗不该记窗口位置——记下去就是替主窗挪窗口"
+    );
+    assert!(
+        crate::restore::RestoreSet::load()
+            .at(running.path())
+            .is_some(),
+        "副窗关掉那一栏时，把主窗正在看的那个目录的现场删了"
+    );
+}
+
+/// `--new-window` 要的是一扇**干净**的窗：给哪儿就开哪儿，不给就开主页，
+/// 上次那排标签不跟着复制一份过来。
+#[gpui_kit::test]
+fn a_new_window_does_not_copy_the_last_session(cx: &mut TestAppContext) {
+    let last_time = tempfile::tempdir().unwrap();
+    let also_last_time = tempfile::tempdir().unwrap();
+    let asked = tempfile::tempdir().unwrap();
+    for dir in [last_time.path(), also_last_time.path(), asked.path()] {
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+    }
+    let isolation = isolate_session();
+    // 上次开着两栏：真去恢复会话的话，这两栏会原样跟着出现。
+    crate::session::Session {
+        tabs: vec![
+            last_time.path().to_path_buf(),
+            also_last_time.path().to_path_buf(),
+        ],
+        active: 0,
+        split: None,
+        focus_on_left: true,
+        sync: false,
+    }
+    .save_to(&isolation.path().join("session.json"))
+    .expect("写测试会话");
+    // 上次那两个目录各留一份现场：新窗不恢复会话，它眼里只有命令行给的那一个，
+    // 一启动就替别人清场的话，这两条会被当成垃圾删掉。
+    let mut set = crate::restore::RestoreSet::default();
+    for dir in [last_time.path(), also_last_time.path()] {
+        set.note(dir.to_path_buf(), Vec::new(), Some(dir.join("a.txt")));
+    }
+    set.save_to(&isolation.path().join("restore.json"))
+        .expect("写恢复现场");
+
+    // 给了路径：新窗里只有它这一栏。
+    let (_handle, app) = open_app_starting(
+        cx,
+        1180.,
+        Starting {
+            launch: Some(crate::cli::Launch {
+                target: crate::cli::Target::Open(asked.path().to_path_buf()),
+                new_tab: false,
+            }),
+            fresh: true,
+            primary: false,
+        },
+    );
+    let paths = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert_eq!(paths.len(), 1, "新窗里只有命令行说的那一栏：{paths:?}");
+    assert!(same_dir(&paths[0], asked.path()));
+    let set = crate::restore::RestoreSet::load();
+    assert!(
+        set.at(last_time.path()).is_some(),
+        "新窗只开着 `asked`，却把别人（主窗）正在看的目录的现场扫了"
+    );
+
+    // 没给路径：从主页起。
+    let (_handle, app) = open_app_starting(
+        cx,
+        1180.,
+        Starting {
+            launch: None,
+            fresh: true,
+            primary: false,
+        },
+    );
+    let paths = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert_eq!(paths.len(), 1, "一栏主页，不是上次那两栏：{paths:?}");
+    let home = dirs::home_dir().expect("系统得有个主页目录");
+    assert!(
+        same_dir(&paths[0], &home),
+        "该落在主页，实际是 {:?}",
+        paths[0]
+    );
+}
+
 /// 第二次启动把那句话交给已经开着的窗口——真的走一趟回环 socket。
 ///
 /// 这条是单实例转发的全链路：主实例抢位子、挂门牌、听；"第二份"读门牌、
@@ -4005,13 +4207,10 @@ fn a_second_launch_lands_in_the_window_that_is_already_open(cx: &mut TestAppCont
     // 第二次启动：说的话交给那一份。这里不等界面——回话是在"排进队列"
     // 之后才发的，所以下面等的才是界面那一头。
     let asked_path = asked.path().join("目标.txt");
-    let handed = crate::instance::hand_off(&crate::cli::Cli {
-        locale: None,
-        launch: Some(crate::cli::Launch {
-            target: crate::cli::Target::Reveal(asked_path.clone()),
-            new_tab: false,
-        }),
-    });
+    let handed = crate::instance::hand_off(&second_launch(crate::cli::Launch {
+        target: crate::cli::Target::Reveal(asked_path.clone()),
+        new_tab: false,
+    }));
     assert!(handed, "已经开着的那一份该应答");
 
     assert!(
@@ -4044,13 +4243,10 @@ fn a_forwarded_new_tab_joins_the_rest(cx: &mut TestAppContext) {
         app.update(cx, |app, cx| app.serve_forwarding(claim, window, cx));
     });
 
-    let handed = crate::instance::hand_off(&crate::cli::Cli {
-        locale: None,
-        launch: Some(crate::cli::Launch {
-            target: crate::cli::Target::Open(asked.path().to_path_buf()),
-            new_tab: true,
-        }),
-    });
+    let handed = crate::instance::hand_off(&second_launch(crate::cli::Launch {
+        target: crate::cli::Target::Open(asked.path().to_path_buf()),
+        new_tab: true,
+    }));
     assert!(handed, "已经开着的那一份该应答");
 
     assert!(
@@ -4096,6 +4292,16 @@ fn same_dir(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
+    }
+}
+
+/// "第二次启动"手里那份命令行：只带一个目标，别的什么都没给。
+fn second_launch(launch: crate::cli::Launch) -> crate::cli::Cli {
+    crate::cli::Cli {
+        locale: None,
+        launch: Some(launch),
+        new_window: false,
+        problem: None,
     }
 }
 

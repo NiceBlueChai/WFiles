@@ -1432,6 +1432,17 @@ static EN: &[(&str, &str)] = &[
         "一次只能收藏一个项目",
         "Only one item can be favorited at a time",
     ),
+    // ---- 命令行 ----
+    // 这两句由 `main` 直接打到 stderr（还没开窗），但读它们的是人，
+    // 所以照样走这张表——英文的机器上不该冒出一句中文用法错误。
+    (
+        "--new-window 与 --new-tab 不能一起用：新开的那一扇窗里只有一栏，没有「另一栏」可加",
+        "--new-window and --new-tab can’t be used together: a new window has a single pane, so there is no “other pane” to add to",
+    ),
+    (
+        "用法：wfiles [路径] [--reveal] [--new-tab | --new-window] [--lang=代码]",
+        "Usage: wfiles [path] [--reveal] [--new-tab | --new-window] [--lang=code]",
+    ),
 ];
 
 /// 英文表里有没有漏掉不该出现的条目：译文等于原文（等于没翻），

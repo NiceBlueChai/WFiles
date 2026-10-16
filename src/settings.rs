@@ -166,6 +166,38 @@ impl Layout {
             && self.x < 20_000.
             && self.y < 20_000.
     }
+
+    /// 错开一小步：副窗（`--new-window` 自己开的那一扇）开在主窗旁边。
+    ///
+    /// 不错开的话两扇窗**一模一样地叠着**——用户按了 `--new-window`，
+    /// 屏幕上看起来"什么都没发生"。
+    ///
+    /// `visible` 是那块屏幕的可见范围 `(x, y, 宽, 高)`，也就是菜单栏、Dock、
+    /// 任务栏之外那块地方；`None` = 拿不到屏幕信息，那就只错开、不钳制。
+    /// 屏幕信息只有平台层知道，所以由调用方喂进来——这段算术于是是纯的，
+    /// 能在没有屏幕的测试里钉死。
+    pub fn cascaded(&self, visible: Option<(f32, f32, f32, f32)>) -> Self {
+        /// 错开多少。32 px 是系统文件管理器和多数应用的惯常步长
+        /// （差不多一个图标格），再小就看不出是两扇窗，再大就浪费地方。
+        const STEP: f32 = 32.;
+
+        let mut layout = Self {
+            x: self.x + STEP,
+            y: self.y + STEP,
+            ..*self
+        };
+        if let Some((vx, vy, vw, vh)) = visible {
+            // **装不下就贴回可见范围的左上**：主窗放大到占满屏幕时（最需要
+            // 再开一扇窗的情形），往右下错 32 px 会把新窗的下边缘和右边缘
+            // 推出屏幕。窗口比可见范围还大时 `max` 兜住负的上界——那种情况
+            // 只能贴着左上，至少标题栏还能点。
+            let max_x = (vx + vw - self.width).max(vx);
+            let max_y = (vy + vh - self.height).max(vy);
+            layout.x = layout.x.clamp(vx, max_x);
+            layout.y = layout.y.clamp(vy, max_y);
+        }
+        layout
+    }
 }
 
 fn default_terminal() -> String {
@@ -710,6 +742,79 @@ mod tests {
     #[test]
     fn default_is_auto() {
         assert_eq!(Settings::default().terminal, terminal::AUTO);
+    }
+
+    #[test]
+    fn a_secondary_window_steps_down_and_right() {
+        let base = Layout {
+            x: 100.,
+            y: 50.,
+            width: 800.,
+            height: 600.,
+        };
+        let stepped = base.cascaded(Some((0., 0., 1920., 1080.)));
+        assert_eq!(stepped.x, 132.);
+        assert_eq!(stepped.y, 82.);
+        assert_eq!(
+            (stepped.width, stepped.height),
+            (800., 600.),
+            "错开的只有位置——副窗跟主窗一样大"
+        );
+    }
+
+    #[test]
+    fn a_secondary_window_never_steps_off_screen() {
+        // 放大到占满整块屏的主窗（最需要再开一扇窗的情形）：往右下错 32 px
+        // 会把新窗的下边缘和右边缘推出屏幕。装不下就贴回可见范围的左上。
+        let full = Layout {
+            x: 0.,
+            y: 25.,
+            width: 1920.,
+            height: 1055.,
+        };
+        let stepped = full.cascaded(Some((0., 25., 1920., 1055.)));
+        assert_eq!((stepped.x, stepped.y), (0., 25.));
+    }
+
+    #[test]
+    fn a_secondary_window_larger_than_the_screen_still_has_a_visible_corner() {
+        // 比可见范围还大的主窗（外接屏拔了、手改了配置都有这种）。
+        // 不能钳出负坐标——那样标题栏就点不到了。
+        let huge = Layout {
+            x: 900.,
+            y: 700.,
+            width: 2400.,
+            height: 1400.,
+        };
+        let stepped = huge.cascaded(Some((0., 0., 1920., 1080.)));
+        assert_eq!((stepped.x, stepped.y), (0., 0.));
+    }
+
+    #[test]
+    fn a_secondary_window_on_the_second_screen_steps_within_it() {
+        // 外接屏在主屏左边时坐标是负的：钳制要按那块屏的可见范围来，
+        // 不是一律往 0 上贴（那样会把窗挪回主屏，用户找不着）。
+        let base = Layout {
+            x: -1800.,
+            y: 100.,
+            width: 800.,
+            height: 600.,
+        };
+        let stepped = base.cascaded(Some((-1920., 0., 1920., 1080.)));
+        assert_eq!(stepped.x, -1768.);
+    }
+
+    #[test]
+    fn without_screen_information_a_secondary_window_still_steps() {
+        // 拿不到屏幕信息（平台层没给）时只错开、不钳制：
+        // 至少不会两扇窗严丝合缝地叠着。
+        let base = Layout {
+            x: -100.,
+            y: 40.,
+            width: 800.,
+            height: 600.,
+        };
+        assert_eq!(base.cascaded(None).x, -68.);
     }
 
     #[test]
