@@ -3991,6 +3991,305 @@ fn a_new_tab_target_joins_the_rest_instead_of_replacing_it(cx: &mut TestAppConte
     );
 }
 
+// ---- 键盘焦点 ----
+//
+// 这一组钉的是同一件事：**焦点所属的元素一旦不在渲染树里，应用级快捷键就
+// 全哑**。gpui 找不着那个节点，就把按键派发到窗口根节点，而挂在应用根元素
+// 上的 `on_action` 一个都不在那条路径上——切栏、关栏、开标签、命令面板、
+// 分栏全按不出来。症状不报错、不留痕（"键盘突然不灵了"，点一下界面又好了），
+// 所以判据只能是"再按一个快捷键，看它生不生效"，不是去读界面上写了什么。
+
+/// 标签栏上有几栏。应用级快捷键还灵不灵，看它。
+fn tab_count(window: &mut gpui_kit::Window) -> usize {
+    (0usize..16)
+        .filter(|index| window.try_find(("tab", *index)).is_some())
+        .count()
+}
+
+/// 开一扇窗，会话里摆上几个临时目录，活动栏是第 `active` 个。
+fn open_tabs(
+    cx: &mut TestAppContext,
+    active: usize,
+    names: &[&str],
+) -> (
+    tempfile::TempDir,
+    SessionIsolation,
+    gpui_kit::WindowHandle<Root>,
+) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let mut tabs = Vec::new();
+    for name in names {
+        let dir = root.path().join(name);
+        std::fs::create_dir(&dir).expect("造目录");
+        tabs.push(dir);
+    }
+    let (isolation, handle) = open_session(
+        cx,
+        &Session {
+            tabs,
+            active,
+            split: None,
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+    (root, isolation, handle)
+}
+
+#[gpui_kit::test]
+fn the_shortcuts_survive_switching_tabs(cx: &mut TestAppContext) {
+    let (_root, _session, handle) = open_tabs(cx, 0, &["甲", "乙"]);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("ctrl-tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            tab_count(window),
+            3,
+            "切了标签之后 Cmd+T 该还灵——换掉的那一栏已经不在渲染树里，\
+             键盘得交给新那一栏"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_shortcuts_survive_closing_a_tab(cx: &mut TestAppContext) {
+    // 连着关两栏：第一次关掉的那一栏连着它的焦点句柄一起没了，
+    // 第二次还按得出来，才说明键盘当时有主。
+    let (_root, _session, handle) = open_tabs(cx, 1, &["甲", "乙", "丙"]);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 3);
+        window.press("cmd-w", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2);
+        window.press("cmd-w", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            tab_count(window),
+            1,
+            "关掉一栏之后 Cmd+W 该还灵——关掉的那一栏已经在渲染树外了"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_shortcuts_work_as_soon_as_the_window_opens(cx: &mut TestAppContext) {
+    // 会话里活动栏不是最后那一栏：开窗时每一栏建出来都会自己抓一次焦点，
+    // 抓错地方的话，用户刚打开就按不出快捷键。
+    let (_root, _session, handle) = open_tabs(cx, 0, &["甲", "乙", "丙"]);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 4, "刚开窗就该按得出 Cmd+T");
+    });
+}
+
+#[gpui_kit::test]
+fn the_shortcuts_survive_clicking_a_tab_in_the_tab_bar(cx: &mut TestAppContext) {
+    let (_root, _session, handle) = open_tabs(cx, 1, &["甲", "乙"]);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("tab", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 3, "点标签栏换了栏之后，快捷键该还灵");
+    });
+}
+
+#[gpui_kit::test]
+fn the_shortcuts_survive_closing_the_command_palette(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let (_session, handle) = open_in(cx, root.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            tab_count(window),
+            2,
+            "关掉命令面板之后 Cmd+T 该还灵——面板的输入框没了，键盘得有人接手"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_shortcuts_survive_closing_a_dialog(cx: &mut TestAppContext) {
+    // 甲：批量重命名（Cmd+Shift+R）→ Esc 关掉。
+    let dir = overlay_fixture();
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 1180.);
+    step(cx, handle, settle);
+    step(cx, handle, |window, cx| {
+        window.press("cmd-a", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-shift-r", cx);
+        settle(window, cx);
+    });
+    // 对话框是下一帧才挂上的（按下去只是个"要开"的事件），所以断言分两步：
+    // 不然这一步量到的可能还是空，下面的 Esc 就变成"关了个寂寞"。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_some(),
+            "Cmd+Shift+R 该开出批量重命名"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_none(),
+            "Esc 该关掉批量重命名"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-t", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2, "关掉批量重命名之后 Cmd+T 该还灵");
+    });
+
+    // 乙：重命名（F2）→ Esc 关掉。
+    let dir = overlay_fixture();
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 1180.);
+    step(cx, handle, settle);
+    step(cx, handle, |window, cx| {
+        window.press("down", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("f2", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_some(),
+            "F2 该开出重命名对话框"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_none(),
+            "Esc 该关掉重命名对话框"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-t", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2, "关掉重命名对话框之后 Cmd+T 该还灵");
+    });
+}
+
+#[gpui_kit::test]
+fn switching_tabs_leaves_the_keyboard_in_the_dialog(cx: &mut TestAppContext) {
+    // 反过来的那一条：对话框自己拿着键盘的时候换栏，键盘**不该**被抢走——
+    // 抢走了用户就没法继续在里面打字，连 Esc 都送不到对话框手上。
+    let dir = overlay_fixture();
+    let elsewhere = tempfile::tempdir().expect("临时目录");
+    std::fs::write(elsewhere.path().join("别处.txt"), "x").unwrap();
+    let (isolation, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![dir.path().to_path_buf(), elsewhere.path().to_path_buf()],
+            active: 0,
+            split: None,
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2);
+        window.press("down", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("f2", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_some(),
+            "按 F2 该开出重命名对话框"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("ctrl-tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 快捷键确实执行了（换栏那件事发生了）……
+        let saved = Session::load_from(&isolation.path().join("session.json")).expect("会话该落盘");
+        assert_eq!(saved.active, 1, "Ctrl+Tab 该换到另一栏");
+        // ……但键盘还在对话框手里。
+        assert!(
+            window.try_find("overlay-card").is_some(),
+            "换栏不该顺手把对话框弄没"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_none(),
+            "Esc 该还是对话框的——键盘被抢到窗格上的话，它根本收不到这个键"
+        );
+    });
+}
+
 /// 副窗**只读不写**：会话、窗口布局、别的目录的恢复现场都动不得。
 ///
 /// 这三样是"两扇窗"今天就会踩的三个文件：两扇各写一份 `session.json`

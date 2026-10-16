@@ -469,6 +469,13 @@ impl WFilesApp {
         // 这条要在 `saved_session` 之后：清扫要用 `self.tabs`，那已经是最终形态。
         app.sweep_restore(cx);
 
+        // 键盘交给活动的那一栏。上面每一栏建出来都会自己抓一次焦点，于是
+        // **最后建的那一栏**赢了下来——而活动栏不一定是它（会话里 `active`
+        // 常常在中间）。抓错地方的后果不是"多按一下"：焦点所属的那一栏不在
+        // 渲染树里，应用级快捷键会静默失效，用户看见的是"刚打开就按不出
+        // Cmd+W / Cmd+T"，点一下界面才好（见 `hand_keyboard_to_active_pane`）。
+        app.hand_keyboard_to_active_pane(window, cx);
+
         // 退出前再存一次，覆盖“最后一次导航还没来得及落盘”的窗口。
         app.quit_subscription = Some(cx.on_app_quit(|this, cx| {
             this.sync_session(cx);
@@ -1212,6 +1219,7 @@ impl WFilesApp {
             let home = Self::initial_dir();
             self.tabs[0].update(cx, |pane, cx| pane.reset_to(home, window, cx));
             self.active = 0;
+            self.hand_keyboard_to_active_pane(window, cx);
             self.sync_session(cx);
             cx.notify();
             return;
@@ -1242,11 +1250,42 @@ impl WFilesApp {
             self.focus_on_left = true;
             self.sync = false;
         }
+        // 关掉的那一栏连同它的实体一起没了，焦点留在它身上就是"没主"
+        // （见 `hand_keyboard_to_active_pane`）。
+        self.hand_keyboard_to_active_pane(window, cx);
         self.sync_session(cx);
         cx.notify();
     }
 
-    fn next_tab(&mut self, cx: &mut Context<Self>) {
+    /// 有没有"自己拿着键盘"的模态开着：命令面板与几个带输入框的对话框。
+    ///
+    /// 它们开着的期间换栏、关栏都不该把键盘抢回来——用户正在里面打字。
+    fn modal_open(&self) -> bool {
+        self.palette.is_some()
+            || self.prompt_input.is_some()
+            || self.bulk_inputs.is_some()
+            || self.connect.is_some()
+    }
+
+    /// 键盘交给当前那一栏。
+    ///
+    /// 这不是锦上添花，是**快捷键还能不能按出来的前提**：焦点所属的元素一旦
+    /// 不在渲染树里（切栏、关栏、浮层的输入框被放下），gpui 找不着它，就把按键
+    /// 派发到**窗口根节点**——挂在应用根元素上的 `on_action` 一个都不在那条路径
+    /// 上。于是切栏、关栏、开标签、命令面板、分栏……全按不出来，而且不报错、
+    /// 不留痕：用户只看见"键盘突然不灵了"，点一下界面又好了。
+    ///
+    /// 模态开着时不抢：那种时候键盘该留在用户正打字的那个框里。
+    /// 换栏/关栏走这里，关掉浮层的人（[`Self::close_palette`]、
+    /// [`Self::close_connect`]、[`Self::on_ops_event`]）也走这里。
+    fn hand_keyboard_to_active_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        self.tabs[self.active].update(cx, |pane, cx| pane.focus(window, cx));
+    }
+
+    fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() < 2 {
             return;
         }
@@ -1259,6 +1298,8 @@ impl WFilesApp {
             }
         }
         self.active = next;
+        // 键盘跟着走：换掉的那一栏下一帧就不在渲染树里了（见上）。
+        self.hand_keyboard_to_active_pane(window, cx);
         self.sync_session(cx);
         cx.notify();
     }
@@ -1523,6 +1564,9 @@ impl WFilesApp {
                 // 否则用户只能靠猜才知道密码去了哪。
                 self.secret_note = Some(format!("「{name}」的密码已存入系统钥匙串"));
                 self.connect = None;
+                // 连上就跳过去：跳过去之后键盘也该在那一栏上（对话框里的
+                // 输入框已经跟着关了）。
+                self.hand_keyboard_to_active_pane(window, cx);
                 self.open_remote(id.clone(), window, cx);
             }
             RemotesEvent::Failed(reason) => {
@@ -1635,8 +1679,11 @@ impl WFilesApp {
         cx.notify();
     }
 
-    fn close_connect(&mut self, cx: &mut Context<Self>) {
+    fn close_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.connect = None;
+        // 连接框里那几个输入框没了，键盘交给活动栏（见
+        // `hand_keyboard_to_active_pane`）。
+        self.hand_keyboard_to_active_pane(window, cx);
         cx.notify();
     }
 
@@ -2076,6 +2123,10 @@ impl WFilesApp {
                     }
                 } else {
                     self.prompt_input = None;
+                    // 输入框一放下键盘就没了主人：得有人接手，不然应用级
+                    // 快捷键会跟着哑掉（见 `hand_keyboard_to_active_pane`）。
+                    // 用户刚才不是敲了回车就是按了取消，接下来该能直接使键盘。
+                    self.hand_keyboard_to_active_pane(window, cx);
                 }
             }
             OpsEvent::BulkChanged { open } => {
@@ -2085,6 +2136,7 @@ impl WFilesApp {
                     }
                 } else {
                     self.bulk_inputs = None;
+                    self.hand_keyboard_to_active_pane(window, cx);
                 }
             }
         }
@@ -2167,7 +2219,7 @@ impl WFilesApp {
 
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
-            self.close_palette(cx);
+            self.close_palette(window, cx);
         } else {
             self.open_palette(window, cx);
         }
@@ -2237,9 +2289,13 @@ impl WFilesApp {
         cx.notify();
     }
 
-    fn close_palette(&mut self, cx: &mut Context<Self>) {
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = None;
         self.palette_input = None;
+        // 面板自己拿着键盘，关掉之后得有人接手：那个输入框已经没了，
+        // 键盘落在谁身上都不对——不接就是"应用级快捷键全哑"（见
+        // `hand_keyboard_to_active_pane`）。
+        self.hand_keyboard_to_active_pane(window, cx);
         cx.notify();
     }
 
@@ -2302,12 +2358,13 @@ impl WFilesApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_palette(cx);
+        self.close_palette(window, cx);
         match action {
             PaletteAction::GoTo(path) => self.navigate_active_tab(path, window, cx),
             PaletteAction::SwitchTab(index) => {
                 if index < self.tabs.len() {
                     self.active = index;
+                    self.hand_keyboard_to_active_pane(window, cx);
                     self.sync_session(cx);
                     cx.notify();
                 }
@@ -2352,7 +2409,7 @@ impl WFilesApp {
             }
             PaletteAction::NewTab => self.new_tab(window, cx),
             PaletteAction::CloseTab => self.close_tab(self.active, window, cx),
-            PaletteAction::NextTab => self.next_tab(cx),
+            PaletteAction::NextTab => self.next_tab(window, cx),
             PaletteAction::App(command) => match command {
                 AppCommand::ToggleSplit => self.toggle_split(window, cx),
                 AppCommand::SwapPane => self.focus_other(window, cx),
@@ -3308,14 +3365,14 @@ impl WFilesApp {
             .px_4()
             .max_h_full()
             .bg(cx.theme().overlay)
-            .on_click(cx.listener(|this, _, _, cx| this.close_palette(cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.close_palette(window, cx)))
             .child(card)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "up" => this.move_palette_selection(-1, cx),
                     "down" => this.move_palette_selection(1, cx),
                     "enter" => this.confirm_palette(window, cx),
-                    "escape" => this.close_palette(cx),
+                    "escape" => this.close_palette(window, cx),
                     _ => {}
                 }
             }))
@@ -3450,7 +3507,9 @@ impl WFilesApp {
                                 this.close_tab(index, window, cx)
                             })),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.focus_tab(index, cx)));
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.focus_tab(index, window, cx)),
+                    );
                 // 拖到某个标签上就是放进它打开的那个目录：
                 // 双栏时也能这么把东西送到另一栏去。
                 Self::drop_target(tab, path, cx)
@@ -3526,13 +3585,17 @@ impl WFilesApp {
 
     /// 点标签页：点的是另一栏就只挪焦点（两栏位置不动），
     /// 否则让这个标签顶替焦点那一栏。
-    fn focus_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn focus_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.split == Some(index) {
             self.focus_partner(cx);
+            // 换的是同屏的另一栏：焦点得跟着传到它身上，否则键盘留在
+            // 刚刚那一栏里（点标签却打不进字），见 `hand_keyboard_to_active_pane`。
+            self.hand_keyboard_to_active_pane(window, cx);
             return;
         }
         if index < self.tabs.len() {
             self.active = index;
+            self.hand_keyboard_to_active_pane(window, cx);
             self.sync_session(cx);
             cx.notify();
         }
@@ -4385,7 +4448,7 @@ impl WFilesApp {
         let cancel = Button::new("connect-cancel")
             .label(crate::i18n::tr(cx, "取消"))
             .ghost()
-            .on_click(cx.listener(|this, _, _, cx| this.close_connect(cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.close_connect(window, cx)))
             .into_any_element();
         let ok = Button::new("connect-ok")
             .label(crate::i18n::tr(cx, "连接"))
@@ -4400,7 +4463,7 @@ impl WFilesApp {
             cx,
             body.into_any_element(),
             h_flex().gap_2().child(cancel).child(ok).into_any_element(),
-            |this, _, cx| this.close_connect(cx),
+            |this, window, cx| this.close_connect(window, cx),
         )
     }
 
@@ -4694,7 +4757,7 @@ impl Render for WFilesApp {
                     this.close_tab(this.active, window, cx)
                 }),
             )
-            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.next_tab(window, cx)))
             .on_action(
                 cx.listener(|this, _: &TogglePalette, window, cx| this.toggle_palette(window, cx)),
             )
