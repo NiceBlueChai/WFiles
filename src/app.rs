@@ -277,6 +277,16 @@ pub struct WFilesApp {
     /// （筛选框、视图切换）整个画到屏幕外——看得见却点不到。给用户一个
     /// 收起侧栏的开关，是让窄窗口可用最省事的一步。
     sidebar_collapsed: bool,
+    /// 详情板（窗口右侧那一列 260 px 的预览）是否显示。
+    ///
+    /// 挂在**窗口**上而不是窗格上：面板看的是**焦点那一栏**的选中项，
+    /// 双栏时它只有一块（Explorer / Finder / Dolphin 都是这个结构）。
+    /// 挂在窗格里的话两栏各被切掉 260 px——实测每栏只剩 224 px，
+    /// 而工具栏那两行自己就要 292 px，内容直接画到面板底下。
+    ///
+    /// 默认显示；这一列不可收缩，窄窗口下靠这个开关还回去
+    /// （Cmd+Alt+O，或标签栏右端那颗按钮）。
+    details_shown: bool,
     /// 最近一次连上后，密码到底落在哪——必须让用户看得见，    /// 否则“密码明文躺在设置里”这种事没人会知道。
     secret_note: Option<String>,
 }
@@ -424,6 +434,7 @@ impl WFilesApp {
             connect: None,
             forget_armed: None,
             sidebar_collapsed: false,
+            details_shown: true,
             secret_note: None,
         };
 
@@ -447,14 +458,15 @@ impl WFilesApp {
             window,
             |this, _, event: &OpsEvent, window, cx| this.on_ops_event(event, window, cx),
         ));
-        for tab in &app.tabs {
+        for tab in app.tabs.clone() {
             app.subscriptions.push(cx.subscribe_in(
-                tab,
+                &tab,
                 window,
                 |this, pane, event: &PaneEvent, window, cx| {
                     this.on_pane_event(pane, event, window, cx);
                 },
             ));
+            app.follow_pane(&tab, cx);
         }
         // 远程：连上就跳过去，列完目录由窗格自己处理（`Remotes::entries`），
         // 这里只管"连上了 / 没连上 / 打开失败"这三件需要告诉用户的事。
@@ -1208,6 +1220,18 @@ impl WFilesApp {
                 this.on_pane_event(pane, event, window, cx);
             },
         ));
+        // 详情板的内容由窗格给（`WFilesApp::render_details`），而面板元素是
+        // 在**应用这一层**画的：窗格自己重画（换选中项、导航、切排序）时，
+        // 要是没人叫醒应用，gpui 只重画脏了的那一栏，面板就停在上一眼的
+        // 状态——不报错，症状是"在左栏选一个、切到右栏，右边还写着左栏那个"。
+        //
+        // 所以每加一栏都订阅一份：窗格一 notify，应用跟着重画。
+        // **这条线在集成测试里钉不住**：gpui-kit 的测试每一步交互前都调
+        // `Window::refresh()`（整窗无条件重画），面板每次量到都是新的。
+        // `ui_tests::the_details_panel_follows_the_focused_pane` 钉的是
+        // "面板画的是焦点那一栏的选中项"，不是这条订阅——删了这句它照样
+        // 全绿，真机上才露馅。别当它是冗余的。
+        self.follow_pane(&tab, cx);
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         if let Some(handle) = keyboard {
@@ -1327,20 +1351,45 @@ impl WFilesApp {
 
     /// 显示 / 隐藏详情板。
     ///
-    /// 只动**当前显示的那几栏**：双栏时两栏可能看的是不同的东西，
-    /// 一条命令把两边一起收掉会让另一栏的预览莫名其妙地消失。
+    /// 面板是**窗口级**的一块（看焦点那一栏的选中项），所以一次开关就是
+    /// 整个窗口的事——不再像以前那样逐栏翻转：那样双栏时"收起来"只收掉
+    /// 一半，另一半的预览莫名其妙地留着。
     fn toggle_details(&mut self, cx: &mut Context<Self>) {
-        for index in self.visible() {
-            self.tabs[index].update(cx, |pane, cx| {
-                pane.details_shown = !pane.details_shown;
-                cx.notify();
-            });
-        }
+        self.details_shown = !self.details_shown;
+        cx.notify();
     }
 
     /// 焦点那一栏此刻有没有详情板——命令面板要拿它决定条目写"收起"还是"展开"。
-    fn details_shown_in_active(&self, cx: &Context<Self>) -> bool {
-        self.tabs[self.active].read(cx).details_shown
+    fn details_shown_in_active(&self, _: &Context<Self>) -> bool {
+        self.details_shown
+    }
+
+    /// 让窗口跟着某一栏的重画走。
+    ///
+    /// 详情板挂在窗口上，内容却来自**焦点那一栏**（选中项、目录、标记）：
+    /// 窗格自己重画（换选中项、重新列目录）不会碰窗口这一层，面板就会
+    /// 停在上一眼的状态——症状是"选了另一个文件，右边还是上一个"。
+    ///
+    /// 观察整栏而不是让窗格发一条"选中项变了"的事件：窗格里有七八处会改
+    /// 选中项（点行、全选、方向键、撤销、刷新…），靠"记得在每个改动处通知"
+    /// 必然漏一处，而漏掉的那处不报错、只是面板不刷新。
+    ///
+    /// **这条订阅在集成测试里钉不住**：gpui-kit 的测试每一步交互前都
+    /// `Window::refresh()`（整窗无条件重画，见 `gpui::Window::refresh`），
+    /// 面板每次量到都是新的，删掉这句测试照样全绿——它是给真机用的。
+    /// `ui_tests::the_details_panel_follows_the_focused_pane` 钉的是
+    /// "面板画的是焦点那一栏的选中项"，不是这根线。
+    fn follow_pane(&mut self, tab: &Entity<Pane>, cx: &mut Context<Self>) {
+        self.subscriptions
+            .push(cx.observe(tab, |_, _, cx| cx.notify()));
+    }
+
+    /// 窗口右侧那块详情板：画的是**焦点那一栏**的选中项。
+    ///
+    /// 元素本身由窗格渲染（状态、缓存都在那边），位置归窗口——它跟侧栏
+    /// 一样是"围在窗格外面"的东西，不是哪个窗格的内容。
+    fn render_details(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.tabs[self.active].update(cx, |pane, cx| pane.render_details(cx).into_any_element())
     }
 
     // ---- 双栏 ----
@@ -3555,6 +3604,23 @@ impl WFilesApp {
             )
             .child(div().flex_1())
             .child(self.render_split_buttons(cx))
+            // 详情板开关。面板是窗口级的一块（看焦点那一栏），开关也就放在
+            // 窗口级的这一行，跟分栏、命令面板作伴。它是从窗格底部那排
+            // **移过来的**：一颗按钮管整扇窗的事，摆在某个窗格里本身就是误导，
+            // 而且窄窗格里那一排每颗 24 px 都是要命的宽度。
+            .child(
+                Button::new("toggle-details")
+                    .ghost()
+                    .small()
+                    .icon(IconName::PanelRight)
+                    .selected(self.details_shown)
+                    .tooltip(if self.details_shown {
+                        crate::i18n::tr(cx, "收起详情板（Cmd+Alt+O）")
+                    } else {
+                        crate::i18n::tr(cx, "展开详情板（Cmd+Alt+O）")
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx))),
+            )
             .child(
                 Button::new("open-palette")
                     .ghost()
@@ -4797,7 +4863,17 @@ impl Render for WFilesApp {
                     // 而工具栏上一排按钮还在屏幕右边点不到。
                     .min_w_0()
                     .child(self.render_sidebar(cx))
-                    .child(self.render_panes(cx)),
+                    .child(self.render_panes(cx))
+                    // 详情板与侧栏对称：围在窗格**外面**的一列，看焦点那一栏的
+                    // 选中项。挂在窗格里面是这一轮修掉的结构问题——双栏时
+                    // 两栏各出面板，每栏被切掉 260 px，装不下的内容就画到
+                    // 面板底下去。
+                    //
+                    // 收起来时整块不画，不是画成 0 宽：留一条 0 宽的分隔线
+                    // 和一个看不见的边框，看起来像"界面坏了"。
+                    .when(self.details_shown, |this| {
+                        this.child(self.render_details(cx))
+                    }),
             );
         // 终端面板压在窗格下面、状态栏上面：它属于"当前窗口"而不是某个窗格，
         // 所以不去动窗格那一栏的布局。

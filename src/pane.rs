@@ -52,6 +52,112 @@ const COL_META: f32 = 120.;
 const COL_MODIFIED: f32 = 130.;
 const COL_KIND: f32 = 90.;
 
+/// 名称列最窄也要留这么多。再窄就只剩一个「…」，
+/// 与其留着占位不如把那点宽度还给别的列。
+const NAME_COL_MIN: f32 = 80.;
+/// 列表行与表头的两侧内边距（`px_3`）和列间距（`gap_3`）。
+///
+/// 抽成常量是因为**表头与行必须按同一份数算**：两处各写一遍 24/12，
+/// 改一处漏一处就是"表头的「大小」压在行的文件名上"。
+const ROW_PADDING: f32 = 24.;
+const ROW_GAP: f32 = 12.;
+
+/// 窗格窄到装不下筛选框时，先把筛选框整块收起来。
+///
+/// 数法是实测：两侧内边距 24 + 三颗导航按钮 72 + 刷新 24 + 筛选框自己的
+/// 硬底 96 + 5 个间隙 40 = 256 px，再加上面包屑压成一条「…」也要的约 36 px。
+/// 它是这一行里唯一"不要也能导航"的东西——面包屑是"我在哪"，
+/// 三颗导航是"去哪儿"，都动不得。比这更窄时整块不画，好过被裁掉半边、
+/// 让人以为筛选框坏了。
+const ADDRESS_BAR_FILTER_AT: f32 = 320.;
+
+/// 命令栏装得下「视图切换」三颗按钮所需的窗格宽度。
+///
+/// 四颗操作 96 + 更多 24 + 三颗视图 72 + 8 个间隙 64 + 两侧内边距 24 = 280。
+/// 装不下就让视图按钮整批让位：它们按 Ctrl+1/2/3 也能到，而
+/// "新建 / 拷贝 / 剪切 / 粘贴"这四颗没有别的去处，不许动。
+const COMMAND_BAR_VIEWS_AT: f32 = 280.;
+/// 命令栏再装下「隐藏开关」所需的宽度（比上面多一颗按钮与一个间隙）。
+const COMMAND_BAR_EYE_AT: f32 = 312.;
+
+/// 窄窗格里列表还剩哪几列。
+///
+/// 定成纯函数是因为它要能被单测钉住：**表头与行必须做同一个判断**，
+/// 两边各写一份"够不够宽"迟早会错开一格，而那种坏法的症状是
+/// "表头的「大小」压在行的文件名上"——不报错，只是看着别扭。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ListColumns {
+    pub(crate) meta: bool,
+    pub(crate) size: bool,
+    pub(crate) modified: bool,
+    pub(crate) kind: bool,
+}
+
+impl ListColumns {
+    /// 这组列摆下来至少要多少宽度（名称列按最窄的 [`NAME_COL_MIN`] 算）。
+    fn needed(self) -> f32 {
+        // 图标槽 20 + 色点槽 8 + 名称列，加上它们之间的两个间隙。
+        let mut width = 20. + 8. + NAME_COL_MIN;
+        let mut gaps = 2.;
+        for (shown, column) in [
+            (self.meta, COL_META),
+            (self.size, COL_SIZE),
+            (self.modified, COL_MODIFIED),
+            (self.kind, COL_KIND),
+        ] {
+            if shown {
+                width += column;
+                gaps += 1.;
+            }
+        }
+        width + gaps * ROW_GAP + ROW_PADDING
+    }
+
+    /// 这个宽度下能留下哪几列。
+    ///
+    /// 让位顺序是"最不常用的先走"：类型（图标已经说了大半）→ 修改时间 →
+    /// 用户自己开的元数据列 → 大小。名称与大小是任何文件管理器最窄时
+    /// 也要留的两列，所以大小最后才动，只剩名称也照画。
+    pub(crate) fn for_width(width: Pixels, has_meta: bool) -> Self {
+        let ladders = [
+            Self {
+                meta: has_meta,
+                size: true,
+                modified: true,
+                kind: true,
+            },
+            Self {
+                meta: has_meta,
+                size: true,
+                modified: true,
+                kind: false,
+            },
+            Self {
+                meta: has_meta,
+                size: true,
+                modified: false,
+                kind: false,
+            },
+            Self {
+                meta: false,
+                size: true,
+                modified: false,
+                kind: false,
+            },
+            Self {
+                meta: false,
+                size: false,
+                modified: false,
+                kind: false,
+            },
+        ];
+        ladders
+            .into_iter()
+            .find(|columns| columns.needed() <= width.as_f32())
+            .unwrap_or(ladders[4])
+    }
+}
+
 /// 面包屑最多同时显示几段路径（不含那个「…」）。
 ///
 /// 3 是量出来的，不是凑的：520 px 窗口收掉两侧之后容器只有 216 px，扣掉
@@ -587,12 +693,6 @@ pub struct Pane {
     capturing: Option<PaneCommand>,
     /// 录按键浮层的焦点；录的时候焦点必须在这上面才收得到键。
     capture_focus: FocusHandle,
-    /// 详情板（右侧那列预览）是否显示。
-    ///
-    /// 默认**显示**，但宽度可以收：这一列写死 260px 不可收缩，而工具栏
-    /// 上一排按钮要 908px。窗口窄的时候两侧固定边框就把内容挤没了，
-    /// 而详情板上的东西（预览、大小、EXIF）在快速浏览时并不是非看不可。
-    pub(crate) details_shown: bool,
     subscriptions: Vec<Subscription>,
 }
 
@@ -652,7 +752,6 @@ impl Pane {
             archive_busy: None,
             capturing: None,
             capture_focus: cx.focus_handle(),
-            details_shown: true,
             subscriptions: Vec::new(),
         };
 
@@ -2482,30 +2581,41 @@ impl Pane {
             //
             // 宽度写在槽上而不是 `Input` 上：`Input` 是固定宽度时它自己
             // 就是布局的硬底，槽再怎么缩也缩不动它。
-            .child(
-                div()
-                    .id("filter-slot")
-                    .test_support()
-                    .min_w(px(96.))
-                    .max_w(px(200.))
-                    .flex_shrink(1.)
-                    .child(
-                        Input::new(&self.filter)
-                            .prefix(Icon::new(IconName::Search).size_4())
-                            .cleanable(true)
-                            .min_w(px(96.))
-                            .w_full(),
-                    ),
-            )
+            //
+            // 窄窗格里它整块让位（见 [`ADDRESS_BAR_FILTER_AT`]）：它是这一行
+            // 里唯一"不要也能导航"的东西，而它自己那 96 px 的硬底也换不来
+            // 别的余地。宽度是上一帧量到的 `known_width`，刚开的那一帧会
+            // 先按窄的算，下一帧就到位。
+            .when(self.known_width >= px(ADDRESS_BAR_FILTER_AT), |this| {
+                this.child(
+                    div()
+                        .id("filter-slot")
+                        .test_support()
+                        .min_w(px(96.))
+                        .max_w(px(200.))
+                        .flex_shrink(1.)
+                        .child(
+                            Input::new(&self.filter)
+                                .prefix(Icon::new(IconName::Search).size_4())
+                                .cleanable(true)
+                                .min_w(px(96.))
+                                .w_full(),
+                        ),
+                )
+            })
     }
 
-    /// 第二行：文件操作 + 「更多」+ 视图切换 + 详情板开关。
+    /// 第二行：文件操作 + 「更多」+ 视图切换 + 隐藏开关。
     ///
-    /// 这一行**不做任何横向压缩**：它最宽也只有 216 px，而地址栏行已经
-    /// 把面包屑能压的都压掉了。不加 `overflow_x_scroll`——加了就是"这里
-    /// 迟早会溢出"的自我承认，而实测它在任何窗口宽度下都不溢出。
+    /// 这一行**不做任何横向压缩**，但装不下时**整颗按钮让位**：窄窗格
+    /// （双栏 + 两侧固定边框都开着）里这一排比窗格还宽，硬留着的按钮会被
+    /// 裁掉半边、点不到。让位的顺序见 [`COMMAND_BAR_VIEWS_AT`] 与
+    /// [`COMMAND_BAR_EYE_AT`]——让掉的两样都另有门可走：视图有 Ctrl+1/2/3、
+    /// 隐藏项有 Cmd+Shift+.（两样在命令面板里也都有），而文件操作那四颗
+    /// 没有别的去处，不许动。**「更多」菜单里没有这两样**，别指望它兜底。
     fn render_command_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+        let width = self.known_width;
+        let mut bar = h_flex()
             .id("command-bar")
             .test_support()
             .h(px(40.))
@@ -2513,16 +2623,19 @@ impl Pane {
             .gap_2()
             .children(self.render_file_ops(cx))
             .child(self.render_more_menu(cx))
-            .child(div().flex_1())
-            .children(self.render_view_buttons(cx))
-            // 隐藏开关紧挨着视图按钮：两个都是"怎么看这个目录"，
-            // 不改变任何文件，也不影响别的窗格。放在「更多」里也有一份，
-            // 那是给已经习惯去菜单里翻的人留的。
-            //
-            // 外面套一层 div 只为挂无障碍名：`Button` 没有 `aria_label`
-            // 方法（只有 `Div` 有），而它的 tooltip **不进快照**——
-            // 没有这层的话，读屏软件念不出这颗按钮，测试也读不到它。
-            .child({
+            .child(div().flex_1());
+        if width >= px(COMMAND_BAR_VIEWS_AT) {
+            bar = bar.children(self.render_view_buttons(cx));
+        }
+        // 隐藏开关紧挨着视图按钮：两个都是"怎么看这个目录"，
+        // 不改变任何文件，也不影响别的窗格。它被让掉时另有 Cmd+Shift+.
+        // 与命令面板可走——**不在「更多」菜单里**。
+        //
+        // 外面套一层 div 只为挂无障碍名：`Button` 没有 `aria_label`
+        // 方法（只有 `Div` 有），而它的 tooltip **不进快照**——
+        // 没有这层的话，读屏软件念不出这颗按钮，测试也读不到它。
+        if width >= px(COMMAND_BAR_EYE_AT) {
+            bar = bar.child({
                 let action = self.hidden_switch_title(cx);
                 div()
                     .id("toggle-hidden-label")
@@ -2545,23 +2658,9 @@ impl Pane {
                             ))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_hidden(cx))),
                     )
-            })
-            .child(
-                Button::new("toggle-details")
-                    .icon(IconName::PanelRight)
-                    .ghost()
-                    .small()
-                    .selected(self.details_shown)
-                    .tooltip(if self.details_shown {
-                        crate::i18n::tr(cx, "收起详情板（Cmd+Alt+O）")
-                    } else {
-                        crate::i18n::tr(cx, "展开详情板（Cmd+Alt+O）")
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.details_shown = !this.details_shown;
-                        cx.notify();
-                    })),
-            )
+            });
+        }
+        bar
     }
 
     /// 视图切换：每种视图一颗按钮，当前那种亮着。
@@ -2982,8 +3081,20 @@ impl Pane {
             .children(children)
     }
 
+    /// 这一栏现在的宽度够摆哪几列。
+    ///
+    /// **一帧算一次，表头与每一行共用**：行里再算一遍就是每可见行一次
+    /// `meta_label` 加一遍算术，而判定只跟窗格宽度有关。
+    fn list_columns(&mut self, cx: &mut Context<Self>) -> ListColumns {
+        let has_meta = self.meta_label(cx).is_some();
+        ListColumns::for_width(self.known_width, has_meta)
+    }
+
+    /// 列表表头。列按 [`ListColumns`] 逐级降级——**与行用同一份判定**，
+    /// 不然表头写着「大小」而下面几行的那一格已经收起来了。
     fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+        let columns = self.list_columns(cx);
+        let mut header = h_flex()
             .h(px(32.))
             .px_3()
             .gap_3()
@@ -2997,8 +3108,10 @@ impl Pane {
             // 否则"名称"三个字比下面所有行的文件名右移 20 px。
             .child(div().w(px(20.)).flex_shrink_0())
             .child(div().w(px(8.)).flex_shrink_0())
-            .child(self.header_cell(0, SortKey::Name, crate::i18n::tr(cx, "名称"), None, cx))
-            .when_some(self.meta_label(cx), |this, label| {
+            .child(self.header_cell(0, SortKey::Name, crate::i18n::tr(cx, "名称"), None, cx));
+
+        if columns.meta {
+            header = header.when_some(self.meta_label(cx), |this, label| {
                 this.child(
                     div()
                         .w(px(COL_META))
@@ -3006,28 +3119,36 @@ impl Pane {
                         .text_color(cx.theme().muted_foreground)
                         .child(label),
                 )
-            })
-            .child(self.header_cell(
+            });
+        }
+        if columns.size {
+            header = header.child(self.header_cell(
                 1,
                 SortKey::Size,
                 crate::i18n::tr(cx, "大小"),
                 Some(COL_SIZE),
                 cx,
-            ))
-            .child(self.header_cell(
+            ));
+        }
+        if columns.modified {
+            header = header.child(self.header_cell(
                 2,
                 SortKey::Modified,
                 crate::i18n::tr(cx, "修改时间"),
                 Some(COL_MODIFIED),
                 cx,
-            ))
-            .child(self.header_cell(
+            ));
+        }
+        if columns.kind {
+            header = header.child(self.header_cell(
                 3,
                 SortKey::Kind,
                 crate::i18n::tr(cx, "类型"),
                 Some(COL_KIND),
                 cx,
-            ))
+            ));
+        }
+        header
     }
 
     /// `width` 为 `None` 时这一列吃掉剩余宽度（名称列）。
@@ -3082,7 +3203,12 @@ impl Pane {
         }
     }
 
-    fn render_row(&mut self, position: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(
+        &mut self,
+        position: usize,
+        columns: ListColumns,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(entry) = self.listing.visible_entry(position) else {
             return ListItem::new(("row", position))
                 .w_full()
@@ -3117,6 +3243,16 @@ impl Pane {
             None
         } else {
             self.thumbnail_of(&thumbnail_path, cx)
+        };
+        // 元数据那一格写什么：**列没开就整格不画**（判定与表头同一份）。
+        // 这里问出来的 `None` 还另有含义——"这一项没有这个值"，
+        // 那种情况下格子留着空（见下面 `.when_some` 那行注释）。
+        // 位置在 `entry` 的最后一处用处之后：问元数据要 `&mut self`，
+        // 而 `entry` 还借着 `self.listing`。
+        let meta_text = if columns.meta {
+            self.meta_text(&path, is_dir, cx)
+        } else {
+            None
         };
 
         let dragged = self.dragged_paths(&path);
@@ -3192,7 +3328,7 @@ impl Pane {
                     // **之前**，所以量它自己得不到"名字从哪儿起排"。要量起排位置
                     // 就量色点槽——它紧挨着名字，两者左边缘之差是固定的 12 px。
                     .child(div().flex_1().min_w_0().truncate().child(name))
-                    .when_some(self.meta_text(&path, is_dir, cx), |this, text| {
+                    .when_some(meta_text, |this, text| {
                         // 整列常驻、里面可以空：不然每行少一个格子会左右跳。
                         this.child(
                             div()
@@ -3207,31 +3343,37 @@ impl Pane {
                                 .child(text),
                         )
                     })
-                    .child(
-                        div()
-                            .w(px(COL_SIZE))
-                            .flex_shrink_0()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(size_text),
-                    )
-                    .child(
-                        div()
-                            .w(px(COL_MODIFIED))
-                            .flex_shrink_0()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(modified_text),
-                    )
-                    .child(
-                        div()
-                            .w(px(COL_KIND))
-                            .flex_shrink_0()
-                            .text_sm()
-                            .truncate()
-                            .text_color(muted)
-                            .child(kind),
-                    ),
+                    .when(columns.size, |this| {
+                        this.child(
+                            div()
+                                .w(px(COL_SIZE))
+                                .flex_shrink_0()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(size_text),
+                        )
+                    })
+                    .when(columns.modified, |this| {
+                        this.child(
+                            div()
+                                .w(px(COL_MODIFIED))
+                                .flex_shrink_0()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(modified_text),
+                        )
+                    })
+                    .when(columns.kind, |this| {
+                        this.child(
+                            div()
+                                .w(px(COL_KIND))
+                                .flex_shrink_0()
+                                .text_sm()
+                                .truncate()
+                                .text_color(muted)
+                                .child(kind),
+                        )
+                    }),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -3275,6 +3417,9 @@ impl Pane {
         }
 
         let row_sizes = self.row_sizes.clone();
+        // 列宽判定一帧算一次，行与表头共用（闭包要 `'static`，
+        // 所以 `move` 进去；`ListColumns` 是 `Copy`，不含引用）。
+        let columns = self.list_columns(cx);
         let list = v_flex()
             .id("file-list")
             // 让集成测试能一眼看出"现在是列表还是网格"，顺带给读屏软件报一声。
@@ -3288,9 +3433,9 @@ impl Pane {
                     cx.entity().clone(),
                     "rows",
                     row_sizes,
-                    |pane, visible_range, _, cx| {
+                    move |pane, visible_range, _, cx| {
                         visible_range
-                            .map(|position| pane.render_row(position, cx))
+                            .map(|position| pane.render_row(position, columns, cx))
                             .collect()
                     },
                 )
@@ -4175,7 +4320,17 @@ impl Pane {
             .child(self.render_status_bar(cx))
     }
 
-    fn render_details(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 详情板（那一列 260 px 的预览）。
+    ///
+    /// **由窗口渲染**（`WFilesApp::render_details`），不挂在这个窗格的
+    /// 布局里：双栏时两栏各挂一块，等于每栏被切掉 260 px（实测每栏只剩
+    /// 224 px，而工具栏那两行要 292 px），而且"哪一栏被切"还是个说不清
+    /// 的问题——详情板看的是**焦点那一栏**的选中项，它属于窗口，
+    /// 跟侧栏一样。
+    ///
+    /// 内容仍然读这里的状态（选中项、目录、标记），所以窗口那边必须
+    /// 跟着这一栏的重画走（`App::follow_pane`）。
+    pub(crate) fn render_details(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self
             .selection
             .single()
@@ -4846,14 +5001,20 @@ impl Render for Pane {
                     .h_full()
                     .flex_1()
                     .min_w_0()
+                    // 装不下就**收住**：GPUI 默认不裁子元素，而这一列里的
+                    // 工具栏与列表列都有固定宽度的硬底（按钮、100/130/90 的
+                    // 列宽），窗格被压窄时它们会画到盒子外面去——详情板
+                    // 就在右边，压上去正好把面板盖花（实测筛选框右端越过
+                    // 主列右端 37 px，详情板的「详细信息」标题被压在下面）。
+                    //
+                    // 裁在这里不碰浮层：下拉菜单与右键菜单走 gpui 的
+                    // `deferred`，那是在窗口层画的、不继承这里的裁剪
+                    //（见 gpui-component 的 `popup_menu.rs`）；Quick Look /
+                    // 搜索 / 分析那几个浮层是这一列的**兄弟**，不在范围内。
+                    .overflow_hidden()
                     .child(self.render_toolbar(cx))
                     .child(self.render_body(cx)),
             );
-        // 详情板收起来时**整块不画**，而不是画成 0 宽：留着一条
-        // 0 宽的分隔线和一个看不见的边框，看起来像"界面坏了"。
-        if self.details_shown {
-            root = root.child(self.render_details(cx));
-        }
 
         if self.archive_view.is_some() {
             root = root.child(self.render_archive(cx));
@@ -4986,8 +5147,66 @@ fn detail_row(key: &'static str, label: String, value: String, cx: &App) -> impl
 #[cfg(test)]
 mod tests {
     use crate::model::{FileEntry, Listing, Selection};
-    use crate::pane::{MultiSelectionSummary, Pane};
+    use crate::pane::{ListColumns, MultiSelectionSummary, Pane};
     use std::path::PathBuf;
+
+    /// 列宽降级的顺序：类型 → 修改时间 → 大小，名称与大小留到最后。
+    ///
+    /// 这条盯的是**表头与行共用一份判定**这件事的另一半：判定本身
+    /// （`needed` 那几行算术）不开窗口就能测，而它是"表头写着「大小」、
+    /// 行里却把那格收起来了"这类错位的唯一来源。
+    #[test]
+    fn a_narrow_list_drops_columns_from_the_least_useful() {
+        use gpui_kit::px;
+
+        let wide = ListColumns::for_width(px(600.), false);
+        assert!(
+            wide.size && wide.modified && wide.kind,
+            "600 px 该摆得下三列：{wide:?}"
+        );
+
+        let medium = ListColumns::for_width(px(500.), false);
+        assert!(
+            !medium.kind && medium.modified && medium.size,
+            "500 px 该先让类型走：{medium:?}"
+        );
+
+        let narrow = ListColumns::for_width(px(300.), false);
+        assert!(
+            !narrow.modified && narrow.size,
+            "300 px 该再让修改时间走、把大小留下：{narrow:?}"
+        );
+
+        let tiny = ListColumns::for_width(px(200.), false);
+        assert!(
+            !tiny.size && !tiny.modified && !tiny.kind,
+            "200 px 只剩名称列（表头与行都退回第一列）：{tiny:?}"
+        );
+    }
+
+    /// 可选的元数据列也要能让位——它是"加出来的"那一列。
+    #[test]
+    fn the_optional_meta_column_yields_to_the_built_in_ones() {
+        use gpui_kit::px;
+
+        let roomy = ListColumns::for_width(px(700.), true);
+        assert!(
+            roomy.meta && roomy.size && roomy.modified && roomy.kind,
+            "700 px 该四列俱全：{roomy:?}"
+        );
+
+        let tight = ListColumns::for_width(px(430.), true);
+        assert!(
+            tight.meta && tight.size && !tight.modified && !tight.kind,
+            "430 px 该保元数据 + 大小，先让修改时间与类型：{tight:?}"
+        );
+
+        let narrower = ListColumns::for_width(px(300.), true);
+        assert!(
+            !narrower.meta && narrower.size,
+            "300 px 元数据列也让位，大小还在：{narrower:?}"
+        );
+    }
 
     /// 一个装着远程文件的列表：路径按 `remote://连接 id/服务器上路径` 拼。
     ///

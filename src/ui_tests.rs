@@ -277,6 +277,23 @@ fn open_session(
     (isolation, handle)
 }
 
+/// [`open_session`] 但指定窗口宽度。
+///
+/// 同 [`open_in_at_width`]：`open_app` 里宽度写死 1180，拿它去"测三种窗口
+/// 宽度"，三次量到的是同一个窗口——测试全绿而缺陷照旧。
+fn open_session_at_width(
+    cx: &mut TestAppContext,
+    session: &Session,
+    width: f32,
+) -> (SessionIsolation, gpui_kit::WindowHandle<Root>) {
+    let isolation = isolate_session();
+    session
+        .save_to(&isolation.path().join("session.json"))
+        .expect("写测试会话");
+    let handle = open_app_of_width(cx, width).0;
+    (isolation, handle)
+}
+
 /// 某一栏里前几行的名字；两栏同屏时元素 id 是重复的，必须带范围查。
 fn row_names_in(window: &mut gpui_kit::Window, slot: usize) -> Vec<String> {
     let mut names = Vec::new();
@@ -311,6 +328,69 @@ fn slot_label(window: &mut gpui_kit::Window, slot: usize) -> String {
     window
         .try_find(("pane-slot", slot))
         .map(|row| row.label().unwrap_or_default().to_string())
+        .unwrap_or_default()
+}
+
+/// 某一栏的盒子（双栏才有 `pane-slot` 那层壳；单栏直接是窗格自己）。
+fn pane_box(window: &mut gpui_kit::Window, slot: usize) -> Bounds<Pixels> {
+    window
+        .try_find(("pane-slot", slot))
+        .expect("量布局先要有栏位（单栏时没有 pane-slot 这层壳，双栏才有）")
+        .bounds()
+}
+
+/// 某一栏的右边缘。
+fn pane_right(window: &mut gpui_kit::Window, slot: usize) -> Pixels {
+    let bounds = pane_box(window, slot);
+    bounds.origin.x + bounds.size.width
+}
+
+/// 某个元素在指定那一栏里的盒子；**没画**（被降级掉了）才是 `None`。
+///
+/// 裁剪不影响它：GPUI 只裁绘制，元素照样在树里、量得到——这正是溢出能被
+/// 抓住的原因（内容画到栏外了，右边缘那条判据就红）。被降级的那些是
+/// **整格不画**，所以查不到，两者分得开。
+/// 两栏同屏时元素 id 是重复的，所以必须带栏号查（同 [`row_names_in`]）。
+fn in_pane(
+    window: &mut gpui_kit::Window,
+    slot: usize,
+    id: impl Into<gpui_kit::ElementId>,
+) -> Option<Bounds<Pixels>> {
+    window
+        .within(("pane-slot", slot))
+        .try_find(id)
+        .map(|element| element.bounds())
+}
+
+/// 某个元素右边缘越过限位多少 px；这个元素没画（降级掉了）算 0。
+fn right_over(
+    window: &mut gpui_kit::Window,
+    slot: usize,
+    id: impl Into<gpui_kit::ElementId>,
+    limit: Pixels,
+) -> f32 {
+    in_pane(window, slot, id)
+        .map(|bounds| (bounds.origin.x + bounds.size.width - limit).as_f32())
+        .unwrap_or(0.)
+}
+
+/// 表头此刻**画了**哪几列（按 `("header", 序号)` 在不在）。
+///
+/// [`ListColumns`] 的降级是"整格不画"，所以"在不在"就是降级判定本身。
+/// 画了但被栏裁掉的元素**仍然算"画了"**——那说明该降级的地方没降级，
+/// 这一条会红（红检时正是这样抓到的）。
+fn header_columns(window: &mut gpui_kit::Window, slot: usize) -> Vec<usize> {
+    let scope = window.within(("pane-slot", slot));
+    (0usize..4)
+        .filter(|&index| scope.try_find(("header", index)).is_some())
+        .collect()
+}
+
+/// 详情板里那个文件名；没有选中项时是空串。
+fn detail_name(window: &mut gpui_kit::Window) -> String {
+    window
+        .try_find("detail-name")
+        .and_then(|element| element.label().map(|label| label.to_string()))
         .unwrap_or_default()
 }
 
@@ -5174,6 +5254,276 @@ fn collapsing_the_details_panel_removes_it_entirely(cx: &mut TestAppContext) {
         "点了收起之后详情板还在（宽 {} px）——要么没收，要么收成了 0 宽的壳",
         hidden.map(|b| b.size.width).unwrap_or(px(0.)),
     );
+}
+
+/// 详情板与窗格**不许重叠**，双栏时也一样。
+///
+/// 这是用户报上来的那条：双栏 + 详情板开着时，「详细信息」的标题被筛选框
+/// 压住。根因是面板原来挂在**窗格里面**——每栏 484 px 被切掉 260 px 之后
+/// 主列只剩 224 px，而地址栏那一行自己就要 292 px、列表表头要 512 px，
+/// 多出来的部分画到了面板上（GPUI 默认不裁子元素，面板又是透明的，
+/// 底下的字照样看得见）。
+///
+/// 现在的结构是"侧栏 | 窗格 | 详情板"三块并排：面板是窗格的**兄弟**。
+/// 判据两条：面板左边缘不早于最后一栏的右边缘（1180 / 900 / 520 三种宽度
+/// 都量）；每一栏自己的子元素都收在自己栏里——这条只在 900 px 以上量，
+/// 520 px 的双栏每栏只剩 24.5 px，装不下是结构事实。
+#[gpui_kit::test]
+fn the_details_panel_never_overlaps_a_pane(cx: &mut TestAppContext) {
+    for width in [1180.0f32, 900.0, 520.0] {
+        let dir = tempfile::tempdir().expect("临时目录");
+        for i in 0..30 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
+        }
+        let (_session, handle) = open_session_at_width(
+            cx,
+            &Session {
+                tabs: vec![dir.path().to_path_buf(), dir.path().to_path_buf()],
+                active: 0,
+                split: Some(1),
+                focus_on_left: true,
+                sync: false,
+            },
+            width,
+        );
+        step(cx, handle, settle);
+
+        step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            let panel = window.try_find("details-panel").expect("详情板").bounds();
+            assert!(
+                panel.size.width >= px(200.),
+                "窗口 {width}：详情板只剩 {} px 宽——它被挤扁了",
+                panel.size.width,
+            );
+            for slot in 0usize..2 {
+                let limit = pane_right(window, slot);
+                assert!(
+                    panel.origin.x >= limit - px(1.),
+                    "窗口 {width}：详情板左边缘 x={} 压在第 {slot} 栏（右边缘 x={limit}）上\
+                     ——面板该是窗格的兄弟，不是挂在窗格里的一块",
+                    panel.origin.x,
+                );
+                // 栏里的东西一件都不许伸进面板那一列：用户报上来的正是这个
+                // （双栏时筛选框伸进去 37 px，把「详细信息」的标题压在下面）。
+                //
+                // 只在 900 px 以上量这一条：520 px 的双栏每栏只剩 24.5 px，
+                // "栏内装得下"本身做不到（命令栏一排按钮就要 184 px），
+                // 那里由 `a_split_window_this_narrow_still_has_a_way_out`
+                // 守"有路可走"。面包屑也不在名单里：它靠折叠祖先段收自己，
+                // 深度压不住时允许伸出栏外（栏会裁掉，用户看不到越界）。
+                if width >= 900. {
+                    let wall = px(limit.as_f32().min(panel.origin.x.as_f32()));
+                    for id in [
+                        "filter-slot",
+                        "view-list",
+                        "view-grid",
+                        "view-columns",
+                        "toggle-hidden",
+                        "op-more",
+                    ] {
+                        let stray = right_over(window, slot, id, wall);
+                        assert!(
+                            stray <= 0.5,
+                            "窗口 {width}：第 {slot} 栏里的 {id} 越过 x={wall} 有 {stray:.1} px\
+                             ——装不下就该整块降级，不许伸进详情板那一列",
+                        );
+                    }
+                    for index in 1usize..=3 {
+                        let stray = right_over(window, slot, ("header", index), wall);
+                        assert!(
+                            stray <= 0.5,
+                            "窗口 {width}：第 {slot} 栏的表头第 {index} 列越过 x={wall} 有 {stray:.1} px",
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// 栏窄到装不下时**整块降级**：列表按列让位、地址栏收起筛选框。
+///
+/// 判据钉在"表头此刻画了哪几列"上：降级是**整格不画**，画了（哪怕被栏
+/// 裁掉）就算没降级——"该降级却没降"因此能被抓住。
+/// 这一条同时钉住地址栏与命令栏两处：装不下的东西不是被裁掉半边，
+/// 而是整颗不画——裁掉半边的按钮点不到，还让人以为界面坏了。
+#[gpui_kit::test]
+fn a_narrow_pane_gives_up_columns_instead_of_overflowing(cx: &mut TestAppContext) {
+    // 窗口宽度 → 每栏宽度（去掉侧栏 210 与详情板 260 之后对半分）：
+    // 1600 → 564 px、1180 → 354 px、900 → 214 px。
+    // （门槛见 pane.rs 里的 NAME_COL_MIN 与 ADDRESS_BAR_FILTER_AT。）
+    for (width, columns, filter, buttons) in [
+        (1600.0f32, vec![0usize, 1, 2, 3], true, true),
+        (1180.0, vec![0usize, 1], true, true),
+        (900.0, vec![0usize], false, false),
+    ] {
+        let dir = tempfile::tempdir().expect("临时目录");
+        for i in 0..30 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
+        }
+        let (_session, handle) = open_session_at_width(
+            cx,
+            &Session {
+                tabs: vec![dir.path().to_path_buf(), dir.path().to_path_buf()],
+                active: 0,
+                split: Some(1),
+                focus_on_left: true,
+                sync: false,
+            },
+            width,
+        );
+        step(cx, handle, settle);
+
+        step_value(cx, handle, |window, cx| {
+            settle(window, cx);
+            assert_eq!(
+                header_columns(window, 0),
+                columns,
+                "窗口 {width}：表头该画这几列",
+            );
+            let scope = window.within(("pane-slot", 0usize));
+            assert_eq!(
+                scope.try_find("filter-slot").is_some(),
+                filter,
+                "窗口 {width}：筛选框该不该在",
+            );
+            assert_eq!(
+                scope.try_find("view-list").is_some(),
+                buttons,
+                "窗口 {width}：视图按钮该不该在",
+            );
+        });
+    }
+}
+
+/// 双栏里详情板画的是**焦点那一栏**的选中项：换焦点、换选中项，它都跟着换。
+///
+/// 面板挂在窗口上、内容却来自窗格，所以这条钉的是"面板读的是哪一栏"——
+/// `render_details` 里写死成 0 号栏、或焦点换过去时不重取，这里立刻红。
+///
+/// **钉不住的半条**：窗格重画之后得**把窗口叫醒**（`WFilesApp::follow_pane`）
+/// 面板才会刷新，而 gpui-kit 的测试每一步交互前都 `Window::refresh()`
+/// （整窗无条件重画），那句订阅即使删掉这里也是绿的。那根线为什么不能删，
+/// 写在 `follow_pane` 上。
+#[gpui_kit::test]
+fn the_details_panel_follows_the_focused_pane(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let left = root.path().join("left");
+    let right = root.path().join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    std::fs::write(left.join("left-file.txt"), "x").unwrap();
+    std::fs::write(right.join("right-file.txt"), "x").unwrap();
+
+    let (_session, handle) = open_session(
+        cx,
+        &Session {
+            tabs: vec![left, right],
+            active: 0,
+            split: Some(1),
+            focus_on_left: true,
+            sync: false,
+        },
+    );
+
+    // 左栏是焦点栏，选中第一行。
+    step(cx, handle, |window, cx| {
+        window.press("down", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(detail_name(window), "left-file.txt");
+    });
+
+    // Tab 把焦点挪到右栏，在那边选一行：面板该换成右栏那个。
+    step(cx, handle, |window, cx| {
+        window.press("tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("down", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            detail_name(window),
+            "right-file.txt",
+            "焦点换到右栏、那边也选了文件，面板还写着左栏那个",
+        );
+    });
+
+    // 挪回去也要跟着回来。
+    step(cx, handle, |window, cx| {
+        window.press("tab", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            detail_name(window),
+            "left-file.txt",
+            "焦点挪回左栏，面板该显示左栏选中的那个",
+        );
+    });
+}
+
+/// 520 px 的双栏：两侧固定边框加起来 470 px，分栏之后每栏只剩 25 px——
+/// 那一栏里什么也放不下。**要求本身做不到**，所以这条测的是"有路可走"：
+/// 把两侧都收掉，每栏回到 235 px，两栏都还能列文件、按钮都还在栏内。
+///
+/// （"25 px 的栏不重叠"由 `the_details_panel_never_overlaps_a_pane` 守着：
+/// 那一栏里的东西被裁掉，但绝不画到面板上。）
+#[gpui_kit::test]
+fn a_split_window_this_narrow_still_has_a_way_out(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    for i in 0..30 {
+        std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").expect("造文件");
+    }
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 520.);
+    step(cx, handle, settle);
+    // 分栏、收侧栏、收详情板各走一步：同一个 step 里连按两个键，
+    // 第一个触发的重画会把第二个键吞掉。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-d", cx);
+    });
+    step(cx, handle, settle);
+    step(cx, handle, |window, cx| {
+        window.press("cmd-b", cx);
+    });
+    step(cx, handle, settle);
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-o", cx);
+    });
+    step(cx, handle, settle);
+
+    step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        for slot in 0usize..2 {
+            let pane = window.try_find(("pane-slot", slot)).expect("栏位").bounds();
+            assert!(
+                pane.size.width >= px(230.),
+                "520 px 的窗口收掉两侧之后每栏该有 235 px 左右，第 {slot} 栏实测 {:?}",
+                pane.size.width,
+            );
+            // 栏里看得见文件（空目录/被挤没了都算这条没过）。
+            assert!(
+                !row_names_in(window, slot).is_empty(),
+                "第 {slot} 栏里一个文件名都没有——这一栏被挤没了",
+            );
+            let limit = pane_right(window, slot);
+            for id in ["op-new-folder", "op-paste", "op-more"] {
+                let stray = right_over(window, slot, id, limit);
+                assert!(
+                    stray <= 0.5,
+                    "第 {slot} 栏里的 {id} 越出栏右边缘 {stray:.1} px",
+                );
+            }
+            let stray = right_over(window, slot, ("header", 0usize), limit);
+            assert!(
+                stray <= 0.5,
+                "第 {slot} 栏表头的「名称」越出栏右边缘 {stray:.1} px",
+            );
+        }
+    });
 }
 
 /// 长文件名也不能把状态栏撑出窗口。
