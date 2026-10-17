@@ -675,7 +675,7 @@ static EN: &[(&str, &str)] = &[
     ("下一个标签页", "Next Tab"),
     ("前往{label}", "Go to {label}"),
     ("连接远程服务器…", "Connect to Server…"),
-    ("默认终端：跟随系统", "Default Terminal: System Default"),
+    ("默认终端：自动", "Default Terminal: Automatic"),
     ("默认终端：{name}", "Default Terminal: {name}"),
     // ---- 日志导出 ----
     // 这几句是**界面上**的话（面板里那一条、状态栏里那两句），

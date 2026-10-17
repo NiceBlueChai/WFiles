@@ -13,7 +13,7 @@ use std::{
     process::Command,
 };
 
-/// 让用户选“跟着系统走”，由 [`resolve`] 挑一个装了的。
+/// 让用户选"自动"：由 [`resolve`] 挑一个本机装着的（Linux 上先按桌面环境挑）。
 pub const AUTO: &str = "auto";
 
 /// 一个可用的终端程序。
@@ -25,6 +25,13 @@ pub struct Terminal {
     pub name: &'static str,
     /// 要启动的程序。
     pub program: &'static str,
+    /// 判断"装没装"该看谁。
+    ///
+    /// 多数终端就是 `program`，但有两处不是：Windows 上那几条走
+    /// `cmd /c start`，`program` 是 cmd（永远都在），真正要问的是后面拉起的
+    /// 那个 exe；macOS 上则是 .app 的名字（不含 `.app`）——启动用的是
+    /// `open -a <同一个名字>`，两边必须一致。
+    pub probe: &'static str,
     /// 参数模板，`{dir}` 会被换成目标目录的绝对路径。
     pub args: &'static [&'static str],
 }
@@ -37,6 +44,15 @@ impl Terminal {
 }
 
 /// 本平台可用的终端，按推荐顺序排。
+///
+/// 顺序只在 [`auto`] 里起作用（第一个装了的胜出）。Terminal.app 永远在
+/// 列表最前面：它在 macOS 上是系统自带的，`auto` 因此总能有个确定答案。
+///
+/// 几个现代终端（Ghostty / WezTerm / kitty / Alacritty）是命令行优先的，
+/// macOS 上得把目录当**启动参数**递进去（`open -a <App> --args …`）——
+/// 它们不像 Terminal.app 那样认"打开这个目录"的文档请求。代价是**已经
+/// 开着的实例可能不认**这个参数（`open` 只在启动那一刻传参），这一点
+/// 在 terminal.rs 里没有别的办法绕，只能记在这儿。
 pub fn candidates() -> Vec<Terminal> {
     #[cfg(target_os = "macos")]
     {
@@ -45,19 +61,50 @@ pub fn candidates() -> Vec<Terminal> {
                 id: "terminal",
                 name: "终端（Terminal.app）",
                 program: "open",
+                probe: "Terminal",
                 args: &["-a", "Terminal", "{dir}"],
             },
             Terminal {
                 id: "iterm",
                 name: "iTerm2",
                 program: "open",
+                probe: "iTerm",
                 args: &["-a", "iTerm", "{dir}"],
             },
             Terminal {
                 id: "warp",
                 name: "Warp",
                 program: "open",
+                probe: "Warp",
                 args: &["-a", "Warp", "{dir}"],
+            },
+            Terminal {
+                id: "ghostty",
+                name: "Ghostty",
+                program: "open",
+                probe: "Ghostty",
+                args: &["-a", "Ghostty", "--args", "--working-directory={dir}"],
+            },
+            Terminal {
+                id: "wezterm",
+                name: "WezTerm",
+                program: "open",
+                probe: "WezTerm",
+                args: &["-a", "WezTerm", "--args", "start", "--cwd", "{dir}"],
+            },
+            Terminal {
+                id: "kitty",
+                name: "kitty",
+                program: "open",
+                probe: "kitty",
+                args: &["-a", "kitty", "--args", "--directory", "{dir}"],
+            },
+            Terminal {
+                id: "alacritty",
+                name: "Alacritty",
+                program: "open",
+                probe: "Alacritty",
+                args: &["-a", "Alacritty", "--args", "--working-directory", "{dir}"],
             },
         ]
     }
@@ -69,6 +116,7 @@ pub fn candidates() -> Vec<Terminal> {
                 id: "wt",
                 name: "Windows Terminal",
                 program: "cmd",
+                probe: "wt.exe",
                 // start 的第一个带引号参数是窗口标题，必须有，
                 // 否则 start 会把后面引号里的路径当成标题。
                 args: &["/c", "start", "WFiles", "wt.exe", "-d", "{dir}"],
@@ -77,13 +125,81 @@ pub fn candidates() -> Vec<Terminal> {
                 id: "powershell",
                 name: "PowerShell",
                 program: "cmd",
+                probe: "powershell.exe",
                 args: &["/c", "start", "WFiles", "/D", "{dir}", "powershell.exe"],
             },
             Terminal {
                 id: "cmd",
                 name: "命令提示符",
                 program: "cmd",
+                probe: "cmd.exe",
                 args: &["/c", "start", "WFiles", "/D", "{dir}", "cmd.exe"],
+            },
+            // 下面几个是各自发行的 Windows 版：装了就列出来，没装的自然被
+            // `installed` 滤掉。
+            Terminal {
+                id: "ghostty",
+                name: "Ghostty",
+                program: "cmd",
+                probe: "ghostty.exe",
+                args: &[
+                    "/c",
+                    "start",
+                    "WFiles",
+                    "/D",
+                    "{dir}",
+                    "ghostty.exe",
+                    "--working-directory={dir}",
+                ],
+            },
+            Terminal {
+                id: "wezterm",
+                name: "WezTerm",
+                program: "cmd",
+                probe: "wezterm.exe",
+                args: &[
+                    "/c",
+                    "start",
+                    "WFiles",
+                    "/D",
+                    "{dir}",
+                    "wezterm.exe",
+                    "start",
+                    "--cwd",
+                    "{dir}",
+                ],
+            },
+            Terminal {
+                id: "kitty",
+                name: "kitty",
+                program: "cmd",
+                probe: "kitty.exe",
+                args: &[
+                    "/c",
+                    "start",
+                    "WFiles",
+                    "/D",
+                    "{dir}",
+                    "kitty.exe",
+                    "--directory",
+                    "{dir}",
+                ],
+            },
+            Terminal {
+                id: "alacritty",
+                name: "Alacritty",
+                program: "cmd",
+                probe: "alacritty.exe",
+                args: &[
+                    "/c",
+                    "start",
+                    "WFiles",
+                    "/D",
+                    "{dir}",
+                    "alacritty.exe",
+                    "--working-directory",
+                    "{dir}",
+                ],
             },
         ]
     }
@@ -95,42 +211,56 @@ pub fn candidates() -> Vec<Terminal> {
                 id: "gnome-terminal",
                 name: "GNOME 终端",
                 program: "gnome-terminal",
+                probe: "gnome-terminal",
                 args: &["--working-directory={dir}"],
             },
             Terminal {
                 id: "konsole",
                 name: "Konsole",
                 program: "konsole",
+                probe: "konsole",
                 args: &["--workdir", "{dir}"],
             },
             Terminal {
                 id: "xfce4-terminal",
                 name: "XFCE 终端",
                 program: "xfce4-terminal",
+                probe: "xfce4-terminal",
+                args: &["--working-directory={dir}"],
+            },
+            Terminal {
+                id: "ghostty",
+                name: "Ghostty",
+                program: "ghostty",
+                probe: "ghostty",
                 args: &["--working-directory={dir}"],
             },
             Terminal {
                 id: "wezterm",
                 name: "WezTerm",
                 program: "wezterm",
+                probe: "wezterm",
                 args: &["start", "--cwd", "{dir}"],
             },
             Terminal {
                 id: "alacritty",
                 name: "Alacritty",
                 program: "alacritty",
+                probe: "alacritty",
                 args: &["--working-directory", "{dir}"],
             },
             Terminal {
                 id: "kitty",
-                name: "Kitty",
+                name: "kitty",
                 program: "kitty",
+                probe: "kitty",
                 args: &["--directory", "{dir}"],
             },
             Terminal {
                 id: "x-terminal-emulator",
                 name: "系统默认终端",
                 program: "x-terminal-emulator",
+                probe: "x-terminal-emulator",
                 args: &["--working-directory={dir}"],
             },
         ]
@@ -203,20 +333,16 @@ fn desktop_candidates() -> Vec<&'static str> {
 pub fn installed(terminal: &Terminal) -> bool {
     #[cfg(target_os = "macos")]
     {
-        // macOS 上真正启动的是 `open -a <名字>`，判断的是那个 .app 在不在。
-        let app = terminal
-            .args
-            .iter()
-            .position(|arg| *arg == "-a")
-            .and_then(|index| terminal.args.get(index + 1))
-            .copied()
-            .unwrap_or(terminal.program);
-        mac_app_exists(app)
+        // macOS 上真正启动的是 `open -a <名字>`，`probe` 就是那个 .app 的
+        // 名字（不含 `.app`）。两个名字不一致的话，用户会看到一个装着的
+        // 终端被判成没装，或者反过来点下去报错——`macos_probe_and_launch_
+        // name_agree` 就是钉这一条的。
+        mac_app_exists(terminal.probe)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        find_program(terminal.program).is_some()
+        find_program(terminal.probe).is_some()
     }
 }
 
@@ -353,6 +479,7 @@ mod tests {
             id: "sample",
             name: "样例终端",
             program: "sample-term",
+            probe: "sample-term",
             args: &["--cwd", "{dir}", "--working-directory={dir}"],
         }
     }
@@ -397,6 +524,50 @@ mod tests {
             assert!(
                 terminal.args.iter().any(|arg| arg.contains("{dir}")),
                 "{} 的参数里没有 {{dir}}，会打开在别的目录",
+                terminal.id
+            );
+        }
+    }
+
+    /// 四个现代终端（Ghostty / WezTerm / kitty / Alacritty）**三个平台上都得
+    /// 有**：用户装的是哪一个不由我们决定，而我们只发一份候选表。少一个就是
+    /// "Linux 里能选、Windows 里选不到"这种没法跟用户解释的差别。
+    #[test]
+    fn the_four_modern_terminals_are_listed_everywhere() {
+        let ids: Vec<&str> = candidates().iter().map(|terminal| terminal.id).collect();
+        for id in ["ghostty", "wezterm", "kitty", "alacritty"] {
+            assert!(ids.contains(&id), "{id} 不在候选表里：{ids:?}");
+        }
+    }
+
+    /// 每个候选都得说清"看谁在不在"。`probe` 写错的后果是它被判成永远没装，
+    /// 或者永远装着——Windows 上那几条曾经就是后者：`program` 是 `cmd`，
+    /// 而 cmd 永远都在，于是"没装的 Ghostty"也会列出来，点下去只能得到
+    /// 一句 cmd 的报错。
+    #[test]
+    fn every_candidate_declares_what_installed_means() {
+        for terminal in candidates() {
+            assert!(!terminal.probe.is_empty(), "{} 没写 probe", terminal.id);
+        }
+    }
+
+    /// macOS 上"看谁在不在"（`probe`，拼成 `<名字>.app`）和"拉起谁"
+    /// （`open -a <名字>`）必须是同一个名字：不一致时，用户会看到一个装着
+    /// 的终端被判成没装；反过来则是点下去报错。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_and_launch_name_agree() {
+        for terminal in candidates() {
+            let launched = terminal
+                .args
+                .iter()
+                .position(|arg| *arg == "-a")
+                .and_then(|index| terminal.args.get(index + 1))
+                .copied()
+                .expect("macOS 上每个候选都靠 `open -a` 启动");
+            assert_eq!(
+                terminal.probe, launched,
+                "{} 的 probe 与 -a 的名字对不上",
                 terminal.id
             );
         }

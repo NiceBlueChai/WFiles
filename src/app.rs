@@ -3005,7 +3005,7 @@ impl WFilesApp {
         items.push(PaletteItem {
             command: PaletteCommand::new(
                 format!("terminal:{}", terminal::AUTO),
-                crate::i18n::tr(cx, "默认终端：跟随系统"),
+                crate::i18n::tr(cx, "默认终端：自动"),
                 if current == terminal::AUTO {
                     crate::i18n::tr(cx, "当前")
                 } else {

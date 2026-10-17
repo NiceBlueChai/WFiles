@@ -25,7 +25,7 @@ const MAX_FOLDER_VIEWS: usize = 500;
 // 只 PartialEq 不 Eq：Layout 里是像素坐标（f32），浮点没有 Eq。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
-    /// 打开终端用哪个程序；`terminal::AUTO` 表示跟着系统走。
+    /// 打开终端用哪个程序；`terminal::AUTO` 表示自动挑一个本机装着的。
     #[serde(default = "default_terminal")]
     pub terminal: String,
     /// 每个目录记住的视图。最近用过的排在最前面。
