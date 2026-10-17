@@ -8,6 +8,7 @@
 //! 这是最难解释的一类数据丢失。
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 /// 拖动时在某个文件夹上停多久就把它"弹开"（弹簧文件夹）。
@@ -21,9 +22,14 @@ pub const HOVER_EXPAND_AFTER: Duration = Duration::from_millis(600);
 ///
 /// 存路径而不是下标：拖动过程中目录可能因为监听而刷新，
 /// 下标会指到别人身上，路径不会。
+///
+/// 清单用 `Rc` 装着：同一帧里每一行都要备一份"拖这一行时该拖哪些"，
+/// 而"点在已选中的项上"那种情况下每行要的是同一份整批选中项——
+/// 逐行克隆的话，全选 10 万项时一帧就是可见行数 × 10 万次克隆。
+/// 一份共享给所有行，见 `Pane::dragged_paths`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraggedPaths {
-    pub paths: Vec<PathBuf>,
+    pub paths: Rc<Vec<PathBuf>>,
 }
 
 /// 落下去要做什么。

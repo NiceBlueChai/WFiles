@@ -1948,6 +1948,96 @@ fn dragging_a_file_onto_a_folder_moves_it(cx: &mut TestAppContext) {
     );
 }
 
+/// 拖一个已选中的项：拖起来的是**整批选中项**，不是那一个。
+///
+/// 这条同时钉住拖动载荷"一帧只算一次、行与行共享"的改法：
+/// 载荷内容必须还是整批，不能被共享机制弄丢或弄串。
+#[gpui_kit::test]
+fn dragging_one_selected_file_carries_the_whole_selection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let inbox = dir.path().join("inbox");
+    std::fs::create_dir(&inbox).unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+
+    let isolation = isolate_session();
+    write_session(isolation.path(), dir.path());
+    let (handle, app) = open_app_of_width(cx, 1180.);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let a = row_position(window, "a.txt");
+        window.click(("row-name", a), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // Shift 连选下一个：a、b 就成了整批。
+        window.press("shift-down", cx);
+    });
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["a.txt", "b.txt"],
+        "先确认两个都选中了，再拖其中一个"
+    );
+
+    let mut from = Point::default();
+    let mut to = Point::default();
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let a = row_position(window, "a.txt");
+        let folder = row_position(window, "inbox");
+        from = center_of(window, ("row-drop", a).into());
+        to = center_of(window, ("row-drop", folder).into());
+    });
+
+    drag_between_rows(cx, handle, from, to);
+
+    assert!(wait_for_file(cx, &inbox.join("a.txt")), "拖的那一项该进去");
+    assert!(
+        wait_for_file(cx, &inbox.join("b.txt")),
+        "同一批选中的 b.txt 也该跟着进去"
+    );
+}
+
+/// 点在整批里的一员上、抬手没拖走：选中项塌回这一个。
+///
+/// 这是上一条的另一半：塌的动作从"按下"挪到了"真的只是一次点击"，
+/// 单点收缩这件事本身不能跟着丢。
+#[gpui_kit::test]
+fn a_plain_click_collapses_a_multi_selection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt"] {
+        std::fs::write(dir.path().join(name), name).unwrap();
+    }
+    let isolation = isolate_session();
+    write_session(isolation.path(), dir.path());
+    let (handle, app) = open_app_of_width(cx, 1180.);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("shift-down", cx);
+    });
+    assert_eq!(
+        selected_names(cx, &app).len(),
+        2,
+        "先建立两选，再点其中一个"
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["a.txt"],
+        "点一下该塌回这一个"
+    );
+}
+
 /// 造一个装了两个文本文件的 `bundle.zip`，放在 `dir` 里。
 fn make_bundle(dir: &Path) -> std::path::PathBuf {
     for name in ["a.txt", "b.txt"] {
@@ -5409,6 +5499,51 @@ fn the_bulk_rename_fields_get_the_width_they_ask_for(cx: &mut TestAppContext) {
             );
         });
     }
+}
+
+/// 批量重命名的预览有行数上限，而且要把话说清楚。
+///
+/// 预览列表原来整份建出来（它不是虚拟列表）：选中几百项就是每帧几百行，
+/// 十万项时这个对话框直接卡死。现在只画前 `PREVIEW_ROWS` 行，并在下面
+/// 注明"只列了前几项、确认后全部生效"。
+///
+/// 这条钉住两件事：第 201 行不再渲染；那行说明确实在，而且报的是真实总数。
+#[gpui_kit::test]
+fn the_bulk_rename_preview_is_capped_and_says_so(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..205 {
+        std::fs::write(dir.path().join(format!("f{index:03}.txt")), "x").unwrap();
+    }
+    let (_session, handle) = open_in(cx, dir.path());
+    step(cx, handle, settle);
+    step(cx, handle, |window, cx| {
+        window.press("cmd-a", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-shift-r", cx);
+        settle(window, cx);
+    });
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find(("bulk-row", 199usize)).is_some(),
+            "第 200 行该在"
+        );
+        assert!(
+            window.try_find(("bulk-row", 200usize)).is_none(),
+            "第 201 行不该画出来（预览有上限）"
+        );
+        let note = window
+            .try_find("bulk-preview-note")
+            .and_then(|node| node.label().map(|label| label.to_string()));
+        let note = note.expect("截断时该有一行说明");
+        assert!(
+            note.contains("200") && note.contains("205"),
+            "说明里要交代「列了 200、共 205」：{note}"
+        );
+    });
 }
 
 /// 色点不能让某些行的文件名单独错开。

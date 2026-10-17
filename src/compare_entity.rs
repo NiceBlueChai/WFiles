@@ -218,7 +218,10 @@ impl ComparePanel {
         cx.notify();
     }
 
-    /// 当前筛选下看得见的那几条。
+    /// 当前筛选下看得见的那几条（整份克隆，给"同步"这类一次性路径用）。
+    ///
+    /// 渲染不走这里：条目带着名字和路径，克隆一份不便宜，而每帧每行
+    /// 要的其实只是"第几条在哪一行"（[`Self::visible_indices`]）。
     fn visible(&self) -> Vec<Entry> {
         self.entries
             .iter()
@@ -227,8 +230,26 @@ impl ComparePanel {
             .collect()
     }
 
+    /// 当前筛选下看得见的条目在 `entries` 里的下标，按列表顺序。
+    fn visible_indices(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| self.filter.keeps(entry))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// 当前筛选下看得见几条，不建任何中间表。
+    fn visible_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| self.filter.keeps(entry))
+            .count()
+    }
+
     fn move_cursor(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let count = self.visible().len();
+        let count = self.visible_count();
         if count == 0 {
             return;
         }
@@ -241,8 +262,12 @@ impl ComparePanel {
 
     /// Enter：跳到光标这一条（左边有就左边，没有就是右边的）。
     fn reveal_cursor(&mut self, cx: &mut Context<Self>) {
-        let entries = self.visible();
-        let Some(entry) = entries.get(self.cursor) else {
+        let Some(entry) = self
+            .entries
+            .iter()
+            .filter(|entry| self.filter.keeps(entry))
+            .nth(self.cursor)
+        else {
             return;
         };
         let path = entry
@@ -310,7 +335,7 @@ impl ComparePanel {
     }
 
     fn sync_rows(&mut self) {
-        let count = self.visible().len();
+        let count = self.visible_count();
         if self.row_sizes.len() == count {
             return;
         }
@@ -436,7 +461,10 @@ impl Render for ComparePanel {
         let radius = cx.theme().radius;
         let status = self.status();
         let row_sizes = self.row_sizes.clone();
-        let visible = self.visible();
+        // 可见条目的下标一帧只算一次：原来 `visible()` 每帧克隆整张表，
+        // 而且克隆两回（一次判空、一次给虚拟列表闭包），可整篇只画
+        // 可见的几十行。下标表小得多，而且不碰条目里的字符串。
+        let visible = Rc::new(self.visible_indices());
 
         let filters = h_flex()
             .gap_1()
@@ -496,15 +524,18 @@ impl Render for ComparePanel {
                 })
                 .into_any_element()
         } else {
+            let indices = Rc::clone(&visible);
             let list = v_virtual_list(
                 cx.entity().clone(),
                 "rows",
                 row_sizes,
-                |panel, range, _, cx| {
-                    let entries = panel.visible();
+                move |panel, range, _, cx| {
                     range
                         .filter_map(|index| {
-                            let entry = entries.get(index)?.clone();
+                            let entry = indices
+                                .get(index)
+                                .and_then(|real| panel.entries.get(*real))?
+                                .clone();
                             Some(panel.render_row(index, &entry, cx))
                         })
                         .collect()

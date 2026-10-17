@@ -5,7 +5,7 @@
 
 use std::{
     any::Any,
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     path::{Path, PathBuf},
     rc::Rc,
@@ -418,6 +418,11 @@ struct ArchiveState {
     path: PathBuf,
     name: String,
     entries: Vec<archive::Entry>,
+    /// 虚拟列表的逐行高度：一行一条、行高固定，打开时算一次就够。
+    ///
+    /// 上万条目的包不虚拟化就是每帧重建上万元素，而这个浮层
+    /// 开着的时候一直在画。
+    row_sizes: Rc<Vec<Size<Pixels>>>,
     /// 读不出来时把原因摆在面板里，而不是弹一个对话框打断操作。
     error: Option<crate::i18n::Msg>,
 }
@@ -481,6 +486,12 @@ fn run_on_pane(
     let _ = me.update(cx, act);
 }
 
+/// 跨帧缓存的新鲜度凭据：选中项改了多少回 + 列表内容改了多少回。
+///
+/// 拖动载荷、详情板汇总这类"每帧都要用、算一遍不便宜"的东西靠它判缓存
+/// 还算不算数（见 [`Pane::freshness`]）。
+type Freshness = (u64, u64);
+
 pub struct Pane {
     /// 指向自己。
     ///
@@ -502,6 +513,10 @@ pub struct Pane {
     remotes: Entity<Remotes>,
     listing: Listing,
     selection: Selection,
+    /// 按下鼠标时压住没塌的选中项：用户点的是整批里的一员，
+    /// 可能正要拖着这一批走。真只是点一下（鼠标抬起没拖走）才塌，
+    /// 见 [`Self::select_row`] 与 [`Self::click_row`]。
+    collapse_pending: Option<PathBuf>,
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
     filter: Entity<InputState>,
@@ -514,6 +529,17 @@ pub struct Pane {
     ///
     /// 列表模式下一项一行；网格模式下一"行"是 [`Self::columns`] 个格子。
     row_sizes: Rc<Vec<Size<Pixels>>>,
+    /// 最后一帧算好的整批选中项（拖起来的就是它），连同算法时的凭据。
+    ///
+    /// 每一行都要带着"拖这一行时该拖哪些"（[`Self::dragged_paths`]），
+    /// 而那是整批选中项的路径。逐行现算的话，全选 10 万项时一帧就是
+    /// "可见行数 × 10 万"次查询加克隆——几百万次操作，只为回答一个
+    /// 每一行都相同的答案。整批算一次存下，选中项没变就一直用
+    /// （凭据见 [`Self::freshness`]）。
+    drag_cache: RefCell<Option<(Freshness, Rc<Vec<PathBuf>>)>>,
+    /// 详情板多选汇总的缓存，凭据同上：算一次要扫一遍目录
+    ///（全选 10 万项时几毫秒），选中项没变就不该每帧重扫。
+    summary_cache: RefCell<Option<(Freshness, MultiSelectionSummary)>>,
     /// 当前目录用什么视图显示。
     view: ViewMode,
     /// 量出来的列表可用宽度，网格据此算一行放几格。
@@ -596,6 +622,7 @@ impl Pane {
             remotes,
             listing,
             selection: Selection::default(),
+            collapse_pending: None,
             back: Vec::new(),
             forward: Vec::new(),
             filter,
@@ -604,6 +631,8 @@ impl Pane {
             status: String::new(),
             scroll: VirtualListScrollHandle::new(),
             row_sizes: Rc::new(Vec::new()),
+            drag_cache: RefCell::new(None),
+            summary_cache: RefCell::new(None),
             view: ViewMode::default(),
             width_probe: Rc::new(Cell::new(px(0.))),
             known_width: px(0.),
@@ -1385,15 +1414,41 @@ impl Pane {
     }
 
     /// 点击选中：Shift 连选，Command（Windows/Linux 上是 Ctrl）加减选，普通点击单选。
+    ///
+    /// 点在整批里的一员上时**先不塌**：用户可能正要拖着这一批走
+    ///（塌的动作见 [`Self::click_row`]）。
     fn select_row(&mut self, path: PathBuf, modifiers: Modifiers) {
         if modifiers.shift {
+            self.collapse_pending = None;
             self.selection.select_range(&self.listing, path);
         } else if modifiers.secondary() {
+            self.collapse_pending = None;
             self.selection.toggle(path);
+        } else if self.selection.len() > 1 && self.selection.contains(&path) {
+            // 已经是整批选中项里的一员：先别塌成它自己。用户可能正是要拖着
+            // 这一批走——拖起来的载荷取的是"此刻的选中项"（见 `dragged_paths`），
+            // 鼠标一按下就塌的话，拖出去的只剩这一个文件。塌留到真的只是
+            // 一次点击：鼠标抬起还没走（没到拖拽阈值，见 `click_row`）。
+            self.collapse_pending = Some(path);
         } else {
+            self.collapse_pending = None;
             self.selection.select(path);
         }
         self.note_restore();
+    }
+
+    /// 一次真正的点击（按下又抬起、没拖走）：把压住的选中项塌回这一个。
+    ///
+    /// 拖动开始后 gpui 就不会再派发这次点击（见 `div.rs` 里拖拽开始时
+    /// 清 `pending_mouse_down` 那段），所以拖着走的那一批不会在松手时塌掉。
+    fn click_row(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.collapse_pending.take().as_deref() != Some(path) {
+            return;
+        }
+        self.selection.select(path.to_path_buf());
+        self.note_restore();
+        self.update_status(cx);
+        cx.notify();
     }
 
     // ---- 文件操作请求 ----
@@ -1598,10 +1653,12 @@ impl Pane {
             Ok(entries) => (entries, None),
             Err(error) => (Vec::new(), Some(error)),
         };
+        let row_sizes = Rc::new(vec![size(px(0.), px(ROW_HEIGHT)); entries.len()]);
         self.archive_view = Some(ArchiveState {
             path,
             name,
             entries,
+            row_sizes,
             error,
         });
         cx.notify();
@@ -3064,6 +3121,8 @@ impl Pane {
 
         let dragged = self.dragged_paths(&path);
         let drop_here = is_dir.then(|| path.clone());
+        // 点击要用的那份路径：按下的那句把 `path` 用掉了（下面两个闭包各要一份）。
+        let click_path = path.clone();
         let item = ListItem::new(("row", position))
             .w_full()
             .h(px(ROW_HEIGHT))
@@ -3109,10 +3168,12 @@ impl Pane {
                     // 整列名字看过去是波浪，而"这一行有没有标记"是它自己的事，
                     // 不该让整列的字都跟着错开 20 px。表头的「名称」列也就对上了。
                     .child({
-                        let hex = Settings::read(cx)
-                            .marks
-                            .color_of(&path)
-                            .map(marks::color_hex);
+                        // 每一行的色点都要问一次标记：`Settings::read` 每次
+                        // 深拷贝整份设置（里面还带着全部标记），十万一行的
+                        // 目录里这是每帧一份全表。借一眼就够了。
+                        let hex = Settings::peek(cx, |settings| {
+                            settings.marks.color_of(&path).map(marks::color_hex)
+                        });
                         div()
                             .id(("row-mark", position))
                             .test_support()
@@ -3189,7 +3250,10 @@ impl Pane {
                     }
                     cx.notify();
                 }),
-            );
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.click_row(&click_path, cx);
+            }));
         // `ListItem` 只实现了 `IntoElement`，挂不上拖放那几个方法：
         // 外面套一层同高的 div 专管拖放，视觉上看不出多了一层。
         let row = div()
@@ -3414,6 +3478,7 @@ impl Pane {
         // 格子同样既是拖拽源也能接：拖到文件夹上就是放进去。
         let dragged = self.dragged_paths(&path);
         let drop_here = is_dir.then(|| path.clone());
+        let click_path = path.clone();
         let tile = tile
             .when(is_selected, |tile| {
                 tile.bg(cx.theme().muted)
@@ -3436,7 +3501,10 @@ impl Pane {
                     }
                     cx.notify();
                 }),
-            );
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.click_row(&click_path, cx);
+            }));
         let tile = self.spring_load(tile, drop_here.clone(), cx);
         Some(self.with_drag_and_drop(tile, Some(dragged), drop_here, cx))
     }
@@ -3664,6 +3732,8 @@ impl Pane {
         // 拖起来的是哪些、能不能接：要在 `path` 被挪进鼠标闭包之前算好。
         let dragged = self.dragged_paths(&path);
         let drop_here = is_dir.then(|| path.clone());
+        // 点击要用的那份路径：按下的那句把 `path` 用掉了。
+        let click_path = path.clone();
         let icon_color = if is_dir {
             cx.theme().primary
         } else {
@@ -3720,9 +3790,21 @@ impl Pane {
                     }
                     cx.notify();
                 }),
-            );
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.click_row(&click_path, cx);
+            }));
         let element = self.spring_load(element, drop_here.clone(), cx);
         self.with_drag_and_drop(element, Some(dragged), drop_here, cx)
+    }
+
+    /// 给跨帧缓存用的新鲜度凭据：选中项、列表内容/顺序，任一变了它就变。
+    ///
+    /// 拖动载荷和详情板汇总都按它判缓存还算不算数。列表那一半取的是
+    /// [`Self::listing_version`]——凡是会改变行集合的地方都会碰它
+    ///（换目录、刷新、改筛选、改排序、换视图）。
+    fn freshness(&self) -> Freshness {
+        (self.selection.version(), self.listing_version)
     }
 
     /// 拖起来的是哪些文件。
@@ -3730,13 +3812,51 @@ impl Pane {
     /// 点在已选中的项上就是整批选中项；点在一个没选中的项上就是它自己——
     /// 按下鼠标会把它选中，而那时候这一帧早就画完了，
     /// 所以这里按"它此刻在不在选中里"判断，结果和按下之后的状态一致。
+    ///
+    /// 整批选中项只算一次、存下来，行与行走同一份（见 `drag_cache`）：
+    /// 全选十万项时逐行现算是每帧几百万次查询加克隆，而答案都一样；
+    /// 就算只算一次，也不该每帧重来——选中项没变，下一帧还是它。
     fn dragged_paths(&self, path: &Path) -> DraggedPaths {
         let paths = if self.selection.contains(path) {
-            self.selected_paths()
+            let mut cache = self.drag_cache.borrow_mut();
+            let fresh = self.freshness();
+            if cache.as_ref().is_none_or(|(key, _)| *key != fresh) {
+                *cache = Some((fresh, Rc::new(self.selected_paths())));
+            }
+            Rc::clone(&cache.as_ref().expect("刚填上").1)
         } else {
-            vec![path.to_path_buf()]
+            Rc::new(vec![path.to_path_buf()])
         };
         DraggedPaths { paths }
+    }
+
+    /// 多选时详情板要的汇总：一共几个、前八个名字。
+    ///
+    /// 原来先把整批选中项克隆出来再截前八个，全选 10 万项时每帧十万次
+    /// `PathBuf` 克隆；现在顺着一遍扫，边数边收名字，克隆只落在真正
+    /// 收下的那几个上。扫的那一遍本身也不便宜（十万次哈希查找），
+    /// 所以结果按 [`Self::freshness`] 存下来，选中项没变就不重扫。
+    fn multi_selection_summary(&self) -> MultiSelectionSummary {
+        let mut cache = self.summary_cache.borrow_mut();
+        let fresh = self.freshness();
+        if cache.as_ref().is_none_or(|(key, _)| *key != fresh) {
+            let mut total = 0usize;
+            let mut names = Vec::new();
+            for position in 0..self.listing.visible_count() {
+                let Some(entry) = self.listing.visible_entry(position) else {
+                    continue;
+                };
+                if !self.selection.contains(&entry.path) {
+                    continue;
+                }
+                total += 1;
+                if names.len() < MultiSelectionSummary::MAX_NAMES {
+                    names.push(entry.name.clone());
+                }
+            }
+            *cache = Some((fresh, MultiSelectionSummary::of(total, names.into_iter())));
+        }
+        cache.as_ref().expect("刚填上").1.clone()
     }
 
     /// 给一个元素挂上拖放：`dragged` 非空则它可以被拖出去，
@@ -3774,11 +3894,11 @@ impl Pane {
         if let Some(destination) = destination {
             let guard = destination.clone();
             element = element.can_drop(move |value, _, _| {
-                dropped_paths(value).is_some_and(|paths| drag::can_drop(&guard, &paths))
+                dropped_paths(value).is_some_and(|paths| drag::can_drop(&guard, paths))
             });
             let internal = destination.clone();
             element = element.on_drop(cx.listener(move |this, drag: &DraggedPaths, window, cx| {
-                this.drop_paths(drag.paths.clone(), internal.clone(), false, window, cx);
+                this.drop_paths(drag.paths.to_vec(), internal.clone(), false, window, cx);
             }));
             element =
                 element.on_drop(cx.listener(move |this, drag: &ExternalPaths, window, cx| {
@@ -4062,7 +4182,7 @@ impl Pane {
             .and_then(|path| self.listing.entry(path));
         // 多选态那两句走 `MultiSelectionSummary`（纯函数，要能被单测），
         // 所以语言在这里解析一次而不是让那两个函数收 `cx`。
-        let locale = Settings::read(cx).locale();
+        let locale = Settings::peek(cx, |settings| settings.locale());
 
         let content = match selected {
             Some(entry) => v_flex()
@@ -4142,7 +4262,9 @@ impl Pane {
                     },
                 )
                 .when_some(
-                    mark_text(Settings::read(cx).marks.get(entry.path.as_path())),
+                    Settings::peek(cx, |settings| {
+                        mark_text(settings.marks.get(entry.path.as_path()))
+                    }),
                     |this, text| {
                         this.child(detail_row("marks", crate::i18n::tr(cx, "标记"), text, cx))
                     },
@@ -4155,14 +4277,7 @@ impl Pane {
                 ))
                 .into_any_element(),
             None if self.selection.len() > 1 => {
-                let selected = self.selection.ordered(&self.listing);
-                let summary = MultiSelectionSummary::of(
-                    selected.len(),
-                    selected
-                        .iter()
-                        .filter_map(|path| self.listing.entry(path))
-                        .map(|entry| entry.name.clone()),
-                );
+                let summary = self.multi_selection_summary();
 
                 v_flex()
                     .gap_3()
@@ -4459,7 +4574,9 @@ impl Pane {
 
     /// 压缩包面板：列出包里的条目，配一个"解压到这儿"。
     fn render_archive(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(state) = self.archive_view.clone() else {
+        // 借一眼就够：这个函数里对 `self` 全是只读（条目那一列交给
+        // 虚拟列表按需取，见 `ArchiveState::row_sizes`）。
+        let Some(state) = self.archive_view.as_ref() else {
             return div().into_any_element();
         };
         let muted = cx.theme().muted_foreground;
@@ -4506,17 +4623,24 @@ impl Pane {
                 .test_support()
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_sm()
                 .child(
-                    v_flex().children(
-                        state
-                            .entries
-                            .iter()
-                            .enumerate()
-                            .map(|(index, entry)| self.render_archive_entry(index, entry, cx)),
-                    ),
+                    v_virtual_list(
+                        cx.entity().clone(),
+                        "archive-rows",
+                        state.row_sizes.clone(),
+                        |pane, range, _, cx| {
+                            range
+                                .filter_map(|index| {
+                                    let entry = pane.archive_view.as_ref()?.entries.get(index)?;
+                                    Some(pane.render_archive_entry(index, entry, cx))
+                                })
+                                .collect()
+                        },
+                    )
+                    .flex_1()
+                    .min_h_0(),
                 )
                 .into_any_element(),
         };
@@ -4676,13 +4800,16 @@ impl Pane {
 }
 
 /// 从一次投放里取出被拖的路径：可能是窗格里拖出来的，也可能是系统拖进来的。
-pub(crate) fn dropped_paths(value: &dyn Any) -> Option<Vec<PathBuf>> {
+///
+/// 借出去而不是克隆：拖动过程中每一次"能不能落"判定都要看这批路径，
+/// 而全选十万项时克隆一次就是十万个 `PathBuf`——拖一路要判几十次。
+pub(crate) fn dropped_paths(value: &dyn Any) -> Option<&[PathBuf]> {
     if let Some(drag) = value.downcast_ref::<DraggedPaths>() {
-        return Some(drag.paths.clone());
+        return Some(drag.paths.as_slice());
     }
     value
         .downcast_ref::<ExternalPaths>()
-        .map(|paths| paths.0.iter().cloned().collect())
+        .map(|paths| paths.0.as_slice())
 }
 
 /// 每种类型用什么图标。没有专门图标的就退回通用文件图标。
@@ -4781,6 +4908,7 @@ fn mark_text(mark: Option<&crate::marks::Mark>) -> Option<String> {
 /// 造不出带修饰键的那次点击（`window.click` 走的正是它）。缝在这里而不是
 /// 留在渲染函数里，是为了"选 12 个时标题写几个、尾巴写几个"这类性质
 /// 能在单测里验；渲染树里那部分仍然是集成测试的地盘。
+#[derive(Clone)]
 pub struct MultiSelectionSummary {
     /// 列出来的名字，至多 [`Self::MAX_NAMES`] 个。
     pub names: Vec<String>,

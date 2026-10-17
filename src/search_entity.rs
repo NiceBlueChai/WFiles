@@ -473,7 +473,7 @@ impl Render for SearchPanel {
         };
 
         let root_label = self.root.display().to_string();
-        let saved = crate::settings::Settings::read(cx).saved_searches.clone();
+        let saved = crate::settings::Settings::peek(cx, |settings| settings.saved_searches.clone());
 
         // 存下来的搜索：一排小签，点一下就把查询填回输入框。
         // 之所以不做成"智能文件夹"（一个装着结果的假目录）：

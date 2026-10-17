@@ -618,11 +618,11 @@ impl WFilesApp {
     {
         let guard = destination.clone();
         let mut element = element.can_drop(move |value, _, _| {
-            crate::pane::dropped_paths(value).is_some_and(|paths| drag::can_drop(&guard, &paths))
+            crate::pane::dropped_paths(value).is_some_and(|paths| drag::can_drop(&guard, paths))
         });
         let internal = destination.clone();
         element = element.on_drop(cx.listener(move |this, drag: &DraggedPaths, window, cx| {
-            let paths = drag.paths.clone();
+            let paths = drag.paths.to_vec();
             this.drop_paths(paths, internal.clone(), false, window, cx);
         }));
         element = element.on_drop(cx.listener(move |this, drag: &ExternalPaths, window, cx| {
@@ -4168,11 +4168,28 @@ impl WFilesApp {
 
     /// 批量重命名：规则输入 + 实时预览列表，确认后才落盘。
     fn render_bulk(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(bulk) = self.ops.read(cx).bulk().cloned() else {
-            return div().into_any_element();
-        };
         let Some(inputs) = self.bulk_inputs.clone() else {
             return div().into_any_element();
+        };
+        // 预览只列前几行：十万行 DOM 每帧重建一遍，这个对话框会直接卡死
+        //（预览不是虚拟列表）。规则本身不受影响——确认后对全部选中项
+        // 执行，总数与可执行数照实报。原来还每帧克隆整份 `BulkState`
+        //（含全部预览、每个都带两个名字），这里只取要画的那几行。
+        const PREVIEW_ROWS: usize = 200;
+        let (previews, total, executable) = {
+            let ops = self.ops.read(cx);
+            let Some(bulk) = ops.bulk() else {
+                return div().into_any_element();
+            };
+            (
+                bulk.previews
+                    .iter()
+                    .take(PREVIEW_ROWS)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                bulk.previews.len(),
+                crate::bulk_rename::executable_count(&bulk.previews),
+            )
         };
 
         let muted = cx.theme().muted_foreground;
@@ -4216,7 +4233,7 @@ impl WFilesApp {
             );
 
         // 预览列表：旧名 -> 新名，跳过/冲突的标出来。
-        let rows = bulk.previews.iter().enumerate().map(|(index, item)| {
+        let rows = previews.iter().enumerate().map(|(index, item)| {
             let status: AnyElement = if let Some(error) = &item.error {
                 div()
                     .text_xs()
@@ -4245,6 +4262,7 @@ impl WFilesApp {
 
             h_flex()
                 .id(("bulk-row", index))
+                .test_support()
                 .w_full()
                 .gap_2()
                 .items_center()
@@ -4269,8 +4287,24 @@ impl WFilesApp {
                 .child(div().flex_shrink_0().w(px(64.)).child(status))
         });
 
-        let executable = crate::bulk_rename::executable_count(&bulk.previews);
-        let total = bulk.previews.len();
+        // 截断时把话说明白：预览只列前几行，确认后全部照规则执行。
+        let capped_note = (total > previews.len()).then(|| {
+            let text = crate::i18n::tr_args(
+                cx,
+                "预览只列前 {shown} 项（共 {total} 项）；确认后全部按规则执行",
+                &[
+                    ("shown", PREVIEW_ROWS.to_string()),
+                    ("total", total.to_string()),
+                ],
+            );
+            div()
+                .id("bulk-preview-note")
+                .test_support()
+                .aria_label(text.clone())
+                .text_xs()
+                .text_color(muted)
+                .child(text)
+        });
 
         let body = v_flex()
             .gap_3()
@@ -4282,6 +4316,7 @@ impl WFilesApp {
             .child(
                 div()
                     .id("bulk-preview")
+                    .test_support()
                     .max_h(px(280.))
                     .overflow_y_scroll()
                     .border_1()
@@ -4290,6 +4325,7 @@ impl WFilesApp {
                     .p_2()
                     .child(v_flex().gap_1().children(rows)),
             )
+            .when_some(capped_note, |this, note| this.child(note))
             .child(
                 div()
                     .text_xs()

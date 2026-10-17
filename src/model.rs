@@ -545,13 +545,24 @@ pub struct Selection {
     paths: HashSet<PathBuf>,
     cursor: Option<PathBuf>,
     anchor: Option<PathBuf>,
+    /// 改过多少次。跨帧的缓存拿它判"还算不算数"（见 `Pane::freshness`）。
+    ///
+    /// **这个结构里每个改选中项的方法都要动它**：漏一个，界面上就是
+    /// "拖着上一批走""详情板报着旧数字"这类不报错、只发呆的毛病。
+    version: u64,
 }
 
 impl Selection {
     pub fn clear(&mut self) {
+        self.version += 1;
         self.paths.clear();
         self.cursor = None;
         self.anchor = None;
+    }
+
+    /// 选中项改过多少回。缓存拿它判新鲜度，别拿它当别的用。
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     pub fn len(&self) -> usize {
@@ -576,6 +587,7 @@ impl Selection {
     }
 
     pub fn select(&mut self, path: PathBuf) {
+        self.version += 1;
         self.paths.clear();
         self.cursor = Some(path.clone());
         self.anchor = Some(path.clone());
@@ -590,6 +602,7 @@ impl Selection {
     /// 光标与锚点落在 `cursor` 上：有就落在它（键盘接着从那儿走），
     /// 没有就落在最后一个（列表最靠下的那一项，按方向键往上走最自然）。
     pub fn select_many(&mut self, paths: Vec<PathBuf>, cursor: Option<PathBuf>) {
+        self.version += 1;
         self.paths.clear();
         self.paths.extend(paths.iter().cloned());
         let cursor = cursor
@@ -601,6 +614,7 @@ impl Selection {
 
     /// 按住 Command 点击：加进来或拿出去。
     pub fn toggle(&mut self, path: PathBuf) {
+        self.version += 1;
         self.cursor = Some(path.clone());
         if !self.paths.remove(&path) {
             self.paths.insert(path.clone());
@@ -622,6 +636,7 @@ impl Selection {
     ///
     /// 锚点保持不变，这样连续几次 Shift 点击可以继续扩大或缩小选区。
     pub fn select_range(&mut self, listing: &Listing, path: PathBuf) {
+        self.version += 1;
         let target = listing.position_of(&path);
         let anchor = self
             .anchor
@@ -647,6 +662,7 @@ impl Selection {
     }
 
     pub fn select_all(&mut self, listing: &Listing) {
+        self.version += 1;
         self.paths.clear();
         for position in 0..listing.visible_count() {
             if let Some(entry) = listing.visible_entry(position) {
@@ -691,6 +707,7 @@ impl Selection {
 
     /// 目录刷新后丢掉已经不存在的路径。
     pub fn retain_existing(&mut self, listing: &Listing) {
+        self.version += 1;
         let before = self.paths.len();
         self.paths.retain(|path| listing.entry(path).is_some());
 
@@ -1152,6 +1169,55 @@ mod tests {
 
         assert_eq!(selection.len(), 0);
         assert_eq!(selection.single(), None);
+    }
+
+    /// 每一个改选中项的方法都要让 `version` 往前走一格。
+    ///
+    /// 跨帧缓存（拖动载荷、详情板汇总）全靠它判新鲜度（见 `Pane::freshness`）：
+    /// 漏掉一个方法，用户看到的是"拖起来的是上一批""板子报着旧个数"——
+    /// 不报错、也不容易复现的那种毛病。加了新的改法就来这里补一行。
+    #[test]
+    fn every_selection_change_bumps_the_version() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+            fs::write(root.path().join(name), "x").unwrap();
+        }
+        let listing = listing_of(root.path());
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|position| {
+                listing
+                    .visible_entry(position)
+                    .expect("三行都在")
+                    .path
+                    .clone()
+            })
+            .collect();
+
+        let mut selection = Selection::default();
+        let mut before = selection.version();
+        let mut moved = |selection: &Selection, what: &str| {
+            let now = selection.version();
+            assert!(
+                now > before,
+                "{what} 要让 version 往前走（{before} -> {now}）"
+            );
+            before = now;
+        };
+
+        selection.select(paths[0].clone());
+        moved(&selection, "select");
+        selection.toggle(paths[1].clone());
+        moved(&selection, "toggle");
+        selection.select_range(&listing, paths[2].clone());
+        moved(&selection, "select_range");
+        selection.select_many(paths.clone(), None);
+        moved(&selection, "select_many");
+        selection.select_all(&listing);
+        moved(&selection, "select_all");
+        selection.retain_existing(&listing);
+        moved(&selection, "retain_existing");
+        selection.clear();
+        moved(&selection, "clear");
     }
 
     /// 锚点被 Command 点击取消掉之后，落到"选中项里最小的那条路径"上。
