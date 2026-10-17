@@ -2635,6 +2635,7 @@ impl WFilesApp {
             PaneCommand::Undo,
             PaneCommand::Refresh,
             PaneCommand::GoUp,
+            PaneCommand::EditLocation,
             PaneCommand::CopyPath,
             PaneCommand::CopyFileName,
             PaneCommand::OpenTerminal,
@@ -3285,6 +3286,12 @@ impl WFilesApp {
                 Self::shortcut_of(command, cx),
                 files,
                 "edit 编辑 remote 远程 回传 上传 upload",
+            ),
+            PaneCommand::EditLocation => (
+                crate::i18n::tr(cx, "编辑路径"),
+                Self::shortcut_of(command, cx),
+                view,
+                "path 路径 地址栏 前往 location address bar",
             ),
             // 换视图不作用于文件，归到"视图"组里更好找。
             PaneCommand::ViewList => (

@@ -91,6 +91,11 @@ pub fn defaults(command: PaneCommand) -> &'static [&'static str] {
         PaneCommand::Undo => &["cmd-z"],
         PaneCommand::Refresh => &["cmd-r"],
         PaneCommand::GoUp => &["backspace", "cmd-up"],
+        // Cmd+L 是"跳到地址栏"的老键位：浏览器、VS Code、GNOME Files 都是它，
+        // Explorer 那边是 Ctrl+L / Alt+D（本项目的键位一律按 `cmd-` 前缀描述）。
+        // 不照抄 Finder 的 Cmd+Shift+G：那是**弹一个框**问去哪儿，与此处的
+        // "就地编辑地址栏"是两种交互。
+        PaneCommand::EditLocation => &["cmd-l"],
         PaneCommand::CopyPath => &["cmd-alt-c"],
         PaneCommand::CopyFileName => &["cmd-shift-c"],
         PaneCommand::OpenTerminal => &["cmd-alt-t"],

@@ -36,6 +36,7 @@ use crate::marks;
 use crate::meta::{Metadata, MetadataEvent};
 use crate::model::{FileEntry, Listing, Selection, Sort, SortKey, ViewMode};
 use crate::ops_entity::{Ops, OpsEvent};
+use crate::path_input::{self, Target};
 use crate::preview::{self, Preview};
 use crate::remote;
 use crate::remotes::{Remotes, RemotesEvent};
@@ -206,6 +207,7 @@ gpui_kit::actions!(
         SelectAll,
         Open,
         OpenParent,
+        EditLocation,
         GoBack,
         GoForward,
         Refresh,
@@ -289,6 +291,7 @@ fn key_binding_for(
         PaneCommand::Undo => KeyBinding::new(key, Undo, context),
         PaneCommand::Refresh => KeyBinding::new(key, Refresh, context),
         PaneCommand::GoUp => KeyBinding::new(key, OpenParent, context),
+        PaneCommand::EditLocation => KeyBinding::new(key, EditLocation, context),
         PaneCommand::CopyPath => KeyBinding::new(key, CopyPath, context),
         PaneCommand::CopyFileName => KeyBinding::new(key, CopyFileName, context),
         PaneCommand::OpenTerminal => KeyBinding::new(key, OpenTerminal, context),
@@ -348,6 +351,8 @@ pub enum PaneCommand {
     Undo,
     Refresh,
     GoUp,
+    /// 把地址栏变成可编辑的路径：敲一句话，回车过去（`cmd-l`）。
+    EditLocation,
     CopyPath,
     CopyFileName,
     OpenTerminal,
@@ -378,7 +383,7 @@ pub enum PaneCommand {
 
 impl PaneCommand {
     /// 全部命令。配置层与命令面板都靠它枚举，加一条命令只改这一处。
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::NewFolder,
         Self::Rename,
         Self::BulkRename,
@@ -389,6 +394,7 @@ impl PaneCommand {
         Self::Undo,
         Self::Refresh,
         Self::GoUp,
+        Self::EditLocation,
         Self::CopyPath,
         Self::CopyFileName,
         Self::OpenTerminal,
@@ -422,6 +428,7 @@ impl PaneCommand {
             Self::Undo => "undo",
             Self::Refresh => "refresh",
             Self::GoUp => "go_up",
+            Self::EditLocation => "edit_location",
             Self::CopyPath => "copy_path",
             Self::CopyFileName => "copy_file_name",
             Self::OpenTerminal => "open_terminal",
@@ -458,6 +465,9 @@ impl PaneCommand {
             Self::Undo => "undo 恢复 快捷键 按键 keybinding",
             Self::Refresh => "refresh 重新读取 快捷键 按键 keybinding",
             Self::GoUp => "up parent 上级 快捷键 按键 keybinding",
+            Self::EditLocation => {
+                "path 路径 地址栏 输入 前往 location address bar 快捷键 按键 keybinding"
+            }
             Self::CopyPath => "path 剪贴板 快捷键 按键 keybinding",
             Self::CopyFileName => "name 剪贴板 快捷键 按键 keybinding",
             Self::OpenTerminal => "terminal 终端 shell 快捷键 按键 keybinding",
@@ -643,6 +653,12 @@ pub struct Pane {
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
     filter: Entity<InputState>,
+    /// 地址栏那个路径输入框。跟 `filter` 一样**常驻**：每进一次编辑就
+    /// 新建一个 `InputState` 的话，它每次都要重新注册焦点与输入法状态，
+    /// 而这里只是一进一出，值由 `start_edit_location` 现填。
+    location: Entity<InputState>,
+    /// 地址栏现在是不是输入框（真 = 面包屑收起来）。
+    editing_location: bool,
     focus: FocusHandle,
     /// 最近一次读取目录失败的原因，显示在状态栏里。
     error: Option<crate::i18n::Msg>,
@@ -985,6 +1001,9 @@ impl Pane {
         let filter = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(cx, "筛选当前文件夹"))
         });
+        let location = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(cx, "输入路径，回车前往"))
+        });
         let (listing, error) = match Listing::read(&path, shows_hidden(cx)) {
             Ok(listing) => (listing, None),
             Err(error) => (Listing::empty(path.clone()), Some(error)),
@@ -1002,6 +1021,8 @@ impl Pane {
             back: Vec::new(),
             forward: Vec::new(),
             filter,
+            location,
+            editing_location: false,
             focus: cx.focus_handle(),
             error,
             status: String::new(),
@@ -1039,6 +1060,20 @@ impl Pane {
                 if matches!(event, InputEvent::Change) {
                     this.on_filter_changed(cx);
                 }
+            },
+        ));
+        pane.subscriptions.push(cx.subscribe_in(
+            &pane.location,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                // 回车是 kit 的正门（输入框自己消费回车、发出这个事件）。
+                // Esc 走地址栏那层的 `on_key_down`——输入框把它吃掉了，
+                // 这里收不到。
+                InputEvent::PressEnter { .. } => this.submit_location(window, cx),
+                // 失焦 = 用户点到别处去了，跟 Explorer 一样收起输入框，
+                // 但**不把键盘抢回来**——那一刻键盘已经在他手上。
+                InputEvent::Blur => this.end_edit_location(false, window, cx),
+                _ => {}
             },
         ));
         pane.subscriptions.push(cx.subscribe_in(
@@ -1574,6 +1609,89 @@ impl Pane {
         self.listing.set_query("");
         self.filter
             .update(cx, |filter, cx| filter.set_value("", window, cx));
+    }
+
+    /// 地址栏切成输入框：填上当前目录的**真实路径**（不是折叠后的面包屑）、
+    /// 全选、键盘交给它。
+    ///
+    /// 为什么填真实路径而不是把面包屑抄一遍：面包屑里那些 `…` 是给人看的，
+    /// 抄进输入框就是一个不存在的目录名——用户什么也没改，回车却得到
+    /// "找不到"。
+    ///
+    /// 幂等：编辑中再按一次 `cmd-l` 只是把路径重新填一遍并全选，
+    /// 相当于"重来一次"（跟浏览器地址栏一样）。
+    pub fn start_edit_location(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.listing.path().to_string_lossy().into_owned();
+        self.editing_location = true;
+        self.location.update(cx, |input, cx| {
+            input.set_value(path, window, cx);
+            input.select_all(window, cx);
+        });
+        window.focus(&self.location.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// 收起输入框、回到面包屑。
+    ///
+    /// `take_focus` 是"要不要把键盘收回来"：回车与 Esc 是我们自己把键盘
+    /// 挪进输入框的，要还；**失焦是用户点了别处**，那一刻键盘已经在他手上，
+    /// 再抢回来就成了"点哪都跳回列表"。
+    fn end_edit_location(&mut self, take_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing_location {
+            return;
+        }
+        self.editing_location = false;
+        if take_focus {
+            self.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 回车：照着 [`crate::path_input::resolve`] 的四种结局走。
+    fn submit_location(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing_location {
+            return;
+        }
+        let text = self.location.read(cx).value().to_string();
+        let cwd = self.listing.path().to_path_buf();
+        // 远程位置（`dav://连接/子路径`）不是文件系统路径，交给导航那条支路
+        // 自己认——跟侧栏点一个远程连接走的是同一条路。从别处拷一条远程
+        // 路径粘进地址栏就该能直接过去；不认它的话，它会被当成相对路径，
+        // 用户得到一句莫名其妙的"找不到"。
+        if remote::parse_location(Path::new(text.trim())).is_some() {
+            self.end_edit_location(true, window, cx);
+            self.navigate_to(PathBuf::from(text.trim()), true, window, cx);
+            return;
+        }
+        match path_input::resolve(&text, &cwd) {
+            Target::Nothing => self.end_edit_location(true, window, cx),
+            Target::Directory(dir) => {
+                self.end_edit_location(true, window, cx);
+                self.navigate_to(dir, true, window, cx);
+            }
+            Target::File(file) => {
+                self.end_edit_location(true, window, cx);
+                // 去父目录、再把它选中——地址栏是**导航**，
+                // "前往某个文件"的含义一向是"带我去看它在哪儿"
+                // （跟启动参数那条 `--reveal` 走同一条路）。
+                if let Some(parent) = file.parent().map(Path::to_path_buf) {
+                    self.navigate_to(parent, true, window, cx);
+                    self.select_path(&file, cx);
+                }
+            }
+            Target::Missing(path) => {
+                // 不导航、也不收起输入框：多半只是敲错一个字母，
+                // 话留着、选中留着，用户改一个字就能走。
+                self.status = crate::i18n::tr_args(
+                    cx,
+                    "找不到路径：{path}",
+                    &[("path", path.display().to_string())],
+                );
+                self.location
+                    .update(cx, |input, cx| input.select_all(window, cx));
+                cx.notify();
+            }
+        }
     }
 
     pub fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2573,6 +2691,7 @@ impl Pane {
             PaneCommand::Undo => self.request_undo(cx),
             PaneCommand::Refresh => self.refresh(cx),
             PaneCommand::GoUp => self.go_up(window, cx),
+            PaneCommand::EditLocation => self.start_edit_location(window, cx),
             PaneCommand::CopyPath => self.copy_paths(cx),
             PaneCommand::CopyFileName => self.copy_file_names(cx),
             PaneCommand::OpenTerminal => self.open_terminal(cx),
@@ -2844,7 +2963,7 @@ impl Pane {
             )
             // 面包屑吃掉这一行剩下的全部宽度：窄的时候它先被压到 18px，
             // 再窄就只剩那条分隔线，但筛选框与刷新永远还在。
-            .child(self.render_breadcrumb(cx))
+            .child(self.render_location(cx))
             .child(
                 Button::new("refresh")
                     .icon(IconName::RefreshCw)
@@ -3314,6 +3433,62 @@ impl Pane {
             })
     }
 
+    /// 地址栏中间那一块：**不在编辑时是面包屑，在编辑时是一个路径输入框**。
+    ///
+    /// 两者共用同一个 id（`breadcrumb`）：布局测试量的是"这一块占多宽、
+    /// 有没有越界"，跟里面装的是面包屑还是输入框无关。
+    ///
+    /// 进编辑有三条路：`cmd-l`、点当前那一段（它在 Explorer 里就是"点一下
+    /// 变路径"），以及点这一段右边**没被任何一段占住的空白**。
+    ///
+    /// 空白区做成一个占满剩余宽度的**兄弟元素**（`location-blank`），
+    /// 而不是挂在容器上的 `on_click`：容器级处理器会被子元素的点击连带上
+    /// （事件先给子、再往上冒），点在祖先段上就会"又导航又进编辑"。
+    /// 兄弟元素跟谁都不重叠，不用去追究谁该吞掉事件。
+    fn render_location(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.editing_location {
+            return div()
+                .id("breadcrumb")
+                .test_support()
+                .h(px(32.))
+                .flex_1()
+                .min_w_0()
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().background)
+                // Esc 在这里收下：这层包着输入框，按键先冒到这儿。
+                //
+                // **这条不是保险，是唯一生效的路**（红检过）：输入框自己在
+                // `Input` 上下文里绑了 `escape → Escape`，按键被它吃掉，
+                // 于是窗格那条 `escape → 清空选中` 根本轮不到——拿掉这一段，
+                // Esc 就关不掉输入框（实测）。
+                //
+                // 回车**不在这里**管：输入框自己会消费回车并发出
+                // `PressEnter`（订阅见 `Pane::new`），那条路是 kit 的正门。
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.end_edit_location(true, window, cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .id("location-input")
+                        .test_support()
+                        .w_full()
+                        .min_w_0()
+                        .child(Input::new(&self.location).w_full()),
+                )
+                .into_any_element();
+        }
+
+        self.render_breadcrumb(cx).into_any_element()
+    }
+
     /// 面包屑：每一段都能点，段数太多时把老段收进一个「…」。
     ///
     /// **为什么必须折叠而不是压缩**：路径层级是用户选的，深浅不由窗口宽窄决定。
@@ -3417,6 +3592,14 @@ impl Pane {
                     .max_w(px(280.))
                     .font_medium()
                     .text_color(current_color)
+                    // 点当前这一段 = 编辑路径（Explorer 就是这行为）。
+                    // 它原来没有任何点击行为，而当前段本来就点不出别的结果：
+                    // 点它进编辑，比"必须瞄准它右边那条缝"宽容得多。
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.start_edit_location(window, cx);
+                    }))
             } else {
                 // 祖先段**不给 min_w**：那是最小尺寸的硬底，一有它整行就永远
                 // 缩不进容器（实测给20px 保底时，520px 窗口里行宽仍是 236px，
@@ -3461,6 +3644,24 @@ impl Pane {
                     .into_any_element(),
             );
         }
+
+        // 右边那条没被任何一段占住的空白：点它进编辑。
+        //
+        // `flex_1`（基宽 0）让它吃掉面包屑没占满的宽度，而路径长到装不下时
+        // 它缩到 0 宽——**不会从任何一段身上抢宽度**（收缩量按 `shrink × 基宽`
+        // 分摊，它的基宽是 0）。所以它只是"多出来的那块地方"的一个把手。
+        children.push(
+            div()
+                .id("location-blank")
+                .test_support()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.start_edit_location(window, cx);
+                }))
+                .into_any_element(),
+        );
 
         div()
             .id("breadcrumb")
@@ -4705,14 +4906,19 @@ impl Pane {
             .on_action(cx.listener(|this, _: &OpenParent, window, cx| {
                 this.run_command(PaneCommand::GoUp, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &EditLocation, window, cx| {
+                this.run_command(PaneCommand::EditLocation, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &GoBack, window, cx| this.go_back(window, cx)))
             .on_action(cx.listener(|this, _: &GoForward, window, cx| this.go_forward(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, window, cx| {
                 this.run_command(PaneCommand::Refresh, window, cx)
             }))
             // Esc 有优先顺序：先看有没有浮层要关，没有才轮到清空选中。
+            //
+            // 地址栏在编辑时轮不到这里：输入框把它那把 `escape` 吃掉了，
+            // 只有包着它的那一层收得到（见 `render_location` 里那段注释）。
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
-                // Esc 有优先顺序：先看有没有浮层要关，没有才轮到清空选中。
                 if this.quick_look_open() {
                     this.close_quick_look(cx);
                 } else if this.archive_open() {
@@ -5090,6 +5296,7 @@ impl Pane {
             PaneCommand::Undo => "撤销",
             PaneCommand::Refresh => "刷新",
             PaneCommand::GoUp => "上一级",
+            PaneCommand::EditLocation => "编辑路径",
             PaneCommand::CopyPath => "复制路径",
             PaneCommand::CopyFileName => "复制文件名",
             PaneCommand::OpenTerminal => "打开终端",

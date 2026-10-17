@@ -25,6 +25,7 @@ mod ops;
 mod ops_entity;
 mod palette;
 mod pane;
+mod path_input;
 // 性能基准只在测试构建里存在：里面的 `FileEntry::for_test` 是
 // `#[cfg(test)]` 的，非 test 构建会报"找不到这个函数"。
 #[cfg(test)]

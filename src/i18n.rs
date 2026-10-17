@@ -728,6 +728,9 @@ static EN: &[(&str, &str)] = &[
     ("剪切（Cmd+X）", "Cut (Cmd+X)"),
     ("粘贴（Cmd+V）", "Paste (Cmd+V)"),
     ("筛选当前文件夹", "Filter this folder"),
+    ("编辑路径", "Edit Path"),
+    ("输入路径，回车前往", "Type a path, press Enter"),
+    ("找不到路径：{path}", "Path not found: {path}"),
     // ---- 窗格：列表表头与排序 ----
     ("修改时间", "Modified"),
     ("升序", "ascending"),

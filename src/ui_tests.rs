@@ -240,6 +240,32 @@ fn open_in(
     )
 }
 
+/// [`open_in`] 但把应用实体一起交出来。
+///
+/// 地址栏那几条测试要读"这一栏现在在哪个目录、选中了什么"——那是断言的
+/// 真实数据源，比从界面外观上猜准（界面这一层能读到的只有坐标和无障碍名）。
+fn open_in_with_app(
+    cx: &mut TestAppContext,
+    dir: &Path,
+) -> (
+    SessionIsolation,
+    gpui_kit::WindowHandle<Root>,
+    gpui_kit::Entity<WFilesApp>,
+) {
+    let isolation = isolate_session();
+    Session {
+        tabs: vec![dir.to_path_buf()],
+        active: 0,
+        split: None,
+        focus_on_left: true,
+        sync: false,
+    }
+    .save_to(&isolation.path().join("session.json"))
+    .expect("写测试会话");
+    let (handle, app) = open_app_of_width(cx, 1180.);
+    (isolation, handle, app)
+}
+
 /// [`open_in`] 但指定窗口宽度：布局相关的测试必须走这个。
 ///
 /// 布局测试一定要用这个而不是 `open_in`——`open_in` 内部调的是
@@ -6193,6 +6219,336 @@ fn the_path_starts_at_the_left_edge(cx: &mut TestAppContext) {
     );
 }
 
+/// 地址栏点一下就能改：进门有三条路（点空白 / 点当前那一段 / `cmd-l`），
+/// 出门有两条（回车前往、Esc 放下）。
+#[gpui_kit::test]
+fn the_address_bar_becomes_an_editable_path_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    // 造两行：下面要验"收掉输入框之后窗格级的按键还灵不灵"，得有两行
+    // 才看得出**这一次**按键真的生效了（只有一行的话，上一轮的选中
+    // 会伪装成这一轮通过）。
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+    std::fs::write(dir.path().join("b.txt"), "x").expect("造文件");
+    let (_isolation, handle, app) = open_in_with_app(cx, dir.path());
+    step(cx, handle, settle);
+    let before = cx.update(|cx| app.read(cx).tab_paths(cx));
+
+    // ① 点面包屑右边那条空白。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-blank").is_some(),
+            "面包屑右边该留有一条可点的空白",
+        );
+        window.click("location-blank", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-input").is_some(),
+            "点空白之后该出现路径输入框",
+        );
+        assert!(
+            deepest_crumb(window).is_none(),
+            "编辑时面包屑该整个让位，不是叠在上面",
+        );
+    });
+
+    // ② 一个字都不改，直接回车：收起输入框、留在原地。
+    //    这一条顺带钉住"预填的是**真实路径**"——填进去的要是折叠后的那串
+    //    （「…」），回车会得到"找不到"，输入框根本不会收。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-input").is_none(),
+            "回车之后该收起输入框",
+        );
+        assert!(deepest_crumb(window).is_some(), "面包屑该回来",);
+    });
+    assert_eq!(
+        cx.update(|cx| app.read(cx).tab_paths(cx)),
+        before,
+        "一个字没改就回车，该还在原来那个目录",
+    );
+
+    // 键盘必须有人接手：地址栏那一块是**当场从渲染树里撤掉**的，焦点要是
+    // 还挂在它身上，窗格级的快捷键会整片变哑——不报错、不留痕（AGENTS.md
+    // 记着这个坑）。判据只能是"再按一个键看看灵不灵"：焦点在不在渲染树里，
+    // 从界面上看不出来。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("down", cx);
+    });
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["a.txt".to_string()],
+        "回车收掉输入框之后，窗格级的按键该还灵（↓ 得能选中第一行）",
+    );
+
+    // ③ `cmd-l` 进门、Esc 出门。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-l", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-input").is_some(),
+            "cmd-l 该进编辑",
+        );
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-input").is_none(),
+            "Esc 该收起输入框",
+        );
+        // Esc 这条路，把键盘收回来的**只有** `end_edit_location` 那一句
+        // （回车那条路上 `navigate_to` 顺手也会收）。所以这一条探针才是
+        // 它的判据：再按一次 ↓，选中该从 a.txt 挪到 b.txt。
+        window.press("down", cx);
+    });
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["b.txt".to_string()],
+        "Esc 收起输入框之后，窗格级的按键该还灵（↓ 得能挪到第二行）",
+    );
+
+    // ④ 点**当前那一段**也进编辑（Explorer 就是这个行为）。
+    let current = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        deepest_crumb_index(window)
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("crumb", current), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-input").is_some(),
+            "点当前那一段该进编辑",
+        );
+    });
+}
+
+/// 敲一条路径回车：真的过去。
+#[gpui_kit::test]
+fn typing_a_path_goes_there(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    // 名字里带空格：路径是**照字面**走的，谁也不许在中间替用户拆词。
+    let target = dir.path().join("目标 目录");
+    std::fs::create_dir(&target).expect("造目录");
+    // 另造一个排在最前头的兄弟目录，一会儿先把它选中（见下面那段）。
+    let other = dir.path().join("aa-另一条");
+    std::fs::create_dir(&other).expect("造目录");
+    let (_isolation, handle, app) = open_in_with_app(cx, dir.path());
+    step(cx, handle, settle);
+
+    // 先选中一行：回车要是被窗格那条"打开选中项"接走了，下面就会落在
+    // `aa-另一条` 上，而不是我敲的那条。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    assert_eq!(selected_names(cx, &app), vec!["aa-另一条".to_string()]);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-l", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 输入框里现在是全选的当前路径：直接敲就是把它整条换掉。
+        window.input(&target.to_string_lossy(), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-input").is_none(),
+            "到了就该收起输入框",
+        );
+    });
+
+    let live = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert_eq!(live.len(), 1, "还是那一栏");
+    assert!(
+        same_dir(&live[0], &target),
+        "该去我敲的那条 {}，实际是 {}——回车只该前往地址栏里的路径，\
+         不该顺手打开选中的那一行",
+        target.display(),
+        live[0].display(),
+    );
+}
+
+/// 敲一个**文件**的路径回车：去它所在的目录，并把它选中。
+#[gpui_kit::test]
+fn typing_a_file_reveals_it_in_its_folder(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("报告.txt"), "x").expect("造文件");
+    let file = dir.path().join("报告.txt");
+    let (_isolation, handle, app) = open_in_with_app(cx, dir.path());
+    step(cx, handle, settle);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-l", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.input(&file.to_string_lossy(), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("enter", cx);
+    });
+    step(cx, handle, settle);
+
+    let live = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert!(
+        same_dir(&live[0], dir.path()),
+        "该停在文件所在的那个目录，实际是 {}",
+        live[0].display(),
+    );
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["报告.txt".to_string()],
+        "该把那个文件选中——地址栏说的是\"带我去看它在哪儿\"",
+    );
+}
+
+/// 路径不存在：不导航、**不收起输入框**，状态栏把话说明白。
+#[gpui_kit::test]
+fn a_path_that_does_not_exist_keeps_the_field_open(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (_isolation, handle, app) = open_in_with_app(cx, dir.path());
+    step(cx, handle, settle);
+    let before = cx.update(|cx| app.read(cx).tab_paths(cx));
+
+    let missing = dir.path().join("并没有这个目录");
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-l", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.input(&missing.to_string_lossy(), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("enter", cx);
+    });
+
+    let status = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-input").is_some(),
+            "敲错了不该把输入框收掉——用户还要在那上面改字",
+        );
+        a11y_label_at(window, "pane-status")
+    });
+    let needle = missing.to_string_lossy().into_owned();
+    assert!(
+        status.contains(&needle),
+        "状态栏该点出是哪条路径没找到（{needle}），实际是 {status:?}",
+    );
+    assert_eq!(
+        cx.update(|cx| app.read(cx).tab_paths(cx)),
+        before,
+        "路径不存在就不许导航",
+    );
+}
+
+/// 远程位置的写法（`dav://连接/子路径`）粘进地址栏：去那儿，
+/// 而不是被当成一条相对路径说「找不到」。
+///
+/// 用了一个不存在的连接 id，是**故意的**：`Remotes::client` 认不出这个 id
+/// 就到此为止（不会去开后台任务），测试因此是确定的——等真起了服务器
+/// 那套再来测这一条，就变成在测网络了。
+#[gpui_kit::test]
+fn a_remote_location_can_be_typed_into_the_address_bar(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (_isolation, handle, app) = open_in_with_app(cx, dir.path());
+    step(cx, handle, settle);
+
+    let location = crate::remote::location("没接过的连接", "子目录");
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-l", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.input(&location.to_string_lossy(), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("enter", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-input").is_none(),
+            "认得的远程位置就该走，不该停在编辑状态",
+        );
+    });
+
+    let live = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert_eq!(
+        live,
+        vec![location],
+        "该落到那条远程位置上，而不是「找不到」",
+    );
+}
+///
+/// 这是"可点的空白做成兄弟元素、不挂在面包屑容器上"的判据：容器级的点击
+/// 处理器会被子元素连带上（事件先给子、再往上冒），一次点击就既导航
+/// 又进编辑。这条测试在换回容器级写法时**必然**变红。
+#[gpui_kit::test]
+fn clicking_an_ancestor_crumb_navigates_without_editing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let deep = dir.path().join("子目录");
+    std::fs::create_dir(&deep).expect("造目录");
+    let (_isolation, handle, app) = open_in_with_app(cx, &deep);
+    step(cx, handle, settle);
+
+    // 屏幕上最左边那一段——它是某一级祖先，点它该往上走。
+    // （深路径上它**不是**根：屏幕上只留最后 `MAX_CRUMBS` 段，再往上的
+    // 老段收进了「…」。所以断言只要求"走到了某一级祖先"。）
+    let first = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (0..24usize)
+            .find(|index| window.try_find(("crumb", *index)).is_some())
+            .expect("该有一段面包屑")
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("crumb", first), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("location-input").is_none(),
+            "点祖先段是导航，不该顺手进编辑",
+        );
+    });
+
+    let live = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert!(
+        !same_dir(&live[0], &deep) && deep.starts_with(&live[0]),
+        "该往上走到某一级祖先，实际是 {}",
+        live[0].display(),
+    );
+}
+
 /// 面包屑里序号最大的那一段，也就是当前目录。
 ///
 /// 序号不能写死成"第几层"：临时目录本身带着 `/var/folders/...` 与随机串，
@@ -6206,6 +6562,16 @@ fn deepest_crumb(window: &mut gpui_kit::Window) -> Option<Bounds<Pixels>> {
     (0..24usize)
         .rev()
         .find_map(|index| window.try_find(("crumb", index)).map(|it| it.bounds()))
+}
+
+/// 当前目录那一段的**序号**（屏幕上看最后一段面包屑）。
+///
+/// [`deepest_crumb`] 给的是坐标，要按着它点就得知道序号。
+fn deepest_crumb_index(window: &mut gpui_kit::Window) -> usize {
+    (0..24usize)
+        .rev()
+        .find(|index| window.try_find(("crumb", *index)).is_some())
+        .expect("该有一段面包屑")
 }
 
 /// Quick Look 的遮罩要盖住**整个窗口**，不只是窗格那一块。
