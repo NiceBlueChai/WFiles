@@ -6738,6 +6738,40 @@ fn the_sidebar_speaks_english_when_english_is_chosen(cx: &mut TestAppContext) {
     assert_eq!(english.2, "Local file system");
 }
 
+/// 侧栏左下那颗「本地文件系统」是**能点的**：一步回到本机根。
+///
+/// 这颗真正的用途是从远程连接里退回来——本机根由
+/// [`crate::volumes::machine_root`] 给（macOS/Linux 是 `/`，Windows 是系统盘），
+/// 断言直接跟它比，别在测试里写死那个路径。
+#[gpui_kit::test]
+fn the_sidebar_local_row_goes_to_the_machine_root(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (_isolation, handle, app) = open_in_with_app(cx, dir.path());
+    step(cx, handle, settle);
+
+    let root = crate::volumes::machine_root();
+    let before = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert!(
+        !same_dir(&before[0], &root),
+        "起点不该已经就是本机根（{}），否则这条测试什么都没验到",
+        root.display(),
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("sidebar-local", cx);
+    });
+    step(cx, handle, settle);
+
+    let live = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert!(
+        same_dir(&live[0], &root),
+        "点「本地文件系统」该到 {}，实际是 {}",
+        root.display(),
+        live[0].display(),
+    );
+}
+
 #[gpui_kit::test]
 fn sidebar_place_names_follow_the_chosen_language(cx: &mut TestAppContext) {
     let _session = isolate_session();

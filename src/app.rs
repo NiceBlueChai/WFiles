@@ -782,7 +782,11 @@ impl WFilesApp {
             .child(self.render_cloud_section(cx))
             .child(self.render_remote_section(cx))
             .child(div().flex_1())
-            .child(
+            .child({
+                // 这颗是"无论在哪儿，一步回到本机"——也就是从远程连接里退回来
+                // 的那条路。所以它不走 `places()`：那些是"去某个目录"，这是
+                // "去整台机器"，`machine_root()` 三平台各给一个真实落点。
+                let hover = cx.theme().border;
                 h_flex()
                     .id("sidebar-local")
                     .test_support()
@@ -793,9 +797,14 @@ impl WFilesApp {
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().muted)
                     .text_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(hover))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.navigate_active_tab(crate::volumes::machine_root(), window, cx);
+                    }))
                     .child(Icon::new(IconName::HardDrive).size_4())
-                    .child(crate::i18n::tr(cx, "本地文件系统")),
-            )
+                    .child(crate::i18n::tr(cx, "本地文件系统"))
+            })
             .into_any_element()
     }
 

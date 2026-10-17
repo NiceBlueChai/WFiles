@@ -131,6 +131,33 @@ fn finish(mut volumes: Vec<Volume>) -> Vec<Volume> {
 }
 
 /// 本机上，卷会出现在哪儿。
+/// 这一台机器的文件系统根——侧栏左下那颗「本地文件系统」点了去哪儿。
+///
+/// 这里给的是"整台机器"那一层，不是某一个卷：
+///
+/// - macOS / Linux：`/`，一切挂载点的父目录。
+/// - Windows：没有统一的根，按惯例取系统盘（`%SystemDrive%`）；环境变量
+///   拿不到就退回 `C:\`——绝大多数机器上它就是系统盘，而真改过盘符的
+///   机器在侧栏的磁盘区里另有入口。
+///
+/// 为什么不干脆列"卷"：那是 [`roots`] + [`mounted_under`]（侧栏的磁盘区）
+/// 已经在做的事。这一颗的用途是"无论在哪儿，一步回到本机"，也就是从远程
+/// 连接里退回来的那条路——所以它得是一个真实、唯一、跨平台都有的落点。
+pub fn machine_root() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let drive = std::env::var("SystemDrive")
+            .ok()
+            .filter(|it| !it.is_empty())
+            .unwrap_or_else(|| "C:".to_string());
+        PathBuf::from(format!("{drive}\\"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from("/")
+    }
+}
+
 fn roots() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -249,6 +276,21 @@ pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// 本机根是这个入口对外唯一的承诺：**绝对路径**，而且真进得去。
+    #[test]
+    fn the_machine_root_is_a_real_absolute_directory() {
+        let root = machine_root();
+        assert!(root.is_absolute(), "{} 不是绝对路径", root.display());
+        assert!(root.is_dir(), "{} 进不去", root.display());
+    }
+
+    /// unix 上就是 `/`——不是 `/Volumes`，也不是家目录。
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_the_machine_root_is_the_slash() {
+        assert_eq!(machine_root(), Path::new("/"));
+    }
 
     /// Windows 扫盘符没法在 macOS 上验，跨平台的那部分逻辑放在
     /// [`mounted_under`] 里测——那才是真正在干活的地方。
