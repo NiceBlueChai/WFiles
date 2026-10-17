@@ -12,6 +12,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     list::ListItem,
+    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     *,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -225,6 +226,13 @@ pub fn init(cx: &mut App) {
 }
 
 pub struct WFilesApp {
+    /// 指向自己。
+    ///
+    /// 侧栏那些右键菜单项的回调只拿得到 `(&ClickEvent, &mut Window, &mut App)`
+    /// ——拿不到 `Context<WFilesApp>`，也就调不到这一层的方法。靠这个弱引用
+    /// 换回来（跟 `Pane::me` 同一个路子，连"外面套一层 `Rc`"的理由都一样：
+    /// 菜单项的闭包要求 `'static`，而 `WeakEntity` 不是 `Copy`）。
+    me: Rc<WeakEntity<Self>>,
     ops: Entity<Ops>,
     /// 缩略图缓存：所有标签共用一份，同一个文件只解一次。
     thumbs: Entity<Thumbnails>,
@@ -411,6 +419,7 @@ impl WFilesApp {
             .filter(|&index| index < tabs.len() && index != active);
 
         let mut app = Self {
+            me: Rc::new(cx.weak_entity()),
             ops: ops.clone(),
             thumbs,
             tabs,
@@ -654,6 +663,9 @@ impl WFilesApp {
             return self.render_sidebar_collapsed(cx);
         }
         let current = self.tabs[self.active].read(cx).path().to_path_buf();
+        // 每行的右键菜单要把动作送回这一层（`ListItem` 的菜单项回调拿不到
+        // `Context<Self>`，见 `WFilesApp::me`）。
+        let me = self.me.clone();
         let items = Self::places()
             .into_iter()
             .enumerate()
@@ -674,9 +686,16 @@ impl WFilesApp {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.navigate_active_tab(target.clone(), window, cx);
-                    }));
-                // 拖到侧边栏的位置上就是放进那个位置：
-                // `ListItem` 只实现了 `IntoElement`，挂不上拖放，外面套一层 div。
+                    }))
+                    .context_menu({
+                        let me = me.clone();
+                        let menu_path = path.clone();
+                        move |menu, _window, cx| {
+                            sidebar_place_menu(menu, &me, menu_path.clone(), true, cx)
+                        }
+                    });
+                // 拖到侧边栏的位置上就是放进那个位置：外面这层 div 管
+                // 这行的落点 id（`("place-drop", i)`）。
                 Self::drop_target(
                     div().id(("place-drop", index)).child(item),
                     path.clone(),
@@ -890,6 +909,7 @@ impl WFilesApp {
         }
         let current = self.tabs[self.active].read(cx).path().to_path_buf();
 
+        let me = self.me.clone();
         let rows: Vec<AnyElement> = favorites
             .iter()
             .enumerate()
@@ -919,7 +939,17 @@ impl WFilesApp {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_favorite(target.clone(), is_dir, window, cx);
-                    }));
+                    }))
+                    // 右键菜单：收藏这一段的行跟"位置/磁盘/云盘"同一种东西，
+                    // 同一份菜单。菜单挂在行上（`ListItem` 撑得起），
+                    // 外面那层是管拖放的，两者不打架。
+                    .context_menu({
+                        let me = me.clone();
+                        let menu_path = favorite.path.clone();
+                        move |menu, _window, cx| {
+                            sidebar_place_menu(menu, &me, menu_path.clone(), is_dir, cx)
+                        }
+                    });
                 // 拖到收藏项上 = 拷进去，跟拖到"位置"里的"下载"同理。
                 Self::drop_target(
                     div().id(("favorite-drop", index)).child(row),
@@ -970,6 +1000,67 @@ impl WFilesApp {
         });
     }
 
+    /// 在新窗口里打开这个位置：另起一个进程，带上 `--new-window`。
+    ///
+    /// **为什么另起进程，而不是在本进程再开一扇窗**：会话、窗口布局、崩溃
+    /// 恢复现场只有主窗写（见 [`Starting`]），本进程里能开的第二扇窗走的
+    /// 是"副窗"那套（只读）；另起一个进程拿到的是一扇完整的**主窗**——
+    /// 跟用户从 Dock 再点一次图标是一回事，也正合用户对"新窗口"的预期。
+    /// 命令行本来就为这条路留了口子（`--new-window` + 一个目录），这里只是
+    /// 把用户点的那一行翻译成那条命令。
+    fn open_in_new_window(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let spawned =
+            std::env::current_exe().and_then(|exe| new_window_command(&exe, &path).spawn());
+        if let Err(error) = spawned {
+            self.note_error(
+                crate::i18n::tr_args(cx, "开不了新窗口：{error}", &[("error", error.to_string())]),
+                cx,
+            );
+        }
+    }
+
+    /// 让用户确认删掉一条远程连接。
+    ///
+    /// 确认框由 [`Ops`] 拿着（五类对话框都在它那儿），点确定后
+    /// [`OpsEvent::ForgetRemote`] 回来，真正动手的是这一层——
+    /// 配置、钥匙串、目录缓存都在它手上（[`Self::forget_remote`]）。
+    fn ask_forget_remote(&mut self, id: String, label: String, cx: &mut Context<Self>) {
+        self.ops
+            .update(cx, |ops, cx| ops.ask_forget_remote(id, label, cx));
+    }
+
+    /// 交给系统拿默认应用打开：目录就是"在系统文件管理器里打开"。
+    fn open_externally(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Err(error) = open::that(&path) {
+            // IO 错误原样透传（"Permission denied" 已经是人话了，
+            // 翻了反而认不出，见 `i18n::Message` 那条注释）。
+            let message: crate::i18n::Message = error.into();
+            self.note_error(message.say(cx), cx);
+        }
+    }
+
+    /// 把一条路径写进剪贴板（侧栏右键菜单用）。
+    fn copy_path_text(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let paths = vec![path.to_path_buf()];
+        cx.write_to_clipboard(ClipboardItem::new_string(crate::clipboard::clipboard_text(
+            &paths,
+            crate::clipboard::ClipboardText::FullPath,
+        )));
+        self.note_error(
+            crate::i18n::tr_args(cx, "已复制 {count} 个路径", &[("count", "1".to_string())]),
+            cx,
+        );
+    }
+
+    /// 侧栏菜单里那些"交给系统"的动作出岔子了：写一句在侧栏下方那条提示里。
+    ///
+    /// 应用层没有状态栏（状态栏长在窗格里，说的是窗格的事），侧栏底下那条
+    /// `secret_note` 是现成的提示位——连接远程失败也走它。
+    fn note_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.secret_note = Some(message);
+        cx.notify();
+    }
+
     fn render_volumes_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.tabs[self.active].read(cx).path().to_path_buf();
         let volumes = crate::volumes::detected();
@@ -977,6 +1068,7 @@ impl WFilesApp {
             return div().into_any_element();
         }
 
+        let me = self.me.clone();
         let rows: Vec<AnyElement> = volumes
             .iter()
             .enumerate()
@@ -1001,7 +1093,14 @@ impl WFilesApp {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.navigate_active_tab(target.clone(), window, cx);
-                    }));
+                    }))
+                    .context_menu({
+                        let me = me.clone();
+                        let menu_path = volume.path.clone();
+                        move |menu, _window, cx| {
+                            sidebar_place_menu(menu, &me, menu_path.clone(), true, cx)
+                        }
+                    });
                 // 拖到某个卷上 = 拷进去，跟拖到"位置"里的"下载"是一个道理。
                 Self::drop_target(
                     div().id(("volume-drop", index)).child(row),
@@ -1041,6 +1140,7 @@ impl WFilesApp {
             return div().into_any_element();
         }
 
+        let me = self.me.clone();
         let rows: Vec<AnyElement> = roots
             .iter()
             .enumerate()
@@ -1067,7 +1167,14 @@ impl WFilesApp {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.navigate_active_tab(target.clone(), window, cx);
-                    }));
+                    }))
+                    .context_menu({
+                        let me = me.clone();
+                        let menu_path = root.path.clone();
+                        move |menu, _window, cx| {
+                            sidebar_place_menu(menu, &me, menu_path.clone(), true, cx)
+                        }
+                    });
                 row.into_any_element()
             })
             .collect();
@@ -1101,6 +1208,7 @@ impl WFilesApp {
         let armed = self.forget_armed.clone();
         let note = self.secret_note.clone();
 
+        let me = self.me.clone();
         let mut rows: Vec<AnyElement> = Vec::new();
         for (index, config) in saved.iter().enumerate() {
             let id = config.id.clone();
@@ -1123,7 +1231,24 @@ impl WFilesApp {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_remote(open_id.clone(), window, cx)
-                }));
+                }))
+                // 右键菜单（连删除一起，删除会弹确认框）。
+                .context_menu({
+                    let me = me.clone();
+                    let menu_id = id.clone();
+                    let menu_root = config.root.clone();
+                    let menu_label = name.clone();
+                    move |menu, _window, cx| {
+                        sidebar_remote_menu(
+                            menu,
+                            &me,
+                            menu_id.clone(),
+                            menu_root.clone(),
+                            menu_label.clone(),
+                            cx,
+                        )
+                    }
+                });
             rows.push(
                 h_flex()
                     .w_full()
@@ -2208,6 +2333,7 @@ impl WFilesApp {
                     self.hand_keyboard_to_active_pane(window, cx);
                 }
             }
+            OpsEvent::ForgetRemote { id } => self.forget_remote(id, window, cx),
         }
     }
 
@@ -4947,6 +5073,162 @@ impl Render for WFilesApp {
 
         root
     }
+}
+
+/// 侧栏一条右键菜单项。
+///
+/// 跟窗格那边同一个道理（见 `pane::context_item`）：菜单项的回调只拿得到
+/// `(&ClickEvent, &mut Window, &mut App)`，动作得靠 [`WFilesApp::me`] 那个
+/// 弱引用换回来。
+fn sidebar_item(
+    me: &Rc<WeakEntity<WFilesApp>>,
+    cx: &App,
+    label: &str,
+    icon: IconName,
+    enabled: bool,
+    run: impl Fn(&mut WFilesApp, &mut Window, &mut Context<WFilesApp>) + 'static,
+) -> PopupMenuItem {
+    let me = me.clone();
+    PopupMenuItem::new(crate::i18n::tr(cx, label))
+        .icon(icon)
+        .disabled(!enabled)
+        .on_click(move |_, window, cx| {
+            let _ = me.update(cx, |app, cx| run(app, window, cx));
+        })
+}
+
+/// 侧栏里一条"地方"（位置 / 磁盘 / 云盘 / 收藏）的右键菜单。
+///
+/// 这四段的行说到底是同一件事——"去某个地方"，菜单也就一样：怎么去，
+/// 外加认得路径的那几件。**每行自己挂一份**：侧栏的行与行是兄弟不是父子，
+/// 一次右键只会开出一份菜单（窗格那边就必须一层只挂一份，见
+/// `pane::with_context_menu`）。
+///
+/// 这里**没有「收藏 / 取消收藏」**：ROADMAP「收藏夹」一节里用户拍板过
+/// "`cmd-d` 再按一次取消（不做 hover 小 ×、不做右键菜单）"——侧栏里
+/// 那一条怎么撤由 `cmd-d` 一个人管，别开第二扇门（下次右键点到"下载"
+/// 顺手收藏了，用户会以为收藏也能从菜单里撤）。
+fn sidebar_place_menu(
+    menu: PopupMenu,
+    me: &Rc<WeakEntity<WFilesApp>>,
+    path: PathBuf,
+    is_dir: bool,
+    cx: &App,
+) -> PopupMenu {
+    let open = path.clone();
+    let tab = path.clone();
+    let other_window = path.clone();
+    let external = path.clone();
+    let copy = path.clone();
+    menu.item(sidebar_item(
+        me,
+        cx,
+        "打开",
+        IconName::FolderOpen,
+        true,
+        move |app, window, cx| app.open_favorite(open.clone(), is_dir, window, cx),
+    ))
+    .item(sidebar_item(
+        me,
+        cx,
+        "在新标签中打开",
+        IconName::Plus,
+        true,
+        move |app, window, cx| {
+            app.add_tab(tab.clone(), window, cx);
+            cx.notify();
+        },
+    ))
+    .item(sidebar_item(
+        me,
+        cx,
+        "在新窗口中打开",
+        IconName::Monitor,
+        true,
+        move |app, _, cx| app.open_in_new_window(other_window.clone(), cx),
+    ))
+    .separator()
+    .item(sidebar_item(
+        me,
+        cx,
+        "在系统文件管理器里打开",
+        IconName::ExternalLink,
+        true,
+        move |app, _, cx| app.open_externally(external.clone(), cx),
+    ))
+    .item(sidebar_item(
+        me,
+        cx,
+        "复制路径",
+        IconName::Link,
+        true,
+        move |app, _, cx| app.copy_path_text(&copy, cx),
+    ))
+}
+
+/// 侧栏里一条远程连接的右键菜单。
+///
+/// 跟本地那几段不同的两处：打开要先连（[`WFilesApp::open_remote`]），
+/// 删除要先问（连接删了就找不回来——钥匙串里那串密码跟着一起没）。
+fn sidebar_remote_menu(
+    menu: PopupMenu,
+    me: &Rc<WeakEntity<WFilesApp>>,
+    id: String,
+    root: String,
+    label: String,
+    cx: &App,
+) -> PopupMenu {
+    let location = remote::location(&id, &root);
+    let open = id.clone();
+    let tab = location.clone();
+    let copy = location.clone();
+    let forget = id.clone();
+    menu.item(sidebar_item(
+        me,
+        cx,
+        "打开",
+        IconName::Cloud,
+        true,
+        move |app, window, cx| app.open_remote(open.clone(), window, cx),
+    ))
+    .item(sidebar_item(
+        me,
+        cx,
+        "在新标签中打开",
+        IconName::Plus,
+        true,
+        move |app, window, cx| {
+            app.add_tab(tab.clone(), window, cx);
+            cx.notify();
+        },
+    ))
+    .item(sidebar_item(
+        me,
+        cx,
+        "复制路径",
+        IconName::Link,
+        true,
+        move |app, _, cx| app.copy_path_text(&copy, cx),
+    ))
+    .separator()
+    .item(sidebar_item(
+        me,
+        cx,
+        "删除连接",
+        IconName::Trash,
+        true,
+        move |app, _, cx| app.ask_forget_remote(forget.clone(), label.clone(), cx),
+    ))
+}
+
+/// 拼出"另起一个进程开一扇新窗"的那条命令。
+///
+/// 单独拎出来是因为它**纯**：参数写错了在真机上只表现为"点了没反应"，
+/// 而这里一眼看得见，也能钉在测试里。
+fn new_window_command(exe: &Path, path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    command.arg("--new-window").arg(path);
+    command
 }
 
 #[cfg(test)]

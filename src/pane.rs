@@ -18,7 +18,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     list::ListItem,
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{ContextMenu, ContextMenuExt, DropdownMenu as _, PopupMenu, PopupMenuItem},
     scroll::{ScrollableElement as _, ScrollbarAxis},
     v_virtual_list, *,
 };
@@ -316,6 +316,23 @@ pub enum PaneEvent {
 }
 
 impl EventEmitter<PaneEvent> for Pane {}
+
+/// 右键那一按落在哪儿：菜单只有一份（挂在容器上），内容照它分三份。
+///
+/// **为什么连坐标一起记**：按下事件先派给行、再派给容器（子先于父）。
+/// 行认得自己，容器只认得"这一按在框里"——把坐标留下，容器就能分辨
+/// 这一按有没有被行认领（同一个事件派发两处，坐标是同一个值）。
+/// 没有这一手，按在行上也会被容器当成空白处。
+#[derive(Clone, Debug)]
+enum ContextPress {
+    /// 列表 / 网格 / 当前那一列里的一行：菜单对着**选中的这一批**。
+    Row,
+    /// 分列视图里祖先列的一条（或者那一列的空白）：它不在选中集合里，
+    /// 菜单只做认得路径的那几件事。
+    Nav(PathBuf),
+    /// 空白处（含空目录）：菜单对着**当前这个目录**。
+    Blank,
+}
 
 /// 窗格能执行的命令。命令面板、快捷键都走这一个入口，
 /// 以后加“可配置快捷键”只需要在这里补一条，不用再散着接。
@@ -689,11 +706,270 @@ pub struct Pane {
     archive_busy: Option<Task<()>>,
     /// 正在给哪个文件做标记（颜色与标签）；`None` 就是没在标。
     marking: Option<MarkState>,
+    /// 右键那一按落在哪儿、落在哪个坐标上；见 [`ContextPress`]。
+    ///
+    /// 菜单实体是**下一帧**才建的（`ContextMenu` 用 `window.defer`），
+    /// 所以那一按得先存下来。`None` 是"从没按过"，按空白处算。
+    context_press: Option<(Point<Pixels>, ContextPress)>,
     /// 正在给哪条命令录新按键；`None` 就是没在录。
     capturing: Option<PaneCommand>,
     /// 录按键浮层的焦点；录的时候焦点必须在这上面才收得到键。
     capture_focus: FocusHandle,
     subscriptions: Vec<Subscription>,
+}
+
+/// 组装右键菜单，按[按下时落在哪儿][ContextPress]给三份清单。
+///
+/// 清单里的每一项都走**现成的命令**（[`PaneCommand`] → `run_command`）：
+/// 右键只是第二扇门，不是第二套功能——命令面板、快捷键、右键点下去进的是
+/// 同一间屋，可用性也一起跟着走，不会出现"菜单里灰着、快捷键却按得动"。
+fn context_menu(menu: PopupMenu, me: &Rc<WeakEntity<Pane>>, cx: &App) -> PopupMenu {
+    let Some(pane) = me.upgrade() else {
+        // 这一栏已经不在了（菜单是下一帧才建的）：给一份空菜单。
+        // 空的菜单不会被画出来（`ContextMenu` 建完先问 `is_empty`）。
+        return menu;
+    };
+    let pane = pane.read(cx);
+    let target = pane
+        .context_press
+        .clone()
+        .map(|(_, target)| target)
+        .unwrap_or(ContextPress::Blank);
+    let selected = pane.selection.len();
+    let can_paste = !pane.ops.read(cx).clipboard().paths.is_empty();
+    let hidden = shows_hidden(cx);
+
+    match target {
+        // 一行文件：对着选中的这一批。选中数是置灰的依据——
+        // 进得去、看到「当前不能按」比干脆不显示有用（跟「更多」菜单一致）。
+        //
+        // 这里**没有「收藏 / 取消收藏」**：ROADMAP「收藏夹」一节里用户拍板过
+        // "`cmd-d` 再按一次取消（不做 hover 小 ×、不做右键菜单）"，而这一项
+        // 的文案是跟着状态翻面的（已收藏时写"取消收藏"）——留着它就等于把
+        // 那条"撤销收藏不给右键"的决定绕过去了。撤销收藏只有 `cmd-d`
+        // 和工具栏「更多」菜单两扇门（都是早就有的）。
+        ContextPress::Row => {
+            let archive_is_zip = pane.archive_target().is_some();
+            let archive_label = if archive_is_zip {
+                "查看压缩包内容"
+            } else {
+                "打包成 Zip"
+            };
+            menu.item(context_item(
+                me,
+                cx,
+                "打开",
+                IconName::FolderOpen,
+                selected == 1,
+                |pane, window, cx| pane.open_context_target(window, cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                "快速查看",
+                IconName::Eye,
+                selected > 0,
+                |pane, window, cx| pane.run_command(PaneCommand::QuickLook, window, cx),
+            ))
+            .separator()
+            .item(context_item(
+                me,
+                cx,
+                "拷贝",
+                IconName::Copy,
+                selected > 0,
+                |pane, window, cx| pane.run_command(PaneCommand::Copy, window, cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                "剪切",
+                IconName::Scissors,
+                selected > 0,
+                |pane, window, cx| pane.run_command(PaneCommand::Cut, window, cx),
+            ))
+            .separator()
+            .item(context_item(
+                me,
+                cx,
+                "重命名",
+                IconName::SquarePen,
+                selected == 1,
+                |pane, window, cx| pane.run_command(PaneCommand::Rename, window, cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                "批量重命名",
+                IconName::TextCursorInput,
+                selected > 1,
+                |pane, window, cx| pane.run_command(PaneCommand::BulkRename, window, cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                "移到回收站",
+                IconName::Trash,
+                selected > 0,
+                |pane, window, cx| pane.run_command(PaneCommand::Trash, window, cx),
+            ))
+            .separator()
+            .item(context_item(
+                me,
+                cx,
+                "复制路径",
+                IconName::Link,
+                selected > 0,
+                |pane, window, cx| pane.run_command(PaneCommand::CopyPath, window, cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                "复制文件名",
+                IconName::Signature,
+                selected > 0,
+                |pane, window, cx| pane.run_command(PaneCommand::CopyFileName, window, cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                archive_label,
+                IconName::FileArchive,
+                archive_is_zip || selected > 0,
+                move |pane, window, cx| {
+                    // 选中的是压缩包就打开它，否则把选中的打成包——
+                    // 跟工具栏那颗按钮同一套判定。
+                    if pane.archive_target().is_some() {
+                        pane.run_command(PaneCommand::ViewArchive, window, cx)
+                    } else {
+                        pane.run_command(PaneCommand::CreateArchive, window, cx)
+                    }
+                },
+            ))
+            .separator()
+            .item(context_item(
+                me,
+                cx,
+                "在这里打开终端",
+                IconName::Terminal,
+                true,
+                |pane, window, cx| pane.run_command(PaneCommand::OpenTerminal, window, cx),
+            ))
+        }
+        // 分列视图里祖先列的一条（或那一列的空白）：它不在当前目录的
+        // 选中集合里，所以只给认得**路径**的那几件事。
+        ContextPress::Nav(path) => {
+            let copy_path = path.clone();
+            let copy_name = path.clone();
+            menu.item(context_item(
+                me,
+                cx,
+                "复制路径",
+                IconName::Link,
+                true,
+                move |pane, _, cx| pane.copy_one_path(&copy_path, false, cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                "复制文件名",
+                IconName::Signature,
+                true,
+                move |pane, _, cx| pane.copy_one_path(&copy_name, true, cx),
+            ))
+            .separator()
+            .item(context_item(
+                me,
+                cx,
+                "用系统打开",
+                IconName::ExternalLink,
+                true,
+                move |pane, _, cx| pane.open_externally(path.clone(), cx),
+            ))
+        }
+        // 空白处：菜单对着当前这个目录。
+        ContextPress::Blank => menu
+            .item(context_item(
+                me,
+                cx,
+                "新建文件夹",
+                IconName::FolderPlus,
+                true,
+                |pane, window, cx| pane.run_command(PaneCommand::NewFolder, window, cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                "粘贴",
+                IconName::ClipboardPaste,
+                can_paste,
+                |pane, window, cx| pane.run_command(PaneCommand::Paste, window, cx),
+            ))
+            .separator()
+            .item(context_item(
+                me,
+                cx,
+                "全选",
+                IconName::Check,
+                true,
+                |pane, _, cx| pane.select_all(cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                "刷新",
+                IconName::RotateCw,
+                true,
+                |pane, window, cx| pane.run_command(PaneCommand::Refresh, window, cx),
+            ))
+            .separator()
+            .item(context_item(
+                me,
+                cx,
+                if hidden {
+                    "隐藏隐藏项"
+                } else {
+                    "显示隐藏项"
+                },
+                if hidden {
+                    IconName::EyeOff
+                } else {
+                    IconName::Eye
+                },
+                true,
+                |pane, window, cx| pane.run_command(PaneCommand::ToggleHidden, window, cx),
+            ))
+            .item(context_item(
+                me,
+                cx,
+                "在这里打开终端",
+                IconName::Terminal,
+                true,
+                |pane, window, cx| pane.run_command(PaneCommand::OpenTerminal, window, cx),
+            )),
+    }
+}
+
+/// 右键菜单里的一条。
+///
+/// 动作统一写成"在 `update` 里跑一个 `&mut Pane` 的方法"——菜单项的回调
+/// 只拿得到 `(&ClickEvent, &mut Window, &mut App)`，这一栏得靠
+/// [`Pane::me`] 那个弱引用换回来（跟「更多」菜单一个路子）。
+fn context_item(
+    me: &Rc<WeakEntity<Pane>>,
+    cx: &App,
+    label: &str,
+    icon: IconName,
+    enabled: bool,
+    run: impl Fn(&mut Pane, &mut Window, &mut Context<Pane>) + 'static,
+) -> PopupMenuItem {
+    let me = me.clone();
+    PopupMenuItem::new(crate::i18n::tr(cx, label))
+        .icon(icon)
+        .disabled(!enabled)
+        .on_click(move |_, window, cx| {
+            let _ = me.update(cx, |pane, cx| run(pane, window, cx));
+        })
 }
 
 impl Pane {
@@ -750,6 +1026,7 @@ impl Pane {
             marking: None,
             archive_view: None,
             archive_busy: None,
+            context_press: None,
             capturing: None,
             capture_focus: cx.focus_handle(),
             subscriptions: Vec::new(),
@@ -2757,6 +3034,132 @@ impl Pane {
     /// 而它占着工具栏上跟「拷贝」同等显眼的位置。搬进菜单不损失可达性——
     /// 每一条的命令面板条目和快捷键都还在（快捷键往往还是最快的入口）。
     ///
+    /// 给这一层挂上右键菜单。
+    ///
+    /// **一层只挂一份**：菜单挂在容器（列表 / 网格 / 那一列、空目录提示）上，
+    /// 行上只记"这一按落在谁身上"（[`Self::note_row_press`]）。行自己再挂
+    /// 一份的话，行嵌在容器里，一次右键会开出两层菜单——后一层把前一层
+    /// 盖住，用户还不知道点到的会是哪一层。
+    fn with_context_menu<E>(&self, element: E) -> ContextMenu<E>
+    where
+        E: ContextMenuExt + 'static,
+    {
+        let me = self.me.clone();
+        element.context_menu(move |menu, _window, cx| context_menu(menu, &me, cx))
+    }
+
+    /// 容器的右键：挂上菜单，顺带把"没被行认领"的那一按记成 `fallback`。
+    ///
+    /// 两者必须成对：只挂菜单不记的话，容器会沿用上一次右键的结果——
+    /// 上一次按在文件上、这一次按在空白处，弹出的会是一份全是灰的
+    /// "文件"菜单（见 [`Self::note_blank_press`]）。
+    fn with_surface_menu<E>(
+        &self,
+        element: E,
+        fallback: ContextPress,
+        cx: &mut Context<Self>,
+    ) -> ContextMenu<E>
+    where
+        E: ContextMenuExt + 'static,
+    {
+        let element = element.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.note_blank_press(fallback.clone(), event, cx);
+            }),
+        );
+        self.with_context_menu(element)
+    }
+
+    /// 行上的右键按下了：这一按落在**这一行**上。
+    ///
+    /// 选中项跟着右键走（跟 Finder 一致）：点的是没选中的行就选它，
+    /// 点在选中集合里就不动——右键是"对着这一批"，塌成一个文件的话，
+    /// 菜单里那些批量操作就全用不上了。右击不会派发 `on_click`
+    /// （走的是 `on_aux_click`），所以复用 `select_row` 那一套不会
+    /// 把多选塌掉。
+    fn note_row_press(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.context_press = Some((event.position, ContextPress::Row));
+        cx.notify();
+    }
+
+    /// 分列视图里祖先列一条的右键：这一列的行**不在**当前目录的列表里，
+    /// 所以连路径一起记下来（菜单只做认得路径的那几件事）。
+    fn note_nav_press(&mut self, path: &Path, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.context_press = Some((event.position, ContextPress::Nav(path.to_path_buf())));
+        cx.notify();
+    }
+
+    /// 容器的右键兜底：**没被行认领**的那一按才算按在空白处。
+    ///
+    /// 判据是坐标——按下事件先派给行、再派给容器（子先于父），同一个事件
+    /// 两处的坐标一模一样，"容器看到的坐标 == 刚记下的坐标"就等于
+    /// "这一按落在行上，容器别抢"。
+    ///
+    /// 没被认领时按容器是谁分两种：列表 / 网格 / 当前那一列的空白对着
+    /// **当前目录**（[`ContextPress::Blank`]），祖先列的空白对着**那一列
+    /// 自己**（[`ContextPress::Nav`]）——祖先列里的"新建文件夹"要是真
+    /// 建在当前目录里，那就是骗人了。
+    fn note_blank_press(
+        &mut self,
+        fallback: ContextPress,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let claimed = matches!(&self.context_press, Some((at, _)) if *at == event.position);
+        if !claimed {
+            self.context_press = Some((event.position, fallback));
+        }
+        cx.notify();
+    }
+
+    /// 打开右键点中的那一个（菜单第一项）。
+    ///
+    /// 只在**只选中一个**时给：一次打开多个时，只要其中一个是目录，
+    /// 这一栏就离开原目录了，后面几个"打开"落在哪儿说不清。
+    fn open_context_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.selection.single().map(PathBuf::from) {
+            self.open_path(path, window, cx);
+        }
+    }
+
+    /// 把**一条**路径写进剪贴板：右键菜单里那条"不在选中集合里的"
+    /// （分列视图的祖先列）用它，所以不能走 `selected_paths()`。
+    fn copy_one_path(&mut self, path: &Path, name_only: bool, cx: &mut Context<Self>) {
+        let paths = vec![path.to_path_buf()];
+        let text = clipboard::clipboard_text(
+            &paths,
+            if name_only {
+                clipboard::ClipboardText::NameOnly
+            } else {
+                clipboard::ClipboardText::FullPath
+            },
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.status = crate::i18n::tr_args(
+            cx,
+            if name_only {
+                "已复制 {count} 个文件名"
+            } else {
+                "已复制 {count} 个路径"
+            },
+            &[("count", "1".to_string())],
+        );
+        cx.notify();
+    }
+
+    /// 交给系统拿默认应用打开。
+    ///
+    /// 目录在这里就是"在系统文件管理器里打开"，文件是"用默认应用打开"
+    /// ——各平台的说法不一样，所以文案挑了个中性的「用系统打开」。
+    fn open_externally(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Err(error) = open::that(&path) {
+            self.error = Some(error.into());
+            self.update_status(cx);
+            cx.notify();
+        }
+    }
+
     /// 置灰状态跟着选中数走：进得去、看到「当前不能按」比干脆不显示有用。
     fn render_more_menu(&mut self, cx: &gpui_kit::App) -> impl IntoElement {
         let selected = self.selection.len();
@@ -3259,6 +3662,7 @@ impl Pane {
         let drop_here = is_dir.then(|| path.clone());
         // 点击要用的那份路径：按下的那句把 `path` 用掉了（下面两个闭包各要一份）。
         let click_path = path.clone();
+        let right_path = path.clone();
         let item = ListItem::new(("row", position))
             .w_full()
             .h(px(ROW_HEIGHT))
@@ -3393,11 +3797,22 @@ impl Pane {
                     cx.notify();
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    // 右键先把它选中（跟 Finder 一致），再记下"这一按落在
+                    // 这一行上"——容器看到同一个坐标，就不再当空白处理。
+                    this.select_row(right_path.clone(), event.modifiers);
+                    this.update_status(cx);
+                    this.note_row_press(event, cx);
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.click_row(&click_path, cx);
             }));
-        // `ListItem` 只实现了 `IntoElement`，挂不上拖放那几个方法：
-        // 外面套一层同高的 div 专管拖放，视觉上看不出多了一层。
+        // 外面这层 div 管两件事：固定行高（`ROW_HEIGHT` 是面板排版的地基，
+        // 表头、行、分列柱子都照它对齐）和拖放要用的落点 id ——
+        // 测试靠 `("row-drop", i)` 找落点。
         let row = div()
             .id(("row-drop", position))
             .test_support()
@@ -3406,6 +3821,7 @@ impl Pane {
             .child(item);
         let row = self.spring_load(row, drop_here.clone(), cx);
         self.with_drag_and_drop(row, Some(dragged), drop_here, cx)
+            .into_any_element()
     }
 
     fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3413,7 +3829,11 @@ impl Pane {
         let drop_here = self.listing.path().to_path_buf();
         if self.listing.visible_count() == 0 {
             let empty = self.render_empty(cx);
-            return self.with_drag_and_drop(empty, None, Some(drop_here), cx);
+            let empty = self.with_drag_and_drop(empty, None, Some(drop_here), cx);
+            // 空目录：那一大片提示就是"空白处"，菜单对着当前这个目录。
+            return self
+                .with_surface_menu(empty, ContextPress::Blank, cx)
+                .into_any_element();
         }
 
         let row_sizes = self.row_sizes.clone();
@@ -3443,7 +3863,10 @@ impl Pane {
                 .py_1(),
             )
             .scrollbar(&self.scroll, ScrollbarAxis::Vertical);
-        self.with_drag_and_drop(list, None, Some(drop_here), cx)
+        let list = self.with_drag_and_drop(list, None, Some(drop_here), cx);
+        // 列表的空白处（包括表格下面那片空）对着当前目录。
+        self.with_surface_menu(list, ContextPress::Blank, cx)
+            .into_any_element()
     }
 
     /// 空目录（或筛选后一个都不剩）时的居中提示，两种视图共用。
@@ -3491,7 +3914,11 @@ impl Pane {
         let drop_here = self.listing.path().to_path_buf();
         if self.listing.visible_count() == 0 {
             let empty = self.render_empty(cx);
-            return self.with_drag_and_drop(empty, None, Some(drop_here), cx);
+            let empty = self.with_drag_and_drop(empty, None, Some(drop_here), cx);
+            // 空目录：那一大片提示就是"空白处"，菜单对着当前这个目录。
+            return self
+                .with_surface_menu(empty, ContextPress::Blank, cx)
+                .into_any_element();
         }
 
         let row_sizes = self.row_sizes.clone();
@@ -3518,7 +3945,9 @@ impl Pane {
                 .p(px(TILE_GAP)),
             )
             .scrollbar(&self.scroll, ScrollbarAxis::Vertical);
-        self.with_drag_and_drop(grid, None, Some(drop_here), cx)
+        let grid = self.with_drag_and_drop(grid, None, Some(drop_here), cx);
+        self.with_surface_menu(grid, ContextPress::Blank, cx)
+            .into_any_element()
     }
 
     /// 第 `row` 行：把这一行该有的格子横排出来，末尾不足就少放几个。
@@ -3624,6 +4053,7 @@ impl Pane {
         let dragged = self.dragged_paths(&path);
         let drop_here = is_dir.then(|| path.clone());
         let click_path = path.clone();
+        let right_path = path.clone();
         let tile = tile
             .when(is_selected, |tile| {
                 tile.bg(cx.theme().muted)
@@ -3647,11 +4077,22 @@ impl Pane {
                     cx.notify();
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.select_row(right_path.clone(), event.modifiers);
+                    this.update_status(cx);
+                    this.note_row_press(event, cx);
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.click_row(&click_path, cx);
             }));
         let tile = self.spring_load(tile, drop_here.clone(), cx);
-        Some(self.with_drag_and_drop(tile, Some(dragged), drop_here, cx))
+        Some(
+            self.with_drag_and_drop(tile, Some(dragged), drop_here, cx)
+                .into_any_element(),
+        )
     }
 
     /// 分列视图：从根目录一级一列铺下来，最后一列是当前目录。
@@ -3842,7 +4283,17 @@ impl Pane {
                 .flex_1()
                 .min_h_0(),
             );
-        self.with_drag_and_drop(element, None, Some(drop_here), cx)
+        let element = self.with_drag_and_drop(element, None, Some(drop_here), cx);
+        // 空白处落在哪一列就对着哪一层：当前列 = 当前目录（"新建文件夹"
+        // 真的会建在这一层），祖先列 = 那一列自己——不然菜单上写着
+        // "新建文件夹"，建出来的却在别的目录里。
+        let fallback = if current {
+            ContextPress::Blank
+        } else {
+            ContextPress::Nav(column.path.clone())
+        };
+        self.with_surface_menu(element, fallback, cx)
+            .into_any_element()
     }
 
     /// 分列里的一行。
@@ -3879,6 +4330,7 @@ impl Pane {
         let drop_here = is_dir.then(|| path.clone());
         // 点击要用的那份路径：按下的那句把 `path` 用掉了。
         let click_path = path.clone();
+        let right_path = path.clone();
         let icon_color = if is_dir {
             cx.theme().primary
         } else {
@@ -3936,11 +4388,27 @@ impl Pane {
                     cx.notify();
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    if current {
+                        // 当前列：跟列表里的一样，先选中再给"文件"菜单。
+                        this.select_row(right_path.clone(), event.modifiers);
+                        this.update_status(cx);
+                        this.note_row_press(event, cx);
+                    } else {
+                        // 祖先列的一条：它不在当前目录的列表里，选中项动不得，
+                        // 菜单只做认得路径的那几件事。
+                        this.note_nav_press(&right_path, event, cx);
+                    }
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.click_row(&click_path, cx);
             }));
         let element = self.spring_load(element, drop_here.clone(), cx);
         self.with_drag_and_drop(element, Some(dragged), drop_here, cx)
+            .into_any_element()
     }
 
     /// 给跨帧缓存用的新鲜度凭据：选中项、列表内容/顺序，任一变了它就变。
@@ -4015,7 +4483,7 @@ impl Pane {
         dragged: Option<DraggedPaths>,
         destination: Option<PathBuf>,
         cx: &mut Context<Self>,
-    ) -> AnyElement
+    ) -> E
     where
         E: StatefulInteractiveElement + Styled + IntoElement + 'static,
     {
@@ -4051,7 +4519,10 @@ impl Pane {
                     this.drop_paths(paths, destination.clone(), true, window, cx);
                 }));
         }
-        element.into_any_element()
+        // 返回**具体类型**而不是 `AnyElement`：外面还可能要接着挂右键菜单
+        // （`ContextMenu` 不是 `StatefulInteractiveElement`，挂在拖放之前
+        // 就没法再套拖放那一层了）。要 `AnyElement` 的调用点自己转。
+        element
     }
 
     /// 给文件夹挂上"弹簧"：拖动时鼠标在它上面停一会儿就自己进去。

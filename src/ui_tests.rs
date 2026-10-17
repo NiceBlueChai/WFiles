@@ -8234,3 +8234,347 @@ fn trashing_asks_before_touching_the_disk(cx: &mut TestAppContext) {
     assert!(closed, "点取消该把确认框关掉");
     assert_eq!(after, vec!["doomed.txt"], "取消之后文件该还在");
 }
+
+// ---- 右键菜单 ----
+//
+// 这批钉的是"右键那一按落在哪儿，菜单就对着谁"：行上对着这一批、空白处
+// 对着当前目录、祖先列对着那一条路径、侧栏对着那一条。右键只是第二扇门
+// ——真动手的还是原来那批命令（`PaneCommand` / `WFilesApp` 的方法）——
+// 所以断言尽量落在**结果**上：文件真改了名、目录里真多出个文件夹、
+// 标签真多了一栏、设置里真少了一条连接。
+//
+// 菜单实体是**下一帧**才建的（`ContextMenu` 用 `window.defer`），
+// 所以每条都先 `settle` 一次再找菜单（`settle` 自己推两帧）。
+
+/// 菜单里此刻有哪些项（按显示顺序）。分隔线不占名字。
+fn menu_labels(window: &mut gpui_kit::Window) -> Vec<String> {
+    (0..32)
+        .map(|index| menu_item_label(window, index))
+        .filter(|label| !label.is_empty())
+        .collect()
+}
+
+/// 点菜单里叫这个名字的那一项。
+fn click_menu_item(window: &mut gpui_kit::Window, label: &str, cx: &mut gpui_kit::App) {
+    let index = (0..32)
+        .find(|&index| menu_item_label(window, index) == label)
+        .unwrap_or_else(|| panic!("菜单里该有「{label}」，实际是：{:?}", menu_labels(window)));
+    window.click(index, cx);
+}
+
+/// 右击一行文件：菜单对着**这一行**，改名改的也是它。
+#[gpui_kit::test]
+fn the_row_menu_acts_on_the_row_under_the_pointer(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::write(dir.join("a.txt"), "x").expect("造文件");
+    std::fs::write(dir.join("b.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 右击**第二行**：改的该是 b.txt，不是第一行。
+        window.right_click(("row-name", 1usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let labels = menu_labels(window);
+        assert!(
+            labels.contains(&"重命名".to_string()),
+            "行上的菜单该有「重命名」：{labels:?}"
+        );
+        assert!(
+            !labels.contains(&"新建文件夹".to_string()),
+            "按在行上不该弹出目录菜单：{labels:?}"
+        );
+        click_menu_item(window, "重命名", cx);
+    });
+
+    // 改名框预填的是那一行的名字，全选之后直接敲新的。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("prompt-ok").is_some(),
+            "菜单里点「重命名」该打开改名框"
+        );
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("renamed.txt", cx);
+        window.press("enter", cx);
+        settle(window, cx);
+    });
+
+    let on_disk = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        names_on_disk(&dir)
+    });
+    assert_eq!(
+        on_disk,
+        vec!["a.txt", "renamed.txt"],
+        "改的该是右键点中的那一个（b.txt），a.txt 一个字母都不该动"
+    );
+}
+
+/// 右击一条**已经在选中集合里**的行：菜单对着整批，选中项不塌。
+///
+/// 这条顺手钉住一个事实：右击派发的是 `on_aux_click` 而**不是** `on_click`
+/// ——后者才是"点一下就把多选塌成一个"的那条路。接错了的话，右击完
+/// 再点菜单里任何批量操作，作用范围就悄悄缩水成一个文件。
+#[gpui_kit::test]
+fn right_clicking_a_selected_row_keeps_the_batch(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.join(name), "x").expect("造文件");
+    }
+    let (_session, handle) = open_in(cx, &dir);
+
+    // 选中前两行：点第一行，再用 shift+下 扩到第二行。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("shift-down", cx);
+    });
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.right_click(("row-name", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        click_menu_item(window, "移到回收站", cx);
+    });
+
+    // 确认框上写着"几个项目"：塌成一个的话这里就只剩 1。
+    let message = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window
+            .try_find("confirm-message")
+            .and_then(|message| message.label().map(|label| label.to_string()))
+            .unwrap_or_default()
+    });
+    assert!(
+        message.contains("2 个项目"),
+        "右击已选中的行不该把整批塌成一个，确认框该说 2 个：{message}"
+    );
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("confirm-cancel", cx);
+    });
+    let on_disk = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        names_on_disk(&dir)
+    });
+    assert_eq!(on_disk.len(), 3, "取消了就一个都不该动：{on_disk:?}");
+}
+
+/// 右击列表空白处：菜单对着**当前目录**，新建的文件夹真落在这儿。
+#[gpui_kit::test]
+fn the_blank_menu_makes_a_folder_here(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::write(dir.join("a.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        // 列表正中间：只有一行文件，剩下全是空白。
+        window.right_click("file-list", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let labels = menu_labels(window);
+        assert!(
+            labels.contains(&"新建文件夹".to_string()),
+            "空白处该有「新建文件夹」：{labels:?}"
+        );
+        assert!(
+            labels.contains(&"粘贴".to_string()),
+            "空白处该有「粘贴」：{labels:?}"
+        );
+        assert!(
+            !labels.contains(&"重命名".to_string()),
+            "空白处不该弹出文件菜单：{labels:?}"
+        );
+        click_menu_item(window, "新建文件夹", cx);
+    });
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("prompt-ok").is_some(),
+            "「新建文件夹」该弹出输入框"
+        );
+        // 预填名已经是不冲突的，直接确认——按一下回车那条路。
+        window.click("prompt-ok", cx);
+    });
+
+    let on_disk = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        names_on_disk(&dir)
+    });
+    assert!(
+        on_disk.contains(&"未命名文件夹".to_string()),
+        "新建的文件夹该落在当前目录里：{on_disk:?}"
+    );
+}
+
+/// 网格里的格子也挂着同一份文件菜单。
+#[gpui_kit::test]
+fn a_grid_tile_carries_the_file_menu(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::write(dir.join("a.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-2", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.right_click(("tile", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let labels = menu_labels(window);
+        assert!(
+            labels.contains(&"重命名".to_string()),
+            "格子上的菜单该有「重命名」：{labels:?}"
+        );
+        assert!(
+            labels.contains(&"快速查看".to_string()),
+            "格子上的菜单该有「快速查看」：{labels:?}"
+        );
+    });
+}
+
+/// 分列视图里**祖先列**的一条：它不在当前目录的选中集合里，
+/// 菜单只做认得路径的那几件（复制路径 / 用系统打开），不冒充文件菜单。
+#[gpui_kit::test]
+fn an_earlier_column_carries_the_path_menu(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    std::fs::create_dir(dir.join("one")).expect("建目录");
+    std::fs::write(dir.join("one").join("inner.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, &dir.join("one"));
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-3", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let mut last = 0usize;
+        while window.try_find(("column", last + 1)).is_some() {
+            last += 1;
+        }
+        assert!(last >= 1, "分列视图该有祖先列");
+        window
+            .within(("column", last - 1))
+            .right_click(("column-row", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let labels = menu_labels(window);
+        assert!(
+            labels.contains(&"用系统打开".to_string()),
+            "祖先列的菜单该有「用系统打开」：{labels:?}"
+        );
+        assert!(
+            !labels.contains(&"重命名".to_string()),
+            "祖先列的行不在选中集合里，不该冒充文件菜单：{labels:?}"
+        );
+    });
+}
+
+/// 侧栏一条"位置"的右键菜单：在新标签中打开真的多一栏。
+#[gpui_kit::test]
+fn the_sidebar_menu_opens_a_place_in_a_new_tab(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let (_session, handle) = open_in(cx, root.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.right_click(("place", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let labels = menu_labels(window);
+        assert!(
+            labels.contains(&"在新标签中打开".to_string()),
+            "侧栏菜单该有「在新标签中打开」：{labels:?}"
+        );
+        assert!(
+            labels.contains(&"在系统文件管理器里打开".to_string()),
+            "侧栏菜单该有「在系统文件管理器里打开」：{labels:?}"
+        );
+        click_menu_item(window, "在新标签中打开", cx);
+    });
+
+    let tabs = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        tab_count(window)
+    });
+    assert_eq!(tabs, 2, "点「在新标签中打开」该真多一栏");
+}
+
+/// 远程那一条：删连接之前先问一句，问完真的从设置里消失。
+#[gpui_kit::test]
+fn the_remote_menu_asks_before_forgetting_the_connection(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| {
+            settings.remotes.push(crate::remote::Config::new(
+                "jg".to_string(),
+                "坚果云".to_string(),
+                crate::remote::Kind::WebDav,
+                // 端口 9 是 discard 端口：连不上，也不会真有请求出去。
+                "http://127.0.0.1:9/dav/".to_string(),
+                "me".to_string(),
+            ));
+        });
+    });
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.right_click(("remote", 0usize), cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let labels = menu_labels(window);
+        assert!(
+            labels.contains(&"删除连接".to_string()),
+            "远程那一行该有「删除连接」：{labels:?}"
+        );
+        click_menu_item(window, "删除连接", cx);
+    });
+
+    // 先问：弹的是标准确认框，里面写着删的是哪一条。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let asked = window
+            .try_find("confirm-message")
+            .and_then(|message| message.label().map(|label| label.to_string()))
+            .unwrap_or_default();
+        assert!(
+            asked.contains("坚果云"),
+            "确认框该写明删的是哪条连接：{asked}"
+        );
+        window.click("confirm-ok", cx);
+    });
+
+    let left = cx.update(|cx| Settings::peek(cx, |settings| settings.remotes.len()));
+    assert_eq!(left, 0, "确认之后那条连接该从设置里消失");
+}

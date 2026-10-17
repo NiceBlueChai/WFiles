@@ -696,6 +696,28 @@ static EN: &[(&str, &str)] = &[
     ("图片尺寸", "Image Size"),
     ("媒体时长", "Duration"),
     ("PDF 页数", "PDF Pages"),
+    // ---- 右键菜单 ----
+    //
+    // 这里的词都比命令面板里短：面板里一句话说全（"剪切选中项"），
+    // 菜单里只有两三个字（"剪切"）——菜单是拿眼睛扫的，一条占一行、
+    // 越宽越难扫，而面板是拿键盘搜的，说清了才搜得到。两边都得留。
+    ("打开", "Open"),
+    ("剪切", "Cut"),
+    ("粘贴", "Paste"),
+    ("全选", "Select All"),
+    ("在新标签中打开", "Open in New Tab"),
+    ("在新窗口中打开", "Open in New Window"),
+    // 两条"交给系统"分开写，因为对象不一样：分列视图里那一条可能是文件，
+    // 也可能是个目录，说中性一点（"用系统打开"）；侧栏那几段全是目录，
+    // 交给系统就是开文件管理器（"在系统文件管理器里打开"）。
+    ("用系统打开", "Open Externally"),
+    ("在系统文件管理器里打开", "Open in File Manager"),
+    ("删除连接", "Remove Connection"),
+    (
+        "确定删除连接“{name}”吗？钥匙串里存的密码会一起删掉。",
+        "Remove the connection “{name}”? The password stored in the keychain is deleted with it.",
+    ),
+    ("开不了新窗口：{error}", "Can't open a new window: {error}"),
     // ---- 窗格：地址栏与工具条----
     ("后退", "Back"),
     ("前进", "Forward"),

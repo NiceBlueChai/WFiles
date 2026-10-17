@@ -39,6 +39,12 @@ pub enum OpsEvent {
     PromptChanged { open: bool },
     /// 批量重命名对话框开/关，应用层据此创建/销毁那一组输入框。
     BulkChanged { open: bool },
+    /// 用户在确认框里点了"删除连接"。
+    ///
+    /// 对话框归这一层（五类都在它手上），可连接的配置、钥匙串里的密码、
+    /// 目录缓存都在应用层手上——所以到这里只报一声，真删由应用层来
+    /// （`WFilesApp::forget_remote`）。
+    ForgetRemote { id: String },
 }
 
 impl EventEmitter<OpsEvent> for Ops {}
@@ -77,6 +83,11 @@ pub enum PendingAction {
     CreateFolder { parent: PathBuf },
     /// 重命名。
     Rename { path: PathBuf },
+    /// 删掉一条远程连接。
+    ///
+    /// 真正动手的是应用层（配置、钥匙串、目录缓存都在它手上），
+    /// 所以这一条点了确定之后只发一个 [`OpsEvent::ForgetRemote`]。
+    ForgetRemote { id: String },
 }
 
 /// 粘贴前的冲突预检：目标目录里已经有同名项，先问怎么办。
@@ -478,6 +489,24 @@ impl Ops {
         cx.notify();
     }
 
+    /// 让用户确认删掉一条远程连接（侧栏右键菜单走的那扇门）。
+    ///
+    /// 侧栏那颗 × 用的是"点两下"：第一下只是举手，第二下还在**同一颗按钮**
+    /// 上。菜单点完就关了，第二次没地方点——所以这里走标准确认框。
+    pub fn ask_forget_remote(&mut self, id: String, label: String, cx: &mut Context<Self>) {
+        self.confirm = Some(Confirm {
+            title: crate::i18n::Message::msg("删除连接"),
+            message: crate::i18n::Message::args(
+                "确定删除连接“{name}”吗？钥匙串里存的密码会一起删掉。",
+                &[("name", label)],
+            ),
+            ok_label: crate::i18n::Message::msg("删除连接"),
+            ok_dangerous: true,
+            action: PendingAction::ForgetRemote { id },
+        });
+        cx.notify();
+    }
+
     /// 移到回收站：破坏性操作，先确认。
     pub fn request_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if paths.is_empty() {
@@ -661,6 +690,8 @@ impl Ops {
                     .unwrap_or_default();
                 self.finish_rename(path, name, cx)
             }
+            // 连接的事这一层管不着，报一声让应用层去做。
+            PendingAction::ForgetRemote { id } => cx.emit(OpsEvent::ForgetRemote { id }),
         }
     }
 
