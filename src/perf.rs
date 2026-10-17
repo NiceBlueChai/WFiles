@@ -11,6 +11,12 @@
 //! debug 79 ms、release 39 ms；过滤：debug 15 ms、release 2.9 ms。
 //! 拿 debug 的数字定门槛，等于把门槛定在一个用户永远碰不到的地方。
 //!
+//! 九条基准之间**自己排队**（见 [`bench_lock`]）：每条都养着 10 万项的
+//! 清单，并跑就是互相抢内存带宽——而抢得最狠的偏偏是大的一头，于是比值
+//! 被单向拉高（按大小排序那条因此误报过两次）。排队之后 `--nocapture`
+//! 读到的就是"独自跑"的数字，跟单跑一条一样；代价是 perf 模块串着跑
+//! （整个模块几秒钟）。
+//!
 //! 那 `cargo test`（默认 debug）里跑的这些是干什么用的？**门禁**：
 //! 时间预算都经 [`budget`] 按构建类型放宽过，debug 下也能过，
 //! 所以 CI 不必额外跑一遍 release（那要多花五分钟编译）。
@@ -38,6 +44,7 @@
 //! - 冷启动到可交互：万级目录 < 1s
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::model::{FileEntry, Listing, Sort, SortKey};
@@ -133,8 +140,33 @@ fn report(what: &str, small: Duration, big: Duration) -> bool {
 
 // ---- 排序 ----
 
+/// **九条基准之间要排队。**
+///
+/// 每条基准都养着"10 万项"的清单（十万个条目、几十 MB），一起跑起来就是
+/// 互相抢内存带宽。挨抢得最狠的是按大小排序：它的条目一个才 8 字节，
+/// 大的一头（12 MB）出不了缓存、小的一头（3 MB）出得去，于是小的一头
+/// 几乎不受影响、大的一头实测被抬到 2 ~ 3 倍（10 ms vs 3 ms）——**比值被
+/// 单向拉高**，实测因此误报过两次（12.2 倍、19.3 倍，上限 12 倍）。
+/// 那一下跟"真的变成平方了"长得一模一样，靠调上限是分不开的。
+///
+/// 所以每条基准量之前先拿这把锁，**而且要拿在建夹具之前**：等锁的时候
+/// 不要自己先占着几十 MB。拿到锁之后量到的就是"独自跑"的数字，跟
+/// `cargo test --release perf::名字` 单跑一条一样。
+///
+/// 中毒了照样拿（`into_inner`）：一条基准自己红过，不该让后面八条全变成
+/// `PoisonError`，那会把"到底哪条挂了"埋掉。
+static BENCH: Mutex<()> = Mutex::new(());
+
+fn bench_lock() -> MutexGuard<'static, ()> {
+    BENCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn sorting_a_hundred_thousand_entries_stays_linear() {
+    // 量之前先排队：见 `bench_lock`。
+    let _bench = bench_lock();
     let small = fastest(|| {
         let mut listing = a_listing(SMALL);
         listing.set_sort(Sort {
@@ -170,8 +202,27 @@ fn sorting_a_hundred_thousand_entries_stays_linear() {
 
 #[test]
 fn sorting_by_size_stays_linear() {
+    // 量之前先排队：见 `bench_lock`。
+    let _bench = bench_lock();
     // 按大小排走的是另一条比较分支（`compare` 里按 u64 比），
     // 名字那条比的是字符串。两条都得平。
+    //
+    // # 这条曾经并跑时误报（而且两次）
+    //
+    // 它的条目一个才 8 字节的键，大的一头 12 MB 出不了缓存、小的一头
+    // 3 MB 出得去，于是并跑时**只有大的一头**被抢带宽抬起来：实测单跑
+    // 3 ms → 并跑 7.9 / 10.6 ms，而小的一头 0.43 → 0.55 / 0.65 ms。
+    // 比值于是成了 12.2 倍、19.3 倍（上限 12），看着跟"真的变成平方了"
+    // 一模一样。**这种"只有一边被抬"的比值是调不出来的**——调高上限
+    // 就跟平方的真信号分不开了。
+    //
+    // 修法是让量的时候没别人抢：`bench_lock` 让九条基准排队量。
+    // 排队之后这条单跑与并跑的比值一致（5 ~ 8 倍）。
+    //
+    // 顺带量到的一件事，跟这条的判据无关但值得记着：夹具的大小是随
+    // 生成顺序递增的，本以为是"排好的输入走快路径"，实测**不是**——
+    // 同样按大小倒排，单调递增的夹具 4.1 ms、大小乱序的夹具 2.8 ms
+    // （都在单跑下量），没有十倍八倍的差别，也就没有那回事。
     let mut listing = a_listing(SMALL);
     let start = Instant::now();
     listing.set_sort(Sort {
@@ -222,6 +273,8 @@ fn sorting_by_size_stays_linear() {
 /// "没重排"和"验不到重排"长得一模一样。
 #[test]
 fn filtering_does_not_resort_the_whole_listing() {
+    // 量之前先排队：见 `bench_lock`。
+    let _bench = bench_lock();
     let mut listing = a_listing(BIG);
 
     // ---- 性质：过滤不该重排 ----
@@ -281,6 +334,8 @@ fn filtering_does_not_resort_the_whole_listing() {
 /// 过滤本身也得是线性的：n 翻 4 倍，耗时不该翻 16 倍。
 #[test]
 fn filtering_a_hundred_thousand_entries_stays_linear() {
+    // 量之前先排队：见 `bench_lock`。
+    let _bench = bench_lock();
     let mut small = a_listing(SMALL);
     let mut big = a_listing(BIG);
     // 先各自排好，再量过滤本身——把排序那一趟排除掉。
@@ -318,6 +373,8 @@ fn filtering_a_hundred_thousand_entries_stays_linear() {
 
 #[test]
 fn reading_rows_stays_constant_time() {
+    // 量之前先排队：见 `bench_lock`。
+    let _bench = bench_lock();
     // 虚拟列表每帧只画可见的那几十行，所以这条决定了"滚动掉不掉帧"。
     // 用 `visible_entry` 而不是遍历——遍历是 O(n)，那不是滚动干的事。
     let listing = a_listing(BIG);
@@ -343,6 +400,8 @@ fn reading_rows_stays_constant_time() {
 /// 反查表（路径 -> 显示在第几行）也是滚动与键盘导航每帧要用的。
 #[test]
 fn finding_a_files_position_stays_fast() {
+    // 量之前先排队：见 `bench_lock`。
+    let _bench = bench_lock();
     let listing = a_listing(BIG);
     let target = listing
         .visible_entry(BIG / 3)
@@ -371,6 +430,8 @@ fn finding_a_files_position_stays_fast() {
 
 #[test]
 fn selecting_everything_stays_linear() {
+    // 量之前先排队：见 `bench_lock`。
+    let _bench = bench_lock();
     // 10 万项全选是"框选整目录"这类操作的起点，也是最坏情况。
     let mut selection = crate::model::Selection::default();
     let listing = a_listing(BIG);
@@ -378,16 +439,17 @@ fn selecting_everything_stays_linear() {
     selection.select_all(&listing);
     let took = start.elapsed();
     assert_eq!(selection.len(), BIG, "该全选上");
-    // release 实测 10 ms 上下（并跑其它基准时 13 ~ 20 ms；从前 139 ms）。
+    // release 实测 6 ms 上下（从前 139 ms）。九条基准自己排队（`bench_lock`），
+    // 所以这里读到的就是"独自跑"的数字。
     //
     // 这条卡的是**结构**，不是这台机器的速度：门槛 60 ms。同一个循环
     // 换成 `BTreeSet` 写过的那种结构，同一趟里实测 105 ms 起——它慢在
     // "克隆一条、插一条"交错着做（详解见 `model::Selection` 的注释），
     // 于是旧结构会稳稳红在门槛之上，而不是靠运气飘过去。
-    println!("10 万项全选：{took:?}（release 实测 10 ms 上下）");
+    println!("10 万项全选：{took:?}（release 实测 6 ms 上下）");
     assert!(
         took < budget(60),
-        "10 万项全选花了 {took:?}（release 实测 10 ms 上下；旧结构 105 ms 起，门槛 60 ms）"
+        "10 万项全选花了 {took:?}（release 实测 6 ms 上下；旧结构 105 ms 起，门槛 60 ms）"
     );
 }
 
@@ -395,6 +457,8 @@ fn selecting_everything_stays_linear() {
 /// 这条走的是**遍历**：按显示顺序扫一遍列表，逐行问一句"你选没选中"。
 #[test]
 fn collecting_the_selection_follows_the_visible_order() {
+    // 量之前先排队：见 `bench_lock`。
+    let _bench = bench_lock();
     let listing = a_listing(BIG);
     // 隔一个选一个，模拟"用户大致全选但漏了几个"。
     //
@@ -429,27 +493,28 @@ fn collecting_the_selection_follows_the_visible_order() {
         })
         .collect();
     assert_eq!(got, expected, "该按列表显示的顺序给，不按选中的先后");
-    // release 实测 7 ~ 11 ms（换 `HashSet` 之前 62 ms）。门槛 40 ms。
+    // release 实测 5 ms 上下（换 `HashSet` 之前 62 ms）。门槛 40 ms。
     //
     // 慢在查找上：旧结构里一次"这个路径选没选中"要逐组件比十几层路径
     // （10 万次查实测 71 ms，同一趟里哈希集合是 2.9 ms）；
     // 另外旧代码是**先给每一行克隆一份路径再筛**，只选了几项时那些
     // 克隆全是白花的（现在先按引用筛、再克隆）。
-    println!("5 万项选中取回顺序：{took:?}（release 实测 7 ~ 11 ms）");
+    println!("5 万项选中取回顺序：{took:?}（release 实测 5 ms 上下）");
     assert!(
         took < budget(40),
-        "5 万项选中取回顺序花了 {took:?}（release 实测 7 ~ 11 ms，门槛 40 ms）"
+        "5 万项选中取回顺序花了 {took:?}（release 实测 5 ms 上下，门槛 40 ms）"
     );
 }
 
 // ---- 冷启动 ----
-
 /// 冷启动到"这一栏能看见东西"：读盘 + 排序 + 建索引。
 ///
 /// 万级目录预算 1 s。这里量的是 `Listing::read` 这一段——读盘加排序，
 /// 也就是用户按下回车之后到看见列表之前的那一段。
 #[test]
 fn reading_a_ten_thousand_entry_directory_is_warm() {
+    // 量之前先排队：见 `bench_lock`。
+    let _bench = bench_lock();
     let dir = tempfile::tempdir().expect("临时目录");
     for ix in 0..10_000usize {
         std::fs::write(dir.path().join(format!("f{ix:06}.txt")), "x").expect("写测试文件");
