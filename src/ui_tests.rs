@@ -4290,6 +4290,87 @@ fn switching_tabs_leaves_the_keyboard_in_the_dialog(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui_kit::test]
+fn a_new_tab_does_not_steal_the_keyboard_from_a_modal(cx: &mut TestAppContext) {
+    // 模态开着时按 Cmd+T：新栏建出来会自己抓一次焦点（`Pane::new`），把键盘
+    // 从模态手里抢走——面板/对话框从此"看着开着、其实按不动"：打不进字，
+    // 连 Esc 都送不进去，只能点一下别的界面把它弄回来。
+    //
+    // 甲：命令面板。
+    let root = tempfile::tempdir().expect("临时目录");
+    let (_session, handle) = open_in(cx, root.path());
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-p", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("palette-overlay").is_some(),
+            "Cmd+P 该打开命令面板"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2, "Cmd+T 该照常开出一栏");
+        assert!(
+            window.try_find("palette-overlay").is_some(),
+            "开栏不该顺手把面板关掉"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("palette-overlay").is_none(),
+            "Esc 该还是面板的——键盘被新栏抢走的话，它根本收不到这个键"
+        );
+    });
+
+    // 乙：重命名对话框（模态不止面板一个，这条钉的是"别只修面板"）。
+    let dir = overlay_fixture();
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 1180.);
+    step(cx, handle, settle);
+    step(cx, handle, |window, cx| {
+        window.press("down", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("f2", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_some(),
+            "F2 该开出重命名对话框"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2, "Cmd+T 该照常开出一栏");
+        assert!(
+            window.try_find("overlay-card").is_some(),
+            "开栏不该顺手把对话框关掉"
+        );
+    });
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_none(),
+            "Esc 该还是对话框的——键盘被新栏抢走的话，它根本收不到这个键"
+        );
+    });
+}
 /// 副窗**只读不写**：会话、窗口布局、别的目录的恢复现场都动不得。
 ///
 /// 这三样是"两扇窗"今天就会踩的三个文件：两扇各写一份 `session.json`

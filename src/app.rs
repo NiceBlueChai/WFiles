@@ -1185,6 +1185,11 @@ impl WFilesApp {
 
     /// 开一个新标签并让焦点落到它上面。返回它的下标。
     fn add_tab(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        // 模态开着的时候新栏不能抢键盘：`Pane::new` 会自己抓一次焦点，把用户
+        // 正打字的那个框甩掉——面板从此"看着开着、其实按不动"（打不进字，
+        // 连 Esc 都送不进去，只能点一下别的界面把它弄回来）。先记下键盘此刻
+        // 在谁手上，建完还回去（见 `hand_keyboard_to_active_pane`）。
+        let keyboard = self.modal_open().then(|| window.focused(cx)).flatten();
         let tab = cx.new(|cx| {
             Pane::new(
                 path,
@@ -1205,6 +1210,10 @@ impl WFilesApp {
         ));
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        if let Some(handle) = keyboard {
+            // 新栏建好了，键盘还给刚才那个模态的输入框（没人抢的话它一直在）。
+            handle.focus(window, cx);
+        }
         self.sync_session(cx);
         cx.notify();
         self.active
