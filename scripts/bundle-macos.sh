@@ -47,6 +47,14 @@ cargo_args=()
 if [ "$profile" = release ]; then
     cargo_args=(--release)
 fi
+
+# 版本号只有一个来源：Cargo.toml 里 [package] 的 version。
+# 手抄一份到 Info.plist 的话，`wfiles --version` 报的、系统「关于本机」里
+# 显示的、`cargo build` 编出来的就会各说各话——用户报 bug 说的第一句话
+# 就是版本号，那一刻对不上，后面全白查。
+version="$(awk -F'"' '/^\[/{inpkg=($0=="[package]")} inpkg && /^version *=/{print $2; exit}' Cargo.toml)"
+[ -n "$version" ] || { echo "没能从 Cargo.toml 里读出版本号" >&2; exit 1; }
+
 echo "构建（${profile}）……"
 # **`${cargo_args[@]}` 要这么写**：macOS 自带的是 bash 3.2，空数组配上
 # `set -u` 会报 "unbound variable"（4.x 才修好）。所以先判空再展开。
@@ -63,6 +71,12 @@ app="$out_dir/WFiles.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/WFiles"
+
+# 图标：从 assets/wfiles.svg 现渲染（脚本自己带"比源稿新就不重做"的缓存）。
+# 产物放 target/icon 而不是 $out_dir——那是构建缓存，不该在用户挑的
+# 输出目录里留一个 icon/ 夹子。
+scripts/make-icon.sh --out target/icon
+cp target/icon/WFiles.icns "$app/Contents/Resources/WFiles.icns"
 
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -83,10 +97,15 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
          全部作废，得重新授一遍。 -->
     <key>CFBundleIdentifier</key>
     <string>com.wfiles.app</string>
+    <key>CFBundleIconFile</key>
+    <string>WFiles.icns</string>
+    <!-- 这两行的值由下面的 plutil 用 Cargo.toml 里的版本号替掉；
+         占位符留着是为了"没能替换"时 plutil 当场报错，而不是悄悄
+         留下一份过期的版本号。 -->
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>@VERSION@</string>
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>@VERSION@</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>
@@ -98,6 +117,12 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+# 版本号写进 plist。用 plutil 而不是 sed 替换模板：它是系统自带的，
+# 而且**替换失败会当场报错**（键不在、plist 结构坏了），不会留下一串
+# 占位符等着谁去发现。
+plutil -replace CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "$version" "$app/Contents/Info.plist"
 
 # 没有原生 xattr 的卷（外置 exFAT / NTFS，比如这个项目所在的 Ventoy）上，
 # `cp` 会给每个文件配一个 `._同名` 的资源叉伴生文件，而 codesign 会把它

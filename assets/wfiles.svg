@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    WFiles 的应用图标（源稿）。渲染成 .icns 走 scripts/make-icon.sh。
+
+    改动前先知道三件事（细节写在那个脚本的头注释里）：
+    1. 这是唯一的设计来源，改色值与形状只改这里；
+    2. 画布 1024、圆角方块 824 居中留 100 边距，是 macOS 图标的网格；
+    3. XML 注释里不能出现两个连续的连字符，写参数时别忘了躲开。
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B8CFF"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E9F0FF"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+
+  <!-- translate(8 -8)：文件夹的几何中心摆到画布中心。中间那道竖线是双栏的暗示，
+       16 像素下它会消失、只剩文件夹的剪影。 -->
+  <g transform="translate(8 -8)">
+    <path d="M 300 426 a 44 44 0 0 1 44 -44 h 118 l 26 34 h 176 a 44 44 0 0 1 44 44 v 154 a 44 44 0 0 1 -44 44 h -320 a 44 44 0 0 1 -44 -44 z"
+          fill="url(#paper)"/>
+    <rect x="494" y="466" width="20" height="142" rx="10" fill="#2563EB" opacity="0.26"/>
+  </g>
+</svg>

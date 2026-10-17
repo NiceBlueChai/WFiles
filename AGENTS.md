@@ -15,6 +15,7 @@ cargo test           # 测试（dev-deps: tempfile）
 cargo clippy --all-targets
 cargo fmt --check
 scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug 可选）
+scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle 时自动调用）
 ```
 
 - Rust edition **2024**，工具链用 stable，无 nightly 特性。
@@ -32,6 +33,12 @@ scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug
   `fatal: unable to mark recent objects`。清掉重跑就行
   （`find .git -name '._*' -delete && git gc --prune=now`），
   但它是写一次补一次，得边清边跑，别指望清一遍就完事。
+- **应用图标是 `assets/wfiles.svg`，由 `scripts/make-icon.sh` 用无头 Chrome
+  渲成 `.icns`**：macOS 自带的工具里没有 SVG 光栅器（`sips` 读不了 SVG，
+  `qlmanage` 会把 SVG 当**文本源码**预览），所以借浏览器。改图标只改 SVG，
+  渲出来的 `.icns` 进 `target/icon`，bundle 脚本自动调用并把它写进
+  Info.plist。**版本号只有一个来源（Cargo.toml）**：plist 里的那两行由
+  bundle 脚本用 plutil 现填，不要手抄。
 - **别从 macOS 交叉编译另外两个平台，试过了，走不通。** Windows 侧卡在
   `ring` 的 C 代码要 MSVC 运行库头文件（`assert.h` 找不到），Linux 侧卡在
   `wayland-backend` 的 build script 要编 C。`llvm-rc` 那道门倒是能绕
