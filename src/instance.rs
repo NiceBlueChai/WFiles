@@ -404,8 +404,7 @@ mod tests {
         cli::Cli {
             locale,
             launch,
-            new_window: false,
-            problem: None,
+            ..Default::default()
         }
     }
 

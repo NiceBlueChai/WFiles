@@ -4678,10 +4678,8 @@ fn same_dir(left: &Path, right: &Path) -> bool {
 /// "第二次启动"手里那份命令行：只带一个目标，别的什么都没给。
 fn second_launch(launch: crate::cli::Launch) -> crate::cli::Cli {
     crate::cli::Cli {
-        locale: None,
         launch: Some(launch),
-        new_window: false,
-        problem: None,
+        ..Default::default()
     }
 }
 

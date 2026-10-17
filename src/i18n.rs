@@ -1440,8 +1440,8 @@ static EN: &[(&str, &str)] = &[
         "--new-window and --new-tab can’t be used together: a new window has a single pane, so there is no “other pane” to add to",
     ),
     (
-        "用法：wfiles [路径] [--reveal] [--new-tab | --new-window] [--lang=代码]",
-        "Usage: wfiles [path] [--reveal] [--new-tab | --new-window] [--lang=code]",
+        "用法：wfiles [路径] [--reveal] [--new-tab | --new-window] [--lang=代码] [--help | --version]",
+        "Usage: wfiles [path] [--reveal] [--new-tab | --new-window] [--lang=code] [--help | --version]",
     ),
 ];
 

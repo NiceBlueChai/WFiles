@@ -12,6 +12,9 @@
 //! 猜哪个都是替用户做决定——而两种猜法都长得像"照办了"。这一种不开窗，
 //! 退出码 2，用法由 `main` 打印（见 [`Cli::problem`]）。
 //!
+//! `--help` 与 `--version` 是另一类：不开窗、不碰实例位子，只回答一句话
+//! （见 [`Cli::question`]）。答完 `main` 就退，退出码 0。
+//!
 //! 解析这一层不碰文件系统也不读环境：路径存不存在、是文件还是目录，
 //! 由调用方问清楚了喂进来（[`OnDisk`]）——那个判据到开窗那一刻才有意义，
 //! 而这一层能拿三个枚举值把规则测干净。
@@ -117,12 +120,50 @@ pub struct Cli {
     /// **只有已经开着一份时它才另有意思**：没有别的窗时，这一扇就是主窗，
     /// 会话、布局照常归它（见 `app::Starting`）。
     pub new_window: bool,
+    /// `--help`：只把用法打出来，不开窗。
+    pub help: bool,
+    /// `--version`：只把版本打出来，不开窗。
+    pub version: bool,
     /// 命令行自己打架时的一句话（i18n key）。有值就别开窗。
     pub problem: Option<&'static str>,
 }
 
+/// 这次启动只是"问一句话"——不开窗、不抢位子。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Question {
+    Help,
+    Version,
+}
+
+impl Cli {
+    /// 要答的那句话；没问就是 `None`。
+    ///
+    /// **两个一起问就先答用法**：用法那行里本来就写着 `--version`，
+    /// 读者顺路都能看到；反过来先答版本，用法就没机会露脸了。
+    ///
+    /// **规则放在这里而不是 `main` 里就地问**：先答哪个、没问算不算问，
+    /// 都是能钉在测试里的判据，而 `main` 里那段代码测不着。
+    pub fn question(&self) -> Option<Question> {
+        if self.help {
+            Some(Question::Help)
+        } else if self.version {
+            Some(Question::Version)
+        } else {
+            None
+        }
+    }
+}
+
 /// 用错了命令行时打印的第一行之后的用法说明。走 i18n，见 [`Cli::problem`]。
-pub const USAGE: &str = "用法：wfiles [路径] [--reveal] [--new-tab | --new-window] [--lang=代码]";
+pub const USAGE: &str =
+    "用法：wfiles [路径] [--reveal] [--new-tab | --new-window] [--lang=代码] [--help | --version]";
+
+/// `--version` 打的那一行。
+///
+/// 版本号在编译期从 `Cargo.toml` 取（`CARGO_PKG_VERSION`），**不手抄**：
+/// 这一行、bundle 脚本写进 Info.plist 的那份、`cargo build` 编出来的那份
+/// 要是对不上，用户报的版本号就成了罗生门。
+pub const VERSION: &str = concat!("wfiles ", env!("CARGO_PKG_VERSION"));
 
 /// `--new-window` 与 `--new-tab` 一起给：两句话互相矛盾。
 ///
@@ -139,7 +180,10 @@ pub struct Launch {
 }
 
 /// 认识的就这么几个：`--lang`（`=` 与空格两种写法）、`--reveal`、
-/// `--new-tab`、`--new-window`，以及一条路径。别的放过。
+/// `--new-tab`、`--new-window`、`--help`、`--version`，以及一条路径。别的放过。
+///
+/// **单横杠的短写法不认**（`-h` / `-v` 也算"别的"）：这一层没有一套短开关
+/// 可言，替用户猜"你想要的是不是 `--help`"正是上面那条规则要避免的事。
 pub fn parse<I>(args: I) -> Cli
 where
     I: IntoIterator<Item = OsString>,
@@ -169,6 +213,10 @@ where
             new_tab = true;
         } else if text == "--new-window" {
             cli.new_window = true;
+        } else if text == "--help" {
+            cli.help = true;
+        } else if text == "--version" {
+            cli.version = true;
         } else if text.starts_with('-') {
             // 认不出来的开关：默默放过，别报错退出。
         } else {
@@ -268,6 +316,58 @@ mod tests {
         // 从这个应用、别的应用、脚本里启动时，参数不由用户控制。
         let launch = cli(&["--whatever", "-v", "/tmp/x"]).launch.unwrap();
         assert_eq!(launch.target, Target::Open(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn asking_the_usage_or_the_version_is_not_a_launch() {
+        let version = cli(&["--version"]);
+        assert_eq!(version.question(), Some(Question::Version));
+        assert!(version.launch.is_none(), "问版本不是开窗");
+        assert!(version.problem.is_none());
+
+        let help = cli(&["--help"]);
+        assert_eq!(help.question(), Some(Question::Help));
+        assert!(help.launch.is_none(), "问用法不是开窗");
+
+        // 没问就不算问：普通启动一个字都不用答。
+        assert_eq!(cli(&["/tmp/x"]).question(), None);
+    }
+
+    #[test]
+    fn a_path_alongside_the_question_is_still_parsed() {
+        // 解析层把两件事都记下来，答哪件由 `main` 定：带路径问版本，
+        // 答案还是版本。**别顺手把路径当"那就开窗吧"**——那是替用户改主意。
+        let mixed = cli(&["--version", "/tmp/x"]);
+        assert_eq!(mixed.question(), Some(Question::Version));
+        assert!(mixed.launch.is_some(), "路径照样记着，只是这一次用不上");
+    }
+
+    #[test]
+    fn both_questions_at_once_answers_the_usage() {
+        // 用法那行里本来就写着 `--version`，先答用法顺路都能看到；
+        // 反过来先答版本，用法就没机会露脸了。顺序不该随参数顺序变。
+        assert_eq!(
+            cli(&["--help", "--version"]).question(),
+            Some(Question::Help)
+        );
+        assert_eq!(
+            cli(&["--version", "--help"]).question(),
+            Some(Question::Help)
+        );
+    }
+
+    #[test]
+    fn single_dash_forms_are_not_the_questions() {
+        // 这一层只认长开关；`-h` / `-v` 跟别的认不出来的开关一样"当没有"。
+        assert_eq!(cli(&["-v"]).question(), None);
+        assert_eq!(cli(&["-h"]).question(), None);
+    }
+
+    #[test]
+    fn the_version_line_carries_the_package_version() {
+        // 版本号只有一个来源：`Cargo.toml`。这里钉住那行的形状
+        // （`wfiles <版本>`），手抄一份数字进来的话这条会挂。
+        assert_eq!(VERSION, format!("wfiles {}", env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

@@ -91,6 +91,21 @@ fn main() {
     let cli = cli::parse(std::env::args_os().skip(1));
     i18n::set_cli_locale(cli.locale);
 
+    // 问用法、问版本是纯粹的提问：不开窗、不碰实例位子，答完就走（退出码 0）。
+    // **排在「两句话打架」之前**：用户没打算开窗，他那两句话也就没真的打架，
+    // 而当面答他要的东西比数落一句更有用。再往后一步就是抢位子（`instance::claim`）——
+    // 排在这里也意味着这两个开关**不会**被转发给已经开着的那一扇。
+    if let Some(question) = cli.question() {
+        match question {
+            cli::Question::Help => {
+                let locale = settings::Settings::load().locale();
+                println!("{}", i18n::tr_in(locale, cli::USAGE));
+            }
+            cli::Question::Version => println!("{}", cli::VERSION),
+        }
+        return;
+    }
+
     // 命令行自己打架（`--new-window` 与 `--new-tab` 一起给）：说清楚，别开窗。
     // 这句话说给谁看，也照上面那条优先级来（`--lang` > 设置 > 环境）——
     // 英文的机器上不该冒出一句中文用法错误。
