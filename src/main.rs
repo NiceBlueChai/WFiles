@@ -57,23 +57,61 @@ use gpui_kit::assets::{self, Assets};
 use gpui_kit::*;
 use std::borrow::Cow;
 
-// 组件默认那套图标里没有"列表/网格"这两个视图图标，
-// 而全量图标（AllAssets）会把 1800 个 SVG 全打进二进制（7 MB）。
-// 只挑出真正用到的这几个，其余的回落到默认那套。
-assets::icon_assets!(ViewIcons, [List, LayoutGrid, Columns3]);
+// **用到什么图标，就得打包什么图标**——没打包的会渲染成一片空白
+// （`AssetSource::load` 报错，元素照画、只是没有内容，不崩不报）。
+//
+// 组件默认那套是 106 个，底下这些都不在里面：视图切换的「列表/网格/分列」，
+// 以及 2026-10-18 一次审计查出来的 19 个（工具栏的新建文件夹/剪切/粘贴、
+// 侧栏的个人文件夹/桌面/下载、菜单的移到回收站…，全中招）。
+// 护栏是 `asset_tests::every_referenced_icon_is_packed`：它扫源码，
+// 少写一个就红——所以**加图标只改这一处**，别去别处找第二份清单。
+//
+// 不用全量图标（`AllAssets`）：1800 个 SVG 会给二进制加 7 MB，
+// 而真正在用的就这几十个。
+assets::icon_assets!(
+    AppIcons,
+    [
+        // 视图切换（组件默认集里没有）
+        List,
+        LayoutGrid,
+        Columns3,
+        // 侧栏与位置
+        House,
+        Monitor,
+        Download,
+        Cloud,
+        // 文件操作
+        FolderPlus,
+        Scissors,
+        ClipboardPaste,
+        SquarePen,
+        TextCursorInput,
+        Trash,
+        Link,
+        Signature,
+        FileArchive,
+        SearchX,
+        // 面板与状态
+        FileDiff,
+        Columns2,
+        X,
+        Command,
+        Terminal,
+    ]
+);
 
 struct WFilesAssets;
 
 impl AssetSource for WFilesAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if let Some(data) = ViewIcons.load(path)? {
+        if let Some(data) = AppIcons.load(path)? {
             return Ok(Some(data));
         }
         Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut all = ViewIcons.list(path)?;
+        let mut all = AppIcons.list(path)?;
         all.extend(Assets.list(path)?);
         Ok(all)
     }
@@ -243,5 +281,113 @@ fn offset_for_secondary(bounds: Bounds<Pixels>, cx: &mut App) -> Bounds<Pixels> 
     Bounds {
         origin: Point::new(px(stepped.x), px(stepped.y)),
         size: bounds.size,
+    }
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::WFilesAssets;
+    use gpui_kit::AssetSource as _;
+    use gpui_kit::assets::IconName;
+    use std::fs;
+
+    /// 源码里用到的图标变体名（去重，保持出现顺序）。
+    ///
+    /// 认的是「`IconName` 双冒号 + 标识符」这个形状，只收紧跟着的标识符字符，
+    /// 所以 `IconName::House` 收 `House`，而后面跟的东西（括号、逗号）不进名字。
+    fn referenced_icons() -> Vec<String> {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut out: Vec<String> = Vec::new();
+        for entry in fs::read_dir(format!("{root}/src")).expect("读不到 src/") {
+            let path = entry.expect("扫 src/ 出错").path();
+            // macOS 在外置卷上给每个文件配一个 `._xxx` 伴生文件（资源叉），
+            // 它不是源码、也不是 UTF-8——不跳过的话这一读就崩。
+            let file = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if file.starts_with("._") {
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("源码文件读不到");
+            let needle = "IconName::";
+            for (at, _) in text.match_indices(needle) {
+                let rest = &text[at + needle.len()..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() || out.contains(&name) {
+                    continue;
+                }
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// **用到什么图标，就得打包什么图标。**
+    ///
+    /// 2026-10-18 实测：源码里用了 53 个变体，其中 19 个既不在
+    /// `gpui-kit-assets` 的默认 106 个里、也没写进 `main.rs` 的 `icon_assets!`
+    /// ——它们在界面上是**一片空白**：`AssetSource::load` 报错，元素照画、
+    /// 只是没有内容。中招的是工具栏的「新建文件夹 / 剪切 / 粘贴」、侧栏的
+    /// 「个人文件夹 / 桌面 / 下载」、菜单里的「移到回收站」这些，一眼就看得出。
+    ///
+    /// 所以这条测试**扫源码**，不维护登记表：登记表一定会漏，而漏了没人知道
+    /// ——界面上不崩不报，只是少一个图形。判据钉在真正渲染用的那个资产源
+    /// （[`WFilesAssets`]）上，于是"忘了补进清单"和"清单里写错了名字"
+    /// 这两件事同一条测试都管得住。
+    #[test]
+    fn every_referenced_icon_is_packed() {
+        // 关联常量不是图标：这一条是全部变体那张表，测试自己要读它。
+        const NOT_ICONS: &[&str] = &["ALL"];
+
+        let referenced = referenced_icons();
+        // 护栏：扫描器坏了会扫到 0 个，上面却什么都不报——「扫不到」和
+        // 「都打包好了」长得一模一样。53 是 2026-10-18 实测数，以后只会更大。
+        assert!(
+            referenced.len() >= 53,
+            "只扫到 {} 个图标，比实测的 53 个还少——扫描器多半坏了",
+            referenced.len()
+        );
+
+        let mut missing = Vec::new();
+        let mut unknown = Vec::new();
+        for name in &referenced {
+            if NOT_ICONS.contains(&name.as_str()) {
+                continue;
+            }
+            let found = IconName::ALL
+                .iter()
+                .find(|icon| format!("{icon:?}") == *name);
+            match found {
+                None => unknown.push(name.clone()),
+                Some(icon) => {
+                    let packed = WFilesAssets
+                        .load(&icon.path())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|bytes| !bytes.is_empty());
+                    if !packed {
+                        missing.push(format!("{name} -> {}", icon.path()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            unknown.is_empty(),
+            "源码里出现了图标枚举里没有的变体名（扫描器扫错了？）：{unknown:?}"
+        );
+        assert!(
+            missing.is_empty(),
+            "这些图标用到了、但没打进二进制，界面上会是一片空白：\n  {}",
+            missing.join("\n  ")
+        );
     }
 }
