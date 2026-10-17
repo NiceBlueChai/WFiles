@@ -1147,6 +1147,16 @@ fn the_status_bar_drives_a_running_transfer(cx: &mut TestAppContext) {
     let (_session, handle) = open_in(cx, root.path());
     // 后台线程要持续把进度送回来，见 [`new_ops`] 里的说明。
     cx.background_executor.allow_parking();
+    // 这条测试要看的是**搬运还在跑**时的界面：进度行、中止按钮、暂停后的
+    // 文案。而 12 MB（3000 个 4 KB）在这台机器上一闪就过去了——实测进度行
+    // 4 ms 就出现，中止按钮那条断言在它出现与消失之间只有几十毫秒，
+    // 全量跑时偶发挂在「还该有中止按钮」上。
+    //
+    // 限到 3 MB/s：实测这一趟稳定地跑六七秒，三样东西都在窗口里。量的是
+    // 界面在搬运中的样子，不是这台机器有多快。
+    cx.update(|cx| {
+        Settings::update(cx, |settings| settings.speed_limit = 3_000_000);
+    });
 
     step(cx, handle, |window, cx| {
         settle(window, cx);
