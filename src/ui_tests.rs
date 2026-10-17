@@ -6130,6 +6130,69 @@ fn no_breadcrumb_escapes_the_address_bar(cx: &mut TestAppContext) {
     }
 }
 
+/// 路径从**左**起排：最左边那一段贴着容器左内边距，左边不留空白。
+///
+/// 用户 2026-10-18 报的："地址栏正常不都居左吗，你这咋都在最右边，左边全是
+/// 一大片空白"。那会儿这里是 `justify_end`，还配了一句"路径从右边起排是
+/// Explorer 的习惯"——那句话是编的：Finder / Explorer / GNOME Files / Dolphin
+/// 全是左起。
+///
+/// 判据落在**左边那段空白有多宽**上：右对齐时它等于"容器宽 − 路径宽"
+/// （1180 px 窗口里两百多像素，一眼就是没对齐），左起时它只剩容器那 8 px
+/// 内边距。跟上面 `no_breadcrumb_escapes_the_address_bar` 是一对：那条管
+/// 右边不越界，这条管左边不塌空。
+#[gpui_kit::test]
+fn the_path_starts_at_the_left_edge(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    // 短名的目标目录：内容比容器窄，"左边剩多少空白"才量得出来。
+    // 拿临时目录自己当目标的话，那串随机名把三段撑得跟容器差不多宽，
+    // 两种对齐都在左边量出小值——测试就废了（这条是被红检打回来改的）。
+    let short = dir.path().join("sub");
+    std::fs::create_dir_all(&short).expect("造目录");
+    let (_isolation, handle) = open_in(cx, &short);
+    step(cx, handle, settle);
+    // 收掉两侧，把宽度让给面包屑——跟上面那条一样。
+    step(cx, handle, |window, cx| {
+        window.press("cmd-b", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-o", cx);
+        settle(window, cx);
+    });
+
+    let (gap, bar_width) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        let bar = window.try_find("breadcrumb").expect("面包屑").bounds();
+
+        // 最左边那一段：折叠时是「…」，没折叠时是序号最小的 crumb。
+        let mut leftmost = px(f32::MAX);
+        for index in 0..12usize {
+            if let Some(crumb) = window.try_find(("crumb", index)) {
+                let at = crumb.bounds().origin.x;
+                if at < leftmost {
+                    leftmost = at;
+                }
+            }
+        }
+        if let Some(folded) = window.try_find("crumb-folded") {
+            let at = folded.bounds().origin.x;
+            if at < leftmost {
+                leftmost = at;
+            }
+        }
+        assert!(leftmost < px(f32::MAX), "至少要有一段路径");
+
+        (leftmost - bar.origin.x, bar.size.width)
+    });
+
+    assert!(
+        gap <= px(16.),
+        "路径没贴着左边：左边空了 {gap}（容器宽 {bar_width}）——\
+         居左那一路下这里只剩容器的内边距（8 px）"
+    );
+}
+
 /// 面包屑里序号最大的那一段，也就是当前目录。
 ///
 /// 序号不能写死成"第几层"：临时目录本身带着 `/var/folders/...` 与随机串，
