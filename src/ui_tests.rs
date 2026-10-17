@@ -2226,6 +2226,34 @@ fn the_terminal_panel_opens_and_the_same_key_closes_it(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn the_shortcuts_survive_closing_the_terminal_drawer(cx: &mut TestAppContext) {
+    let _session = isolate_session();
+    let handle = open_app(cx);
+
+    step(cx, handle, |window, cx| {
+        toggle_terminal(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("terminal").is_some(), "先打开终端");
+        toggle_terminal(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("terminal").is_none(), "再按一次该收起");
+    });
+    // 面板一开就把键盘拿走了，收起时它整个离开渲染树——接下来键盘在谁手上？
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2, "收起终端之后，快捷键该还灵");
+    });
+}
+
+#[gpui_kit::test]
 fn the_embedded_terminal_runs_a_real_command(cx: &mut TestAppContext) {
     let _session = isolate_session();
     let handle = open_app(cx);
@@ -3026,6 +3054,71 @@ fn escape_closes_the_compare_panel(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui_kit::test]
+fn the_shortcuts_survive_closing_the_compare_panel(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    compare_pair(root.path());
+    let (_session, handle) = open_in(cx, root.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-b", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("compare").is_some(), "先打开比较面板");
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("compare").is_none(), "Esc 该关掉");
+    });
+    // 面板开着的时候焦点在它身上；关掉之后键盘得有人接手。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2, "关掉比较面板之后，快捷键该还灵");
+    });
+}
+
+#[gpui_kit::test]
+fn the_shortcuts_survive_toggling_the_compare_panel_off(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    compare_pair(root.path());
+    let (_session, handle) = open_in(cx, root.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-b", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("compare").is_some(), "先打开比较面板");
+        window.press("cmd-alt-b", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("compare").is_none(), "同一个键再按该收起");
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2, "同一个键收起面板之后，快捷键该还灵");
+    });
+}
+
 // ---- 文件内容比较：按行 / 细到字符 / 十六进制 ----
 
 /// 面板在两个文件读完之后才出结果，那个读取在真线程上：
@@ -3141,6 +3234,40 @@ fn escape_closes_the_diff_panel(cx: &mut TestAppContext) {
     step(cx, handle, |window, cx| {
         settle(window, cx);
         assert!(window.try_find("diff").is_none(), "Esc 该关掉面板");
+    });
+}
+
+#[gpui_kit::test]
+fn the_shortcuts_survive_closing_the_diff_panel(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "一样\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "一样\n").unwrap();
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.press("cmd-alt-shift-b", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("diff").is_some(), "先打开内容比较面板");
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(window.try_find("diff").is_none(), "Esc 该关掉");
+    });
+    // 面板开着的时候焦点在它身上；关掉之后键盘得有人接手。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-t", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(tab_count(window), 2, "关掉内容比较面板之后，快捷键该还灵");
     });
 }
 

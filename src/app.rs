@@ -1420,6 +1420,8 @@ impl WFilesApp {
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.term.is_some() {
             self.term = None;
+            // 键盘在终端手里，收起来得有人接手（见 `hand_keyboard_to_active_pane`）。
+            self.hand_keyboard_to_active_pane(window, cx);
             cx.notify();
             return;
         }
@@ -1428,9 +1430,11 @@ impl WFilesApp {
         self.subscriptions.push(cx.subscribe_in(
             &terminal,
             window,
-            |this, _, event: &TerminalEvent, _, cx| match event {
+            |this, _, event: &TerminalEvent, window, cx| match event {
                 TerminalEvent::Close => {
                     this.term = None;
+                    // shell 自己退出时用户可能正等着继续敲键盘：还回去。
+                    this.hand_keyboard_to_active_pane(window, cx);
                     cx.notify();
                 }
             },
@@ -1547,6 +1551,8 @@ impl WFilesApp {
             |this, _, event: &DiffEvent, window, cx| match event {
                 DiffEvent::Close => {
                     this.diff = None;
+                    // 面板带着焦点离开渲染树，键盘得有人接手。
+                    this.hand_keyboard_to_active_pane(window, cx);
                     cx.notify();
                 }
                 DiffEvent::Reveal(path) => this.reveal_in_active(path.clone(), window, cx),
@@ -1832,6 +1838,8 @@ impl WFilesApp {
     /// 打开比较面板，或者在开着的时候收起它。
     fn toggle_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.compare.take().is_some() {
+            // 面板开着时焦点在它身上，收起来得还键盘（见 `hand_keyboard_to_active_pane`）。
+            self.hand_keyboard_to_active_pane(window, cx);
             cx.notify();
             return;
         }
@@ -1847,6 +1855,8 @@ impl WFilesApp {
             |this, _, event: &CompareEvent, window, cx| match event {
                 CompareEvent::Close => {
                     this.compare = None;
+                    // 面板带着焦点离开渲染树，键盘得有人接手。
+                    this.hand_keyboard_to_active_pane(window, cx);
                     cx.notify();
                 }
                 CompareEvent::Reveal(path) => this.reveal_in_active(path.clone(), window, cx),
