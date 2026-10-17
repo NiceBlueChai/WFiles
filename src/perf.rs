@@ -378,19 +378,21 @@ fn selecting_everything_stays_linear() {
     selection.select_all(&listing);
     let took = start.elapsed();
     assert_eq!(selection.len(), BIG, "该全选上");
-    // release 实测 175 ms。这条本身就**不理想**：175 ms 在 release 下是
-    // 能感觉到的顿。它慢是因为 BTreeSet 逐条插入 10 万个 `PathBuf`
-    // （带堆分配）。门槛给 350 ms（2 倍），盯的是"别再往上涨"，
-    // 而不是"这已经够快了"——真要提速该换结构，那是另一件事。
-    println!("10 万项全选：{took:?}（release 实测 175 ms，这个值本身还不够好）");
+    // release 实测 10 ms 上下（并跑其它基准时 13 ~ 20 ms；从前 139 ms）。
+    //
+    // 这条卡的是**结构**，不是这台机器的速度：门槛 60 ms。同一个循环
+    // 换成 `BTreeSet` 写过的那种结构，同一趟里实测 105 ms 起——它慢在
+    // "克隆一条、插一条"交错着做（详解见 `model::Selection` 的注释），
+    // 于是旧结构会稳稳红在门槛之上，而不是靠运气飘过去。
+    println!("10 万项全选：{took:?}（release 实测 10 ms 上下）");
     assert!(
-        took < budget(350),
-        "10 万项全选花了 {took:?}（release 实测 175 ms）"
+        took < budget(60),
+        "10 万项全选花了 {took:?}（release 实测 10 ms 上下；旧结构 105 ms 起，门槛 60 ms）"
     );
 }
 
 /// 取回"按显示顺序排好的选中路径"——复制、剪切、统计都要它。
-/// 这条走的是排序 + 二分，不是遍历。
+/// 这条走的是**遍历**：按显示顺序扫一遍列表，逐行问一句"你选没选中"。
 #[test]
 fn collecting_the_selection_follows_the_visible_order() {
     let listing = a_listing(BIG);
@@ -427,11 +429,16 @@ fn collecting_the_selection_follows_the_visible_order() {
         })
         .collect();
     assert_eq!(got, expected, "该按列表显示的顺序给，不按选中的先后");
-    // release 实测 97 ms。同样偏慢（每次都新建 PathBuf），门槛给 200 ms。
-    println!("5 万项选中取回顺序：{took:?}（release 实测 97 ms）");
+    // release 实测 7 ~ 11 ms（换 `HashSet` 之前 62 ms）。门槛 40 ms。
+    //
+    // 慢在查找上：旧结构里一次"这个路径选没选中"要逐组件比十几层路径
+    // （10 万次查实测 71 ms，同一趟里哈希集合是 2.9 ms）；
+    // 另外旧代码是**先给每一行克隆一份路径再筛**，只选了几项时那些
+    // 克隆全是白花的（现在先按引用筛、再克隆）。
+    println!("5 万项选中取回顺序：{took:?}（release 实测 7 ~ 11 ms）");
     assert!(
-        took < budget(200),
-        "5 万项选中取回顺序花了 {took:?}（release 实测 97 ms）"
+        took < budget(40),
+        "5 万项选中取回顺序花了 {took:?}（release 实测 7 ~ 11 ms，门槛 40 ms）"
     );
 }
 

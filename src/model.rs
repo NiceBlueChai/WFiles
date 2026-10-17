@@ -4,7 +4,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, HashMap},
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::SystemTime,
@@ -523,9 +523,26 @@ impl Listing {
 /// `cursor` 是“当前这一项”，方向键和点击都会移动它；
 /// `anchor` 是 Shift 连选的起点，只有普通点击和 Command 点击才会移动它，
 /// 这样连续按 Shift+方向键才能不断扩大选区。
+///
+/// # 为什么是 `HashSet` 而不是 `BTreeSet`
+///
+/// 全选、取回顺序都是"10 万项"量级的操作，而**路径比较是逐组件的**：
+/// 一个 `BTreeSet<PathBuf>` 每次查要走十几层，每层都在比两条路径。
+/// release 实测（10 万项，`perf.rs`）：查 10 万次 71 ms（哈希集合 2.9 ms）。
+/// 插入更微妙——**单独插入不贵，和克隆交错着插入贵十倍**
+/// （交错 105 ms vs 先克隆再插入 10 ms，同一个循环换个顺序而已）；
+/// 而 `select_all` / `select_range` 天然就是"克隆一条、插一条"的形状。
+/// 哈希集合那个形状是 6.3 ms，两头都躲开了。
+///
+/// 代价：迭代顺序不再是有序的。这个结构**不对外暴露顺序**——
+/// 要顺序的地方（批量操作、写恢复现场）都走 [`Selection::ordered`]，
+/// 它按列表显示顺序走，跟这里没关系。三处"选中项里最小的那个"
+/// （光标/锚点掉了之后的兜底）用 [`Iterator::min`] 把顺序拿回来，
+/// 结果跟 `BTreeSet` 的迭代顺序**一模一样**，只是那一下要 O(n)——
+/// 它只在"刷新后原来的选中项没了"这类偶发路径上走。
 #[derive(Debug, Default)]
 pub struct Selection {
-    paths: BTreeSet<PathBuf>,
+    paths: HashSet<PathBuf>,
     cursor: Option<PathBuf>,
     anchor: Option<PathBuf>,
 }
@@ -593,7 +610,11 @@ impl Selection {
             .as_ref()
             .is_some_and(|anchor| self.paths.contains(anchor))
         {
-            self.anchor = self.paths.iter().next().cloned();
+            // `min()` 而不是 `iter().next()`：哈希集合的迭代顺序是随机的，
+            // 这里要的是"选中项里最小的那条路径"（`BTreeSet` 时代的行为，
+            // 测试 `dropping_the_anchor_moves_it_to_the_smallest_remaining_path`
+            // 钉着它）。
+            self.anchor = self.paths.iter().min().cloned();
         }
     }
 
@@ -639,10 +660,12 @@ impl Selection {
 
     /// 按列表顺序返回选中项，批量操作要用同一个顺序。
     pub fn ordered(&self, listing: &Listing) -> Vec<PathBuf> {
+        // 先按引用筛、再克隆。反过来（给每一行克隆一份路径再筛）在
+        // 10 万项目录里只选了寥寥几项时会把分配几乎全白花掉。
         (0..listing.visible_count())
             .filter_map(|position| listing.visible_entry(position))
+            .filter(|entry| self.paths.contains(&entry.path))
             .map(|entry| entry.path.clone())
-            .filter(|path| self.paths.contains(path))
             .collect()
     }
 
@@ -671,12 +694,14 @@ impl Selection {
         let before = self.paths.len();
         self.paths.retain(|path| listing.entry(path).is_some());
 
+        // 两处兜底都用 `min()`（见 [`Selection::toggle`] 里的解释：
+        // 哈希集合的迭代顺序是随机的，"选中项里最小的那条"要显式取）。
         if self
             .cursor
             .as_ref()
             .is_some_and(|cursor| !self.paths.contains(cursor))
         {
-            self.cursor = self.paths.iter().next().cloned();
+            self.cursor = self.paths.iter().min().cloned();
         }
 
         if self.paths.len() != before
@@ -685,7 +710,7 @@ impl Selection {
                 .as_ref()
                 .is_none_or(|anchor| !self.paths.contains(anchor))
         {
-            self.anchor = self.paths.iter().next().cloned();
+            self.anchor = self.paths.iter().min().cloned();
         }
     }
 }
@@ -1127,6 +1152,64 @@ mod tests {
 
         assert_eq!(selection.len(), 0);
         assert_eq!(selection.single(), None);
+    }
+
+    /// 锚点被 Command 点击取消掉之后，落到"选中项里最小的那条路径"上。
+    ///
+    /// 这条在 `BTreeSet` 时代是免费来的（迭代顺序就是路径序），换成
+    /// `HashSet` 之后**只能靠 `min()` 显式保住**——`iter().next()` 在哈希
+    /// 集合上是随机的，那会让光标在刷新后随机跳，而这条测试时而红时而绿。
+    #[test]
+    fn dropping_the_anchor_moves_it_to_the_smallest_remaining_path() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+            fs::write(root.path().join(name), "x").unwrap();
+        }
+        let listing = listing_of(root.path());
+        let alpha = root.path().join("alpha.txt");
+        let beta = root.path().join("beta.txt");
+        let gamma = root.path().join("gamma.txt");
+
+        let mut selection = Selection::default();
+        selection.select(beta.clone());
+        selection.toggle(gamma.clone());
+        selection.toggle(alpha.clone());
+        assert_eq!(selection.anchor.as_deref(), Some(alpha.as_path()));
+
+        // 把锚点自己取消掉，剩下的选中项是 beta / gamma。
+        selection.toggle(alpha);
+        assert_eq!(
+            selection.anchor.as_deref(),
+            Some(beta.as_path()),
+            "锚点该落到剩下最小的那一条上，不是随便哪一条"
+        );
+        assert_eq!(selection.ordered(&listing), [beta, gamma]);
+    }
+
+    /// 刷新之后光标那一项没了：光标与锚点都落到幸存项里最小的那条。
+    #[test]
+    fn a_refresh_moves_the_cursor_and_the_anchor_to_the_smallest_survivor() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+            fs::write(root.path().join(name), "x").unwrap();
+        }
+        let alpha = root.path().join("alpha.txt");
+        let beta = root.path().join("beta.txt");
+
+        // `select_all` 的光标本来就落在第一项，这里删的就是它。
+        let mut selection = Selection::default();
+        selection.select_all(&listing_of(root.path()));
+        assert_eq!(selection.cursor.as_deref(), Some(alpha.as_path()));
+
+        fs::remove_file(&alpha).unwrap();
+        selection.retain_existing(&listing_of(root.path()));
+
+        assert_eq!(
+            selection.cursor.as_deref(),
+            Some(beta.as_path()),
+            "光标该落到幸存的最小项上"
+        );
+        assert_eq!(selection.anchor.as_deref(), Some(beta.as_path()));
     }
 
     // 链接相关的测试都得挂 `#[cfg(unix)]`：`std::os::unix` 在 Windows 上
