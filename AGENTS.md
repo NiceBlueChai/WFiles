@@ -95,6 +95,9 @@ scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle �
 | `src/volumes.rs` | 本机挂着的卷：三个平台各自的扫描落点、3 秒 TTL 快照缓存 |
 | `src/ui_tests.rs` | 无头窗口 UI 集成测试 |
 | `src/perf.rs` | 性能基准：9 条，钉住 ROADMAP「性能基线」（**看数字要用 `--release`**） |
+| `README.md` / `README.en.md` | 门面：功能一览、平台状态（只有 macOS 真机验证过）、构建与运行、数据位置、快捷键表；英文那份是精简版 |
+| `LICENSE` | MIT；改它别忘了 `Cargo.toml` 的 `license` 字段 |
+| `assets/wfiles.svg` | 应用图标源稿；`scripts/make-icon.sh` 渲成 .icns，bundle 时自动调用 |
 | `ROADMAP.md` | 产品路线图：功能范围、阶段划分、明确不做清单 |
 | `docs/cross-platform-filesystem.md` | 三平台文件系统约束调研（文件名/路径/回收站/元数据） |
 | `.agents/skills/` | 项目级 skill 的规范位置（当前：`gpui-kit`、`gpui-kit-design-guides` 两个官方 skill，改 UI/架构前必读） |
