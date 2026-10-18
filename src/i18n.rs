@@ -612,6 +612,28 @@ static EN: &[(&str, &str)] = &[
     ("文件", "Files"),
     ("快捷键", "Shortcuts"),
     ("改键：{title}", "Rebind: {title}"),
+    // ---- 设置对话框 ----
+    // 「设置」那四项只有这一处出口（外加命令面板里各一条），所以文案都
+    // 在这儿：行标题 + 一句说明 + 选项名。
+    ("设置", "Settings"),
+    ("偏好", "Preferences"),
+    ("自动", "Automatic"),
+    ("跟随系统", "Follow system"),
+    ("默认终端", "Default Terminal"),
+    (
+        "自动 = 挑一个本机装着的",
+        "Automatic picks one that is installed",
+    ),
+    ("界面语言", "Interface Language"),
+    ("换完立刻生效", "Applies immediately"),
+    ("传输限速", "Transfer Speed Limit"),
+    (
+        "正在跑的搬运也立刻按新的来",
+        "Running transfers pick it up right away",
+    ),
+    ("列表最右边那一列显示什么", "What the extra column shows"),
+    ("不显示", "Hidden"),
+    ("{label}（当前）", "{label} (current)"),
     // ---- 命令面板（文件操作）----
     ("新建文件夹", "New Folder"),
     ("重命名", "Rename"),
@@ -677,6 +699,13 @@ static EN: &[(&str, &str)] = &[
     ("连接远程服务器…", "Connect to Server…"),
     ("默认终端：自动", "Default Terminal: Automatic"),
     ("默认终端：{name}", "Default Terminal: {name}"),
+    // 终端的显示名。产品名照抄，只有我们自己写的那几个中文名要翻——
+    // 名字在设置卡与命令面板里都出现，两处是同一个来源。
+    ("终端（Terminal.app）", "Terminal (Terminal.app)"),
+    ("命令提示符", "Command Prompt"),
+    ("系统默认终端", "System Default Terminal"),
+    ("GNOME 终端", "GNOME Terminal"),
+    ("XFCE 终端", "XFCE Terminal"),
     // ---- 日志导出 ----
     // 这几句是**界面上**的话（面板里那一条、状态栏里那两句），
     // 所以要翻。被导出的日志文件内容不翻——那是排查看的现场，

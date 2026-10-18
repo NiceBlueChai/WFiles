@@ -4704,6 +4704,177 @@ fn a_new_tab_does_not_steal_the_keyboard_from_a_modal(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// 设置对话框：Cmd+, 开、Esc 关，关完键盘要回到窗格。
+///
+/// 卡片里没有输入框，"键盘进没进来"从界面上看不出来——判据只能是两个键：
+/// 开着时 Esc 能收掉它（说明按键冒到了浮层根节点），关掉后 ↓ 能选中行
+/// （说明键盘回到了窗格）。后一条钉的是 AGENTS 记着的那个坑：卡片是**当场
+/// 从渲染树里撤掉**的，焦点要是还挂在它身上，窗格级快捷键会整片变哑，
+/// 不报错、不留痕。
+#[gpui_kit::test]
+fn the_settings_dialog_opens_with_cmd_comma_and_esc_gives_the_keyboard_back(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+    std::fs::write(dir.path().join("b.txt"), "x").expect("造文件");
+    let (_isolation, handle, app) = open_in_with_app(cx, dir.path());
+    step(cx, handle, settle);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-,", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_some(),
+            "Cmd+, 该开出设置卡"
+        );
+        assert_eq!(a11y_label_at(window, "overlay-title"), "设置");
+        window.press("escape", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_none(),
+            "Esc 该收掉设置卡"
+        );
+        window.press("down", cx);
+    });
+    assert_eq!(
+        selected_names(cx, &app),
+        vec!["a.txt".to_string()],
+        "关掉设置之后，窗格级的按键该还灵（↓ 得能选中第一行）"
+    );
+}
+
+/// 设置卡里点一下就能改设置。判据钉在**设置本身**上，不看配色：
+/// "哪一颗亮着"是画出来的，改了没有只有数据说了算。
+#[gpui_kit::test]
+fn clicking_a_choice_in_the_settings_dialog_changes_the_setting(cx: &mut TestAppContext) {
+    let dir = overlay_fixture();
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 1180.);
+    step(cx, handle, settle);
+    // 先摆一个"以前选过"的状态：终端与语言默认就是"自动"，不先改一下的话，
+    // 点那两颗跟没点一样，这条测试就什么都没验到。
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| {
+            settings.terminal = "wezterm".to_string();
+            settings.set_locale(crate::i18n::Locale::En);
+            settings.speed_limit = 0;
+        });
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-,", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("setting-terminal-auto", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            Settings::peek(cx, |settings| settings.terminal.clone()),
+            "auto",
+            "点了「自动」之后设置里该是 auto"
+        );
+        assert!(
+            window.try_find("overlay-card").is_some(),
+            "改一项不该顺手收掉卡片——设置是「改完接着看下一项」的地方"
+        );
+        window.click("setting-speed-1000000", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            Settings::peek(cx, |settings| settings.speed_limit),
+            1_000_000,
+            "点了「1 MB/s」之后限速该跟着变"
+        );
+        window.click("setting-locale-auto", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            Settings::peek(cx, |settings| settings.locale.clone()),
+            "",
+            "点「跟随系统」该存空串，不是把当前语言写回去——写回去等于从此不再跟随"
+        );
+        assert!(window.try_find("overlay-card").is_some());
+    });
+}
+
+/// 存着的终端本机没有时（换了机器、装过又卸了），那颗仍然要看得见。
+///
+/// 不补这一颗的话，四颗里一颗都不亮——用户看见的是"我的设置丢了"，
+/// 而不是"这个终端没了"，前者会让人到处找。
+#[gpui_kit::test]
+fn a_terminal_that_is_no_longer_installed_still_shows_up(cx: &mut TestAppContext) {
+    let dir = overlay_fixture();
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 1180.);
+    step(cx, handle, settle);
+    step(cx, handle, |_, cx| {
+        Settings::update(cx, |settings| {
+            settings.terminal = "no-such-term".to_string()
+        });
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-,", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            a11y_label_at(window, "setting-terminal-no-such-term"),
+            "no-such-term（当前）",
+            "存着但本机没有的终端该看得见，并且标着当前"
+        );
+    });
+    // 换得掉：点「自动」。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("setting-terminal-auto", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert_eq!(
+            Settings::peek(cx, |settings| settings.terminal.clone()),
+            "auto",
+            "点得掉那个已经不存在的终端"
+        );
+    });
+}
+
+/// 设置也能从命令面板进：不是所有人都记得住 Cmd+,。
+#[gpui_kit::test]
+fn the_settings_dialog_opens_from_the_palette(cx: &mut TestAppContext) {
+    let dir = overlay_fixture();
+    let (_isolation, handle) = open_in_at_width(cx, dir.path(), 1180.);
+    step(cx, handle, settle);
+    step(cx, handle, |window, cx| {
+        window.press("cmd-p", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.input("设置", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.click("app:settings", cx);
+        settle(window, cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        assert!(
+            window.try_find("overlay-card").is_some(),
+            "面板里点「设置」该开出设置卡"
+        );
+    });
+}
+
 /// 副窗**只读不写**：会话、窗口布局、别的目录的恢复现场都动不得。
 ///
 /// 这三样是"两扇窗"今天就会踩的三个文件：两扇各写一份 `session.json`
@@ -5746,6 +5917,29 @@ fn every_dialog_stays_inside_a_narrow_window(cx: &mut TestAppContext) {
                     bounds_of(window, "bulk-ok", width, "批量重命名对话框的执行按钮"),
                     width,
                     "执行重命名按钮",
+                );
+            });
+        }
+        // 设置卡：560px，四行选项 + 一排按钮（最宽的一张卡之外的第二张）
+        {
+            let dir = overlay_fixture();
+            let (_isolation, handle) = open_in_at_width(cx, dir.path(), width);
+            step(cx, handle, settle);
+            step(cx, handle, |window, cx| {
+                window.press("cmd-,", cx);
+                settle(window, cx);
+            });
+            step_value(cx, handle, |window, cx| {
+                settle(window, cx);
+                assert_inside_window(
+                    bounds_of(window, "overlay-card", width, "设置对话框"),
+                    width,
+                    "设置对话框",
+                );
+                assert_inside_window(
+                    bounds_of(window, "settings-done", width, "设置对话框的完成按钮"),
+                    width,
+                    "完成按钮",
                 );
             });
         }

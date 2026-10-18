@@ -67,6 +67,7 @@ gpui_kit::actions!(
         ToggleDetails,
         Compare,
         Diff,
+        OpenSettings,
     ]
 );
 
@@ -122,6 +123,8 @@ enum PaletteAction {
     MetaColumn(Option<MetaField>),
     /// 开关底部的内嵌终端面板。
     ToggleTerminal,
+    /// 打开设置对话框。
+    OpenSettings,
     NewTab,
     CloseTab,
     NextTab,
@@ -222,6 +225,9 @@ pub fn init(cx: &mut App) {
         // 文件内容比较：同上，只是对象换成两个文件。带 Shift 是顺着
         // "同一个比较动作、更细一层"的意思，和上面的目录比较挨着记。
         KeyBinding::new("cmd-alt-shift-b", Diff, None),
+        // 设置：Cmd+, 是 macOS 上叫了几十年的"偏好设置"，Windows/Linux 上
+        // 这个组合也没人占。
+        KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
 }
 
@@ -298,6 +304,16 @@ pub struct WFilesApp {
     /// 最近一次连上后，密码到底落在哪——必须让用户看得见，
     /// 否则“密码明文躺在设置里”这种事没人会知道。
     secret_note: Option<String>,
+    /// 设置对话框开着没有。
+    ///
+    /// 它跟几个输入框对话框不一样：卡片里没有输入框，但键盘仍然得进来
+    /// （见 [`Self::open_settings`]），所以它也算"拿着键盘的模态"。
+    settings_open: bool,
+    /// 设置对话框的焦点落点。
+    ///
+    /// 卡片里没有输入框，键盘总得落在谁身上——落在卡片上，Esc 才冒得到
+    /// 浮层根节点那一支（按键只顺着焦点所在的那条路往上走）。
+    settings_focus: FocusHandle,
 }
 
 /// 这一次开窗的来路：命令行给了什么、这一扇是什么身份。
@@ -446,6 +462,8 @@ impl WFilesApp {
             sidebar_collapsed: false,
             details_shown: true,
             secret_note: None,
+            settings_open: false,
+            settings_focus: cx.focus_handle(),
         };
 
         // 侧栏的「收藏」段读的是设置，而设置是**窗格**改的（Cmd+D 在窗格上）。
@@ -1425,7 +1443,8 @@ impl WFilesApp {
         cx.notify();
     }
 
-    /// 有没有"自己拿着键盘"的模态开着：命令面板与几个带输入框的对话框。
+    /// 有没有"自己拿着键盘"的模态开着：命令面板、设置，与几个带输入框的
+    /// 对话框。
     ///
     /// 它们开着的期间换栏、关栏都不该把键盘抢回来——用户正在里面打字。
     fn modal_open(&self) -> bool {
@@ -1433,6 +1452,7 @@ impl WFilesApp {
             || self.prompt_input.is_some()
             || self.bulk_inputs.is_some()
             || self.connect.is_some()
+            || self.settings_open
     }
 
     /// 键盘交给当前那一栏。
@@ -2503,6 +2523,32 @@ impl WFilesApp {
         cx.notify();
     }
 
+    /// 开设置对话框（Cmd+, 或命令面板里的「设置」）。
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_open {
+            return;
+        }
+        self.settings_open = true;
+        // 卡片里没有输入框，但键盘必须进来一步：Esc 靠的是浮层根节点那支
+        // `on_key_down`（见 `overlay_card`），而按键只顺着**焦点所在的那条路**
+        // 往上冒——焦点还留在窗格上的话，对话框一个键都收不到：Esc 关不掉，
+        // 只有"点遮罩"还灵，那不算能用。
+        window.focus(&self.settings_focus, cx);
+        cx.notify();
+    }
+
+    /// 关设置对话框。`Esc` /「完成」/ 点遮罩都走这里。
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings_open {
+            return;
+        }
+        self.settings_open = false;
+        // 卡片带着焦点离开渲染树，键盘得有人接手——跟关命令面板同一条，
+        // 不接就是窗格级快捷键整片变哑（见 `hand_keyboard_to_active_pane`）。
+        self.hand_keyboard_to_active_pane(window, cx);
+        cx.notify();
+    }
+
     /// 查询词变了：重新过滤，选中项回到第一条。
     fn sync_palette_filter(&mut self, cx: &mut Context<Self>) {
         let Some(input) = self.palette_input.as_ref() else {
@@ -2602,6 +2648,7 @@ impl WFilesApp {
                 cx.notify();
             }
             PaletteAction::ToggleTerminal => self.toggle_terminal(window, cx),
+            PaletteAction::OpenSettings => self.open_settings(window, cx),
             PaletteAction::ExportLog => self.export_log(cx),
             PaletteAction::SavedSearch(name) => {
                 let Some(saved) = Settings::read(cx).saved_search(&name).cloned() else {
@@ -2770,6 +2817,20 @@ impl WFilesApp {
                 action: PaletteAction::App(AppCommand::Diff),
             });
         }
+
+        // 设置对话框：把"只能靠命令面板改"的几项摆到一张卡上
+        // （见 `render_settings`）。放进面板是因为它本来就该在"命令中心"
+        // 里找得到——Cmd+, 只是个熟键位，不是唯一入口。
+        items.push(PaletteItem {
+            command: PaletteCommand::new(
+                "app:settings",
+                crate::i18n::tr(cx, "设置"),
+                "Cmd+,",
+                crate::i18n::tr(cx, "偏好"),
+                "settings 设置 偏好 首选项 preferences 选项",
+            ),
+            action: PaletteAction::OpenSettings,
+        });
 
         // ---- 元数据列 ----
         // 六种共用一列，所以这里是"选一个"，不是六个开关：
@@ -3026,7 +3087,9 @@ impl WFilesApp {
                     crate::i18n::tr_args(
                         cx,
                         "默认终端：{name}",
-                        &[("name", option.name.to_string())],
+                        // 名字里只有几个是我们自己写的中文（「终端（Terminal.app）」、
+                        // 「命令提示符」这类），其余是产品名——查不到表就原样显示。
+                        &[("name", crate::i18n::tr(cx, option.name))],
                     ),
                     if current == option.id {
                         crate::i18n::tr(cx, "当前")
@@ -4748,6 +4811,212 @@ impl WFilesApp {
         None
     }
 
+    /// 设置对话框：把"只能靠命令面板改"的四项摆到一张卡上。
+    ///
+    /// 只放这四项，不是"把所有设置搬进来"。其余设置都有更贴着现场的家：
+    /// 视图模式在工具栏、排序在表头、每条命令的快捷键在命令面板里。
+    /// 搬来这儿就是两处都能改同一件事——迟早有对不上的那天。
+    ///
+    /// 四行都是"选一个"，控件也是同一个：**选项直接摆出来**，用户一眼能
+    /// 看见有哪几个、现在在哪个；下拉要点开才知道，而这四行的全部意义
+    /// 就是"看看现在是什么、顺手换一个"。
+    ///
+    /// 改完不收卡片：接着还能改下一项（跟系统设置一个脾气）。收卡片是
+    /// Esc /「完成」/ 点遮罩的事。
+    fn render_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let settings = Settings::read(cx);
+
+        // ---- 默认终端 ----
+        // "自动"排在最前，后面只列本机装着的：列一个装不了的，等于摆一颗
+        // 按下去只会报错的按钮。
+        let mut terminal_options = vec![(
+            terminal::AUTO.to_string(),
+            crate::i18n::tr(cx, "自动"),
+            settings.terminal == terminal::AUTO,
+            PaletteAction::SetTerminal(terminal::AUTO.to_string()),
+        )];
+        for option in terminal::candidates() {
+            if !terminal::installed(&option) {
+                continue;
+            }
+            terminal_options.push((
+                option.id.to_string(),
+                crate::i18n::tr(cx, option.name),
+                settings.terminal == option.id,
+                PaletteAction::SetTerminal(option.id.to_string()),
+            ));
+        }
+        // 存着的那个可能本机没有（换了机器、装过又卸了）。补一颗出来：
+        // 不补的话一颗都不亮，用户看见的是"我的设置丢了"，而不是
+        // "这个终端没了"——前者会让人到处找，后者一眼就懂。
+        if !terminal_options.iter().any(|(_, _, current, _)| *current) {
+            let name = terminal::candidates()
+                .iter()
+                .find(|option| option.id == settings.terminal)
+                .map(|option| crate::i18n::tr(cx, option.name))
+                .unwrap_or_else(|| settings.terminal.clone());
+            terminal_options.push((
+                settings.terminal.clone(),
+                name,
+                true,
+                PaletteAction::SetTerminal(settings.terminal.clone()),
+            ));
+        }
+
+        // ---- 界面语言 ----
+        // "跟随系统"存的是空串，不是"把当前解析出来的语言写回去"——后者
+        // 会让"跟随系统"永远失效（理由见 `PaletteAction::SetLocaleAuto`）。
+        let mut locale_options = vec![(
+            "auto".to_string(),
+            crate::i18n::tr(cx, "跟随系统"),
+            settings.locale.is_empty(),
+            PaletteAction::SetLocaleAuto,
+        )];
+        for option in crate::i18n::Locale::ALL {
+            locale_options.push((
+                option.code().to_string(),
+                option.label().to_string(),
+                settings.locale == option.code(),
+                PaletteAction::SetLocale(*option),
+            ));
+        }
+
+        // ---- 传输限速 ----
+        let speed_options = crate::throttle::rates()
+            .into_iter()
+            .map(|rate| {
+                (
+                    rate.to_string(),
+                    crate::throttle::rate_label(rate, cx),
+                    rate == settings.speed_limit,
+                    PaletteAction::SetSpeedLimit(rate),
+                )
+            })
+            .collect();
+
+        // ---- 元数据列 ----
+        let shown = MetaField::from_id(&settings.meta_column);
+        let mut meta_options = vec![(
+            "off".to_string(),
+            crate::i18n::tr(cx, "不显示"),
+            shown.is_none(),
+            PaletteAction::MetaColumn(None),
+        )];
+        for field in MetaField::ALL {
+            meta_options.push((
+                field.id().to_string(),
+                field.label(cx),
+                shown == Some(field),
+                PaletteAction::MetaColumn(Some(field)),
+            ));
+        }
+
+        let body = v_flex()
+            // 卡片里没有输入框，键盘总得落在谁身上——落在这儿，Esc 才冒得到
+            // 浮层根节点那支 `on_key_down`（见 `open_settings`）。
+            .track_focus(&self.settings_focus)
+            .gap_5()
+            .child(Self::setting_row(
+                "terminal",
+                crate::i18n::tr(cx, "默认终端"),
+                crate::i18n::tr(cx, "自动 = 挑一个本机装着的"),
+                terminal_options,
+                cx,
+            ))
+            .child(Self::setting_row(
+                "locale",
+                crate::i18n::tr(cx, "界面语言"),
+                crate::i18n::tr(cx, "换完立刻生效"),
+                locale_options,
+                cx,
+            ))
+            .child(Self::setting_row(
+                "speed",
+                crate::i18n::tr(cx, "传输限速"),
+                crate::i18n::tr(cx, "正在跑的搬运也立刻按新的来"),
+                speed_options,
+                cx,
+            ))
+            .child(Self::setting_row(
+                "meta",
+                crate::i18n::tr(cx, "元数据列"),
+                crate::i18n::tr(cx, "列表最右边那一列显示什么"),
+                meta_options,
+                cx,
+            ))
+            .into_any_element();
+
+        let done = Button::new("settings-done")
+            .label(crate::i18n::tr(cx, "完成"))
+            .primary()
+            .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)))
+            .into_any_element();
+
+        Self::overlay_card(
+            crate::i18n::Message::msg("设置"),
+            px(560.),
+            cx,
+            body,
+            h_flex().gap_2().child(done).into_any_element(),
+            |this, window, cx| this.close_settings(window, cx),
+        )
+    }
+
+    /// 设置卡里的一行：左边标题加一句说明，右边一排"选一个"。
+    ///
+    /// `options` 是 `(id 后缀, 文案, 是不是当前, 动作)`，元素 id 拼成
+    /// `setting-<行>-<后缀>`：稳定、可点，测试按 id 点，不靠"第几颗"。
+    ///
+    /// 当前那一颗用 `primary` 点亮，同时把"（当前）"写进无障碍名——
+    /// 配色是给眼睛看的，读屏软件得靠后者才知道现在是哪个。
+    fn setting_row(
+        row: &'static str,
+        label: String,
+        hint: String,
+        options: Vec<(String, String, bool, PaletteAction)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut chips = h_flex().flex_wrap().gap_1();
+        for (suffix, text, current, action) in options {
+            let mut chip = Button::new(format!("setting-{row}-{suffix}"))
+                .label(text.clone())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.run_palette_action(action.clone(), window, cx)
+                }));
+            chip = if current {
+                chip.primary().accessibility_label(crate::i18n::tr_args(
+                    cx,
+                    "{label}（当前）",
+                    &[("label", text.clone())],
+                ))
+            } else {
+                chip.ghost()
+            };
+            chips = chips.child(chip);
+        }
+
+        h_flex()
+            .id(format!("setting-row-{row}"))
+            .test_support()
+            .items_start()
+            .gap_4()
+            .child(
+                v_flex()
+                    .w(px(132.))
+                    .flex_shrink_0()
+                    .gap_1()
+                    .child(div().text_sm().child(label))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(hint),
+                    ),
+            )
+            .child(div().flex_1().min_w_0().child(chips))
+            .into_any_element()
+    }
+
     /// Quick Look 浮层：居中卡片，内容按类型分派。
     ///
     /// **画在整个窗口之上**，跟标签栏、侧栏、状态栏一起盖住——
@@ -4987,7 +5256,8 @@ impl Render for WFilesApp {
             || self.ops.read(cx).prompt().is_some()
             || self.ops.read(cx).bulk().is_some()
             || self.palette.is_some()
-            || self.connect.is_some();
+            || self.connect.is_some()
+            || self.settings_open;
 
         let mut root = v_flex()
             .size_full()
@@ -5052,7 +5322,10 @@ impl Render for WFilesApp {
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleDetails, _, cx| this.toggle_details(cx)))
             .on_action(cx.listener(|this, _: &Compare, window, cx| this.toggle_compare(window, cx)))
-            .on_action(cx.listener(|this, _: &Diff, window, cx| this.open_diff(window, cx)));
+            .on_action(cx.listener(|this, _: &Diff, window, cx| this.open_diff(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
+            );
 
         // 比较面板自带遮罩，压在窗格上；确认框与冲突框还要在它之上，
         // 所以放在 has_overlay 那一段之前挂。
@@ -5064,11 +5337,13 @@ impl Render for WFilesApp {
         }
 
         if has_overlay {
-            // 一次只显示一层：命令面板 > 连接 > 冲突 > 批量 > 输入 > 确认。
+            // 一次只显示一层：命令面板 > 连接 > 设置 > 冲突 > 批量 > 输入 > 确认。
             let overlay = if self.palette.is_some() {
                 self.render_palette(cx)
             } else if self.connect.is_some() {
                 self.render_connect(cx)
+            } else if self.settings_open {
+                self.render_settings(cx)
             } else if self.ops.read(cx).conflict().is_some() {
                 self.render_conflict(cx)
             } else if self.ops.read(cx).bulk().is_some() {
