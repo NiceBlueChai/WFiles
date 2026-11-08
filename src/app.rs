@@ -26,6 +26,7 @@ use crate::compare_entity::{CompareEvent, ComparePanel};
 use crate::diff_entity::{DiffEvent, DiffPanel};
 use crate::drag::{self, DraggedPaths};
 use crate::format;
+use crate::i18n::Say as _;
 use crate::instance;
 use crate::meta::{Field as MetaField, Metadata};
 use crate::ops::{ConflictPolicy, ControlState};
@@ -123,6 +124,8 @@ enum PaletteAction {
     MetaColumn(Option<MetaField>),
     /// 开关底部的内嵌终端面板。
     ToggleTerminal,
+    /// 新建一个指定模板的文件（命令面板里八个模板各一条）。
+    NewFile(&'static str),
     /// 打开设置对话框。
     OpenSettings,
     NewTab,
@@ -136,6 +139,8 @@ enum PaletteAction {
     OpenRemote(String),
     /// 设一个搬运限速（字节每秒，0 = 不限速）。
     SetSpeedLimit(u64),
+    /// 复制/移动链接时跟随目标内容，还是保留链接本身。
+    SetLinkPolicy(crate::entry_kind::LinkPolicy),
     /// 换界面语言。
     SetLocale(crate::i18n::Locale),
     /// 界面语言改回"跟随系统"（设置里存空串）。
@@ -777,29 +782,46 @@ impl WFilesApp {
                             })),
                     ),
             )
+            // 中间这几段（位置 / 收藏 / 磁盘 / 云 / 远程）长度都不可控：收藏是
+            // 用户自己加的、磁盘会热插拔、云盘连得上连不上都在变。全部塞进一个
+            // 可滚动列里，滚不下的自己滚，**不许把底下的「本地文件系统」顶出去**。
+            //
+            // 这不是"以防万一"：磁盘那节加了「剩多少」那一行之后每行高了一截，
+            // 侧栏就装不下，底部那颗直接从可见区外溢出去（点击判据当场红）。
+            // 结构上的病得结构上治——`flex_1` + `min_h_0` 让它可收缩，
+            // `overflow_y_scroll` 让多出来的部分滚而不是溢。
             .child(
                 v_flex()
-                    .p_2()
-                    .gap_1()
+                    .id("sidebar-scroll")
+                    // 滚动容器也得能被测试指到：`window.scroll(id, …)` 只认
+                    // 注册过的 id，而注册靠的就是这一句。
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .child(
-                        div()
-                            .id("sidebar-places-title")
-                            .test_support()
-                            .aria_label(crate::i18n::tr(cx, "位置"))
-                            .px_3()
-                            .py_2()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(crate::i18n::tr(cx, "位置")),
+                        v_flex()
+                            .p_2()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("sidebar-places-title")
+                                    .test_support()
+                                    .aria_label(crate::i18n::tr(cx, "位置"))
+                                    .px_3()
+                                    .py_2()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(crate::i18n::tr(cx, "位置")),
+                            )
+                            .children(items),
                     )
-                    .children(items),
+                    .child(self.render_favorites_section(cx))
+                    .child(self.render_volumes_section(cx))
+                    .child(self.render_cloud_section(cx))
+                    .child(self.render_remote_section(cx)),
             )
-            .child(self.render_favorites_section(cx))
-            .child(self.render_volumes_section(cx))
-            .child(self.render_cloud_section(cx))
-            .child(self.render_remote_section(cx))
-            .child(div().flex_1())
             .child({
                 // 这颗是"无论在哪儿，一步回到本机"——也就是从远程连接里退回来
                 // 的那条路。所以它不走 `places()`：那些是"去某个目录"，这是
@@ -1102,6 +1124,9 @@ impl WFilesApp {
             .map(|(index, volume)| {
                 let target = volume.path.clone();
                 let spoken = volume.spoken();
+                // 容量那行字由 core 拼（`Capacity::describe`），这里只负责画。
+                let capacity_text = volume.capacity.map(|capacity| capacity.describe().say(cx));
+                let muted = cx.theme().muted_foreground;
                 let row = ListItem::new(("volume", index))
                     .rounded(cx.theme().radius)
                     .selected(current == volume.path)
@@ -1111,11 +1136,25 @@ impl WFilesApp {
                             .gap_3()
                             .child(Icon::new(IconName::HardDrive).size_4())
                             .child(
-                                div()
+                                v_flex()
                                     .flex_1()
                                     .min_w_0()
-                                    .truncate()
-                                    .child(volume.name.clone()),
+                                    .child(div().truncate().child(volume.name.clone()))
+                                    // 剩多少是「清楚」的一半：只有名字的话，
+                                    // 用户看不出哪块盘快满了。探不出来的卷
+                                    // （光盘、网络共享）就只显示名字。
+                                    .when_some(capacity_text, |this, text| {
+                                        this.child(
+                                            div()
+                                                .id(("volume-capacity", index))
+                                                .test_support()
+                                                .aria_label(text.clone())
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .truncate()
+                                                .child(text),
+                                        )
+                                    }),
                             ),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -2633,6 +2672,10 @@ impl WFilesApp {
             PaletteAction::Connect => self.open_connect(window, cx),
             PaletteAction::OpenRemote(id) => self.open_remote(id, window, cx),
             PaletteAction::SetSpeedLimit(rate) => self.set_speed_limit(rate, cx),
+            PaletteAction::SetLinkPolicy(policy) => {
+                Settings::update(cx, |settings| settings.set_link_policy(policy));
+                cx.notify();
+            }
             PaletteAction::SetLocale(locale) => {
                 // 存设置 → 全部界面下一次重画就是新语言。
                 // 不逐个 `cx.refresh()`：设置改了但没立刻重画的话，
@@ -2648,6 +2691,13 @@ impl WFilesApp {
                 cx.notify();
             }
             PaletteAction::ToggleTerminal => self.toggle_terminal(window, cx),
+            PaletteAction::NewFile(id) => {
+                let Some(template) = crate::templates::template(id) else {
+                    return;
+                };
+                self.tabs[self.active]
+                    .update(cx, |pane, cx| pane.request_new_file_from(template, cx));
+            }
             PaletteAction::OpenSettings => self.open_settings(window, cx),
             PaletteAction::ExportLog => self.export_log(cx),
             PaletteAction::SavedSearch(name) => {
@@ -3167,7 +3217,59 @@ impl WFilesApp {
             });
         }
 
+        // 新建文件：每个模板一条。这样"新建 Markdown"直接搜得到，
+        // 不用先记快捷键再挑模板。快捷键那条只给空白文件。
+        for template in crate::templates::TEMPLATES {
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    format!("new-file:{}", template.id),
+                    crate::i18n::tr_args(
+                        cx,
+                        "新建文件：{kind}",
+                        &[("kind", crate::i18n::tr(cx, template.label))],
+                    ),
+                    String::new(),
+                    crate::i18n::tr(cx, "文件"),
+                    template.id,
+                ),
+                action: PaletteAction::NewFile(template.id),
+            });
+        }
+
         self.push_key_binding_items(&mut items, cx);
+
+        // 链接策略。设置卡里也有一份，两处改的是同一个字段；
+        // 命令面板里放着是为了"手不离键盘就能换"。
+        let policy = Settings::peek(cx, |settings| settings.link_policy());
+        for (id, label, value, keywords) in [
+            (
+                "link:follow",
+                "复制链接：跟随目标内容",
+                crate::entry_kind::LinkPolicy::Follow,
+                "link symlink follow 链接 符号链接 跟随 快捷方式",
+            ),
+            (
+                "link:preserve",
+                "复制链接：保留链接本身",
+                crate::entry_kind::LinkPolicy::Preserve,
+                "link symlink preserve 链接 符号链接 保留",
+            ),
+        ] {
+            items.push(PaletteItem {
+                command: PaletteCommand::new(
+                    id,
+                    crate::i18n::tr(cx, label),
+                    if policy == value {
+                        crate::i18n::tr(cx, "当前")
+                    } else {
+                        String::new()
+                    },
+                    crate::i18n::tr(cx, "传输"),
+                    keywords,
+                ),
+                action: PaletteAction::SetLinkPolicy(value),
+            });
+        }
 
         items
     }
@@ -3251,6 +3353,12 @@ impl WFilesApp {
                 files,
                 "folder 创建 目录",
             ),
+            PaneCommand::NewFile => (
+                crate::i18n::tr(cx, "新建文件"),
+                Self::shortcut_of(command, cx),
+                files,
+                "file 新建 文件 模板 template",
+            ),
             PaneCommand::Rename => (
                 crate::i18n::tr(cx, "重命名"),
                 Self::shortcut_of(command, cx),
@@ -3268,6 +3376,12 @@ impl WFilesApp {
                 Self::shortcut_of(command, cx),
                 files,
                 "delete 删除 trash",
+            ),
+            PaneCommand::DeletePermanently => (
+                crate::i18n::tr(cx, "彻底删除（不可撤销）"),
+                Self::shortcut_of(command, cx),
+                files,
+                "delete permanent 彻底删除 永久删除 不可撤销",
             ),
             PaneCommand::Copy => (
                 crate::i18n::tr(cx, "拷贝选中项"),
@@ -4811,13 +4925,13 @@ impl WFilesApp {
         None
     }
 
-    /// 设置对话框：把"只能靠命令面板改"的四项摆到一张卡上。
+    /// 设置对话框：把"只能靠命令面板改"的几项摆到一张卡上。
     ///
-    /// 只放这四项，不是"把所有设置搬进来"。其余设置都有更贴着现场的家：
+    /// 只放这几项，不是"把所有设置搬进来"。其余设置都有更贴着现场的家：
     /// 视图模式在工具栏、排序在表头、每条命令的快捷键在命令面板里。
     /// 搬来这儿就是两处都能改同一件事——迟早有对不上的那天。
     ///
-    /// 四行都是"选一个"，控件也是同一个：**选项直接摆出来**，用户一眼能
+    /// 每行都是"选一个"，控件也是同一个：**选项直接摆出来**，用户一眼能
     /// 看见有哪几个、现在在哪个；下拉要点开才知道，而这四行的全部意义
     /// 就是"看看现在是什么、顺手换一个"。
     ///
@@ -4911,6 +5025,24 @@ impl WFilesApp {
             ));
         }
 
+        // ---- 链接策略 ----
+        // 默认跟随，跟 Explorer / Finder 的默认一致；保留链接在目标卷
+        // 不支持时会自动降级并给一条说明（见 ops::copy_entry）。
+        let link_options = vec![
+            (
+                "follow".to_string(),
+                crate::i18n::tr(cx, "跟随内容"),
+                settings.link_policy() == crate::entry_kind::LinkPolicy::Follow,
+                PaletteAction::SetLinkPolicy(crate::entry_kind::LinkPolicy::Follow),
+            ),
+            (
+                "preserve".to_string(),
+                crate::i18n::tr(cx, "保留链接"),
+                settings.link_policy() == crate::entry_kind::LinkPolicy::Preserve,
+                PaletteAction::SetLinkPolicy(crate::entry_kind::LinkPolicy::Preserve),
+            ),
+        ];
+
         let body = v_flex()
             // 卡片里没有输入框，键盘总得落在谁身上——落在这儿，Esc 才冒得到
             // 浮层根节点那支 `on_key_down`（见 `open_settings`）。
@@ -4942,6 +5074,13 @@ impl WFilesApp {
                 crate::i18n::tr(cx, "元数据列"),
                 crate::i18n::tr(cx, "列表最右边那一列显示什么"),
                 meta_options,
+                cx,
+            ))
+            .child(Self::setting_row(
+                "link",
+                crate::i18n::tr(cx, "复制链接时"),
+                crate::i18n::tr(cx, "跟随 = 复制目标内容；保留 = 复制链接本身"),
+                link_options,
                 cx,
             ))
             .into_any_element();

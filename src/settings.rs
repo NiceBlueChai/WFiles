@@ -61,6 +61,14 @@ pub struct Settings {
     /// 单位解析器，而写错了还得猜用户想说的是 1000 还是 1024。
     #[serde(default)]
     pub speed_limit: u64,
+    /// 复制/移动链接时怎么办：空串或 `"follow"` = 跟随目标内容（默认），
+    /// `"preserve"` = 保留链接本身。
+    ///
+    /// 跟 `meta_column` / `locale` 一样存字符串：枚举写错一个字会让**整份**
+    /// settings.json 解析失败、连同终端/标记/快捷键一起退回默认（踩过）。
+    /// 这里认不出来的值一律按"跟随"处理，最坏只是这一个开关没生效。
+    #[serde(default)]
+    pub link_policy: String,
     /// 界面语言，存 `i18n::Locale::code()`（`zh-Hans` / `en`）。
     ///
     /// 存字符串而不是枚举，跟 `meta_column` 同一个理由：
@@ -219,6 +227,7 @@ impl Default for Settings {
             remotes: Vec::new(),
             meta_column: String::new(),
             speed_limit: 0,
+            link_policy: String::new(),
             show_hidden: false,
             favorites: Vec::new(),
             // 空串 = "跟着系统走"。不是直接写死中文：一份英文系统上刚装好
@@ -292,6 +301,23 @@ impl Settings {
     /// 记下界面语言。空串 = 跟着系统走。
     pub fn set_locale(&mut self, locale: crate::i18n::Locale) {
         self.locale = locale.code().to_string();
+    }
+
+    /// 链接策略。跟 `locale()` 同一把尺：认不出来的值按默认（跟随）走，
+    /// 不让一份手改坏的配置把别的偏好一起弄丢。
+    pub fn link_policy(&self) -> crate::entry_kind::LinkPolicy {
+        match self.link_policy.as_str() {
+            "preserve" => crate::entry_kind::LinkPolicy::Preserve,
+            _ => crate::entry_kind::LinkPolicy::Follow,
+        }
+    }
+
+    pub fn set_link_policy(&mut self, policy: crate::entry_kind::LinkPolicy) {
+        self.link_policy = match policy {
+            crate::entry_kind::LinkPolicy::Follow => "follow",
+            crate::entry_kind::LinkPolicy::Preserve => "preserve",
+        }
+        .to_string();
     }
 
     /// 这个目录上次用的排序与视图；没记住过就是 `None`，由调用方决定默认值。
@@ -825,6 +851,35 @@ mod tests {
         fs::write(&path, "{}").unwrap();
 
         assert_eq!(Settings::load_from(&path), Some(Settings::default()));
+    }
+
+    #[test]
+    fn link_policy_is_stored_as_a_string_and_bad_values_fall_back() {
+        use crate::entry_kind::LinkPolicy;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+
+        let mut settings = Settings::default();
+        assert_eq!(settings.link_policy(), LinkPolicy::Follow);
+        settings.set_link_policy(LinkPolicy::Preserve);
+        settings.save_to(&path).unwrap();
+        assert_eq!(
+            Settings::load_from(&path).unwrap().link_policy(),
+            LinkPolicy::Preserve
+        );
+
+        // 手改坏这一个字段（大小写不对）：整份配置还得读得进来，
+        // 别的偏好不能跟着一起丢——这正是存字符串而不存枚举的理由。
+        fs::write(
+            &path,
+            r#"{"link_policy":"Preserve","terminal":"iTerm","locale":"en"}"#,
+        )
+        .unwrap();
+        let back = Settings::load_from(&path).expect("整份配置还能读");
+        assert_eq!(back.link_policy(), LinkPolicy::Follow, "认不出来就跟随");
+        assert_eq!(back.terminal, "iTerm", "别的偏好不能跟着丢");
+        assert_eq!(back.locale, "en");
     }
 
     #[test]

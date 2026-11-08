@@ -2,7 +2,7 @@
 //!
 //! 这一层不认识 UI，也不真的动文件：它只回答两个问题——
 //! "两边差在哪"，以及"要同步的话得拷哪些、删哪些、哪些不敢动"。
-//! 真正的搬运交给 [`crate::ops_entity::Ops`]：那边有进度、有冲突处理、
+//! 真正的搬运交给界面层的 `Ops` 实体：那边有进度、有冲突处理、
 //! 有撤销，没必要再写一套。
 //!
 //! 三条规矩：
@@ -152,6 +152,34 @@ impl Stats {
     pub fn diffs(&self) -> usize {
         self.different + self.left_only + self.right_only
     }
+
+    /// 一句话结论。**文案归 core**：GUI 与 NSH 各自画，但说的是同一句话。
+    ///
+    /// 一样的那些不进列表（几万项会把要看的东西淹掉），所以它们只在
+    /// 括号里报个数——用户需要知道"比过了"，但不需要看见它们。
+    pub fn summary(&self) -> String {
+        if self.diffs() == 0 {
+            return format!("两边一样，共 {} 项", self.same);
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.different > 0 {
+            parts.push(format!("不同 {} 项", self.different));
+        }
+        if self.left_only > 0 {
+            parts.push(format!("只有左 {} 项", self.left_only));
+        }
+        if self.right_only > 0 {
+            parts.push(format!("只有右 {} 项", self.right_only));
+        }
+        let mut text = parts.join(" · ");
+        if self.same > 0 {
+            text.push_str(&format!("（另有 {} 项一样）", self.same));
+        }
+        if self.truncated {
+            text.push_str("，已到上限");
+        }
+        text
+    }
 }
 
 /// 走一遍两边，把差异一批一批交给 `on_batch`。
@@ -264,7 +292,7 @@ fn collect(
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if kind.is_symlink() {
+            if crate::entry_kind::is_link_or_junction(&entry) {
                 continue;
             }
             let path = entry.path();
@@ -517,7 +545,7 @@ pub fn spawn(options: Options, sink: Arc<dyn Fn(Event) + Send + Sync>) -> Contro
 }
 
 /// 把一个个拷贝按目标目录归堆：
-/// [`crate::ops_entity::Ops`] 一次搬一批到同一个目录，
+/// 界面层的 `Ops` 一次搬一批到同一个目录，
 /// 于是一个目录一个任务，进度、冲突、撤销都还是原来那一套。
 pub fn group_copies(copies: Vec<Copy>) -> Vec<(PathBuf, Vec<PathBuf>)> {
     let mut groups: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
@@ -535,6 +563,37 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// 结论句只报真发生的事：0 项不出现，"一样的"只在括号里报个数。
+    #[test]
+    fn summary_reports_only_what_happened() {
+        let same = Stats {
+            same: 12,
+            ..Stats::default()
+        };
+        assert_eq!(same.summary(), "两边一样，共 12 项");
+
+        let mixed = Stats {
+            same: 4,
+            different: 2,
+            left_only: 1,
+            right_only: 0,
+            truncated: false,
+            cancelled: false,
+        };
+        let text = mixed.summary();
+        assert!(text.contains("不同 2 项"), "{text}");
+        assert!(text.contains("只有左 1 项"), "{text}");
+        assert!(!text.contains("只有右"), "0 项不许出现：{text}");
+        assert!(text.contains("另有 4 项一样"), "{text}");
+
+        let clipped = Stats {
+            different: 5000,
+            truncated: true,
+            ..Stats::default()
+        };
+        assert!(clipped.summary().contains("已到上限"), "{}", clipped.summary());
+    }
 
     fn write(path: PathBuf, contents: &str) {
         if let Some(parent) = path.parent() {

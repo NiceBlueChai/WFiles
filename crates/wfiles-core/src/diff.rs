@@ -78,6 +78,29 @@ pub struct TextStats {
     pub removed: usize,
 }
 
+impl TextStats {
+    /// 一句话结论。**文案归 core**：界面（GUI / NSH / 以后的前端）只负责画，
+    /// 不许各自拼一遍——否则同一份差异在三处会写成三种说法。
+    ///
+    /// 没说到的项就不出现（"新增 0 行"是噪音）。
+    pub fn summary(&self) -> String {
+        if self.changed == 0 && self.added == 0 && self.removed == 0 {
+            return format!("两边一样，共 {} 行", self.same);
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.changed > 0 {
+            parts.push(format!("改了 {} 行", self.changed));
+        }
+        if self.added > 0 {
+            parts.push(format!("新增 {} 行", self.added));
+        }
+        if self.removed > 0 {
+            parts.push(format!("少了 {} 行", self.removed));
+        }
+        parts.join(" · ")
+    }
+}
+
 /// 十六进制里的一行：16 个字节，或者最后不满 16 个。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HexRow {
@@ -98,6 +121,16 @@ pub struct HexStats {
     pub different: usize,
     /// 第一处不一样的偏移。
     pub first_difference: Option<usize>,
+}
+
+impl HexStats {
+    /// 一句话结论，规则同 [`TextStats::summary`]：文案归 core。
+    pub fn summary(&self) -> String {
+        match self.first_difference {
+            None => "两边字节完全一样".to_string(),
+            Some(at) => format!("{} 个字节不同，第一处偏移 0x{:x}", self.different, at),
+        }
+    }
 }
 
 /// 比一段文本：按行，并可细到行内的字符。
@@ -533,6 +566,49 @@ pub fn ascii_line(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// 结论句由 core 出，界面只画。这三条钉的是"0 项不出现"——
+    /// 多写一句"新增 0 行"看着像有变化，其实是噪音。
+    #[test]
+    fn text_summary_lists_only_what_happened() {
+        let same = TextStats {
+            same: 7,
+            ..TextStats::default()
+        };
+        assert_eq!(same.summary(), "两边一样，共 7 行");
+
+        let mixed = TextStats {
+            same: 3,
+            changed: 2,
+            added: 0,
+            removed: 1,
+        };
+        assert_eq!(mixed.summary(), "改了 2 行 · 少了 1 行");
+        assert!(!mixed.summary().contains("新增"), "0 项不许出现：{}", mixed.summary());
+
+        // 三种都有时按「改 → 增 → 少」的固定顺序，别随统计结构体的字段顺序漂。
+        let all = TextStats {
+            same: 0,
+            changed: 1,
+            added: 2,
+            removed: 3,
+        };
+        assert_eq!(all.summary(), "改了 1 行 · 新增 2 行 · 少了 3 行");
+    }
+
+    #[test]
+    fn hex_summary_says_where_the_first_difference_is() {
+        let identical = HexStats::default();
+        assert_eq!(identical.summary(), "两边字节完全一样");
+
+        let differs = HexStats {
+            different: 5,
+            first_difference: Some(0x20),
+        };
+        // 偏移用十六进制报：比对二进制的人按这个去看 dump。
+        assert!(differs.summary().contains("0x20"), "{}", differs.summary());
+        assert!(differs.summary().contains('5'), "{}", differs.summary());
+    }
 
     fn rows_of(left: &str, right: &str) -> Vec<TextRow> {
         diff_text(left, right, false).0

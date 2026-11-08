@@ -242,11 +242,11 @@ fn stamp() -> String {
 /// 而测试里遍地是"故意让它失败"的用例，不隔开的话每跑一轮 `cargo test`
 /// 都往用户的缓存目录里灌一批故障现场。
 pub fn root() -> PathBuf {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         super::resume::test_root().join("logs")
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         match crate::session::session_dir_override() {
             Some(dir) => dir.join("logs"),

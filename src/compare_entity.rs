@@ -315,7 +315,9 @@ impl ComparePanel {
             removed = plan.removals.len();
             batches += 1;
             let paths = plan.removals.clone();
-            self.ops.update(cx, |ops, cx| ops.request_trash(paths, cx));
+            // 同步计划里的"删除"走回收站（能撤销）；介质上会自动降级。
+            self.ops
+                .update(cx, |ops, cx| ops.request_delete(paths, None, cx));
         }
 
         let note = if batches == 0 {

@@ -131,13 +131,13 @@ impl State {
 }
 
 /// 测试里指定"本机上有哪些云盘"：真机器上装没装客户端由不得测试决定。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static OVERRIDE: OnceLock<Vec<SyncRoot>> = OnceLock::new();
 
 /// 本机上找得到的云盘同步目录。结果只算一次，之后一直用。
 pub fn detected() -> &'static [SyncRoot] {
     static ROOTS: OnceLock<Vec<SyncRoot>> = OnceLock::new();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         if let Some(roots) = OVERRIDE.get() {
             return roots;
@@ -163,7 +163,7 @@ pub fn detected() -> &'static [SyncRoot] {
 ///
 /// 只能装一次、之后所有测试都看这一份：它是进程级的，
 /// 所以别在两条测试里各装一份互相打架的目录。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn install(roots: Vec<SyncRoot>) {
     OVERRIDE.set(roots).ok();
 }
@@ -307,8 +307,16 @@ fn dropbox_from_info(file: &Path) -> Vec<PathBuf> {
     let Some(map) = value.as_object() else {
         return Vec::new();
     };
-    map.values()
-        .filter_map(|entry| entry.get("path").and_then(|it| it.as_str()))
+    // 别靠 map 的遍历顺序：serde_json 开没开 `preserve_order` 由整个依赖图
+    // 决定（拆成独立 crate 之后单独测 core，gpui-kit 那条链就不在了），
+    // 一变顺序结果就反。info.json 认的就是这两个键，个人版在前。
+    ["personal", "business"]
+        .iter()
+        .filter_map(|key| {
+            map.get(*key)
+                .and_then(|entry| entry.get("path"))
+                .and_then(|it| it.as_str())
+        })
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .collect()

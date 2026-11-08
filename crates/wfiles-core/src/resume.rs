@@ -23,7 +23,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 use crate::session;
 
 /// 暂存数据的总预算：超过就丢最久没动的。
@@ -319,7 +319,7 @@ impl Journal {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// 续传暂存放哪儿。
@@ -333,7 +333,7 @@ static TEST_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 /// 属于系统和清理工具都认的缓存语义。放在状态目录里，
 /// 用户和清理工具都不敢动它——那正是它能攒到 29 GB 的原因。
 pub fn root() -> PathBuf {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let dir = {
         // 测试一律走系统临时目录：真机的暂存平时在 `~/Library/Caches/WFiles`，
         // 而测试里遍地是"拷一半就叫停"——不隔开的话每跑一轮 `cargo test`
@@ -342,14 +342,14 @@ pub fn root() -> PathBuf {
         // 也不会互相盖。
         test_root().to_path_buf()
     };
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let dir = machine_root();
     dir
 }
 
 /// 真机上暂存放哪儿：优先 `WFILES_SESSION_DIR`（便携安装用），
 /// 否则按平台惯例落在缓存目录。
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn machine_root() -> PathBuf {
     if let Some(dir) = session::session_dir_override() {
         return dir.join("resume");
@@ -362,7 +362,7 @@ fn machine_root() -> PathBuf {
 }
 
 /// 测试里暂存落在哪儿：系统临时目录下一个固定位置，全进程共用。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_root() -> &'static Path {
     TEST_ROOT.get_or_init(|| std::env::temp_dir().join("wfiles-test-resume"))
 }

@@ -1,54 +1,33 @@
-mod analyze;
+// 界面层与核心层的唯一接缝。core 已经物理独立成一个不依赖任何 UI 框架的
+// crate，这里把这些模块原样 `pub use` 回 `crate::xxx`，于是既有界面代码里
+// 几千处 `crate::model::...` / `crate::ops::...` 一个字都不用改。
+// 方向只能是「界面 → core」：core 的依赖表里没有 gpui-kit，反向引用编译不过。
+pub use wfiles_core::{
+    analyze, archive, bulk_rename, cli, clipboard, cloud, compare, contract, diff, entry_kind,
+    favorites, format, ftp, instance, kernel, logfile, marks, model, offline, ops, palette, path_input,
+    preview, query, remote, restore, resume, s3, search, session, sftp, templates, terminal,
+    volumes, watch,
+};
+
+// 下面这些是界面层：渲染、窗格状态、拖放、快捷键、菜单、缩略图、终端绘制，
+// 以及 i18n 的三个 GPUI 适配函数（见 src/i18n.rs）。
 mod analyze_entity;
 mod app;
-mod archive;
-mod bulk_rename;
-mod cli;
-mod clipboard;
-mod cloud;
-mod compare;
 mod compare_entity;
-mod diff;
 mod diff_entity;
 mod drag;
-mod format;
-mod ftp;
 mod i18n;
-mod instance;
 mod keymap;
-mod logfile;
-mod marks;
 mod meta;
-mod model;
-mod offline;
-mod ops;
 mod ops_entity;
-mod palette;
 mod pane;
-mod path_input;
-// 性能基准只在测试构建里存在：里面的 `FileEntry::for_test` 是
-// `#[cfg(test)]` 的，非 test 构建会报"找不到这个函数"。
-#[cfg(test)]
-mod perf;
-mod preview;
-mod query;
-mod remote;
 mod remotes;
-mod restore;
-mod resume;
-mod s3;
-mod search;
 mod search_entity;
-mod session;
 mod settings;
-mod sftp;
 mod term;
 mod term_entity;
-mod terminal;
 mod throttle;
 mod thumbnails;
-mod volumes;
-mod watch;
 
 #[cfg(test)]
 mod ui_tests;

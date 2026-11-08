@@ -31,6 +31,7 @@ use crate::archive;
 use crate::clipboard;
 use crate::drag::{self, DraggedPaths};
 use crate::format;
+use crate::i18n::Say as _;
 use crate::keymap;
 use crate::marks;
 use crate::meta::{Metadata, MetadataEvent};
@@ -213,9 +214,11 @@ gpui_kit::actions!(
         Refresh,
         ClearSelection,
         NewFolder,
+        NewFile,
         Rename,
         BulkRename,
         Trash,
+        DeletePermanently,
         CopySelection,
         CutSelection,
         CopyPath,
@@ -282,9 +285,11 @@ fn key_binding_for(
     }
     Some(match command {
         PaneCommand::NewFolder => KeyBinding::new(key, NewFolder, context),
+        PaneCommand::NewFile => KeyBinding::new(key, NewFile, context),
         PaneCommand::Rename => KeyBinding::new(key, Rename, context),
         PaneCommand::BulkRename => KeyBinding::new(key, BulkRename, context),
         PaneCommand::Trash => KeyBinding::new(key, Trash, context),
+        PaneCommand::DeletePermanently => KeyBinding::new(key, DeletePermanently, context),
         PaneCommand::Copy => KeyBinding::new(key, CopySelection, context),
         PaneCommand::Cut => KeyBinding::new(key, CutSelection, context),
         PaneCommand::Paste => KeyBinding::new(key, Paste, context),
@@ -342,9 +347,14 @@ enum ContextPress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneCommand {
     NewFolder,
+    /// 按模板新建一个文件（空白 / Markdown / Rust / 脚本 …）。
+    NewFile,
     Rename,
     BulkRename,
     Trash,
+    /// 彻底删除：不进回收站、**不可撤销**。
+    /// 可移动介质上 `trash` 会自动变成这个（见 `ops::delete_mode_for`）。
+    DeletePermanently,
     Copy,
     Cut,
     Paste,
@@ -383,11 +393,13 @@ pub enum PaneCommand {
 
 impl PaneCommand {
     /// 全部命令。配置层与命令面板都靠它枚举，加一条命令只改这一处。
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 28] = [
         Self::NewFolder,
+        Self::NewFile,
         Self::Rename,
         Self::BulkRename,
         Self::Trash,
+        Self::DeletePermanently,
         Self::Copy,
         Self::Cut,
         Self::Paste,
@@ -419,9 +431,11 @@ impl PaneCommand {
     pub fn id(self) -> &'static str {
         match self {
             Self::NewFolder => "new_folder",
+            Self::NewFile => "new_file",
             Self::Rename => "rename",
             Self::BulkRename => "bulk_rename",
             Self::Trash => "trash",
+            Self::DeletePermanently => "delete_permanently",
             Self::Copy => "copy",
             Self::Cut => "cut",
             Self::Paste => "paste",
@@ -456,9 +470,13 @@ impl PaneCommand {
     pub fn keywords(self) -> &'static str {
         match self {
             Self::NewFolder => "folder 创建 目录 快捷键 按键 keybinding",
+            Self::NewFile => "file 新建 文件 模板 template markdown rust 快捷键 keybinding",
             Self::Rename => "rename 改名 快捷键 按键 keybinding",
             Self::BulkRename => "batch 序号 模板 快捷键 按键 keybinding",
             Self::Trash => "delete 删除 快捷键 按键 keybinding",
+            Self::DeletePermanently => {
+                "delete permanent 彻底删除 永久删除 不可撤销 快捷键 keybinding"
+            }
             Self::Copy => "copy 快捷键 按键 keybinding",
             Self::Cut => "cut 移动 快捷键 按键 keybinding",
             Self::Paste => "paste 快捷键 按键 keybinding",
@@ -644,7 +662,10 @@ pub struct Pane {
     meta: Entity<Metadata>,
     /// 远程连接的客户端与目录缓存。
     remotes: Entity<Remotes>,
-    listing: Listing,
+    /// 浏览与操作状态的唯一持有者（core）。Pane 不再自己存一份 Listing。
+    core: crate::contract::Core,
+    /// 订阅 core 的事件流；状态变化在下一帧触发一次重绘。
+    events: async_channel::Receiver<crate::kernel::KernelEvent>,
     selection: Selection,
     /// 按下鼠标时压住没塌的选中项：用户点的是整批里的一员，
     /// 可能正要拖着这一批走。真只是点一下（鼠标抬起没拖走）才塌，
@@ -1008,6 +1029,9 @@ impl Pane {
             Ok(listing) => (listing, None),
             Err(error) => (Listing::empty(path.clone()), Some(error)),
         };
+        let mut core = crate::contract::Core::new(path.clone());
+        let events = core.subscribe();
+        core.set_listing(listing);
 
         let mut pane = Self {
             me: Rc::new(cx.weak_entity()),
@@ -1015,7 +1039,8 @@ impl Pane {
             thumbs,
             meta,
             remotes,
-            listing,
+            core,
+            events,
             selection: Selection::default(),
             collapse_pending: None,
             back: Vec::new(),
@@ -1089,7 +1114,7 @@ impl Pane {
                 let ThumbnailsEvent::Ready(path) = event;
                 // 只在这个文件确实还看得见的时候才重画：后台任务回来的图，
                 // 用户可能早就滚过去了。
-                let visible = this.listing.entry(path).is_some()
+                let visible = this.core.listing().entry(path).is_some()
                     || this
                         .quick_look
                         .as_ref()
@@ -1107,14 +1132,14 @@ impl Pane {
             |this, _, event: &MetadataEvent, _, cx| match event {
                 MetadataEvent::Ready(path) => {
                     // 只在这个文件还看得见的时候才重画。
-                    if this.listing.entry(path).is_some() {
+                    if this.core.listing().entry(path).is_some() {
                         cx.notify();
                     }
                 }
                 // Git 一次调用回来一批，没法一个个对：
                 // 但只重画确实在这个仓库里的窗格（双栏时另一栏可能在别处）。
                 MetadataEvent::GitReady(root) => {
-                    if this.listing.path().starts_with(root) {
+                    if this.core.listing().path().starts_with(root) {
                         cx.notify();
                     }
                 }
@@ -1128,7 +1153,7 @@ impl Pane {
             |this, _, event: &RemotesEvent, _, cx| match event {
                 RemotesEvent::Listed { path, error } => {
                     // 只填"现在正看着"的那一栏：用户可能早就切走了。
-                    if *path != this.listing.path() {
+                    if *path != this.core.listing().path() {
                         return;
                     }
                     match error {
@@ -1165,7 +1190,7 @@ impl Pane {
                 }
                 // 回了传：服务器上的大小和时间都变了，正在看的那一栏该重问一次。
                 RemotesEvent::Uploaded { error: None, .. } => {
-                    if let Some((id, sub)) = remote::parse_location(this.listing.path()) {
+                    if let Some((id, sub)) = remote::parse_location(this.core.listing().path()) {
                         this.remotes.update(cx, |remotes, cx| {
                             remotes.reload(&id, &sub, cx);
                         });
@@ -1197,7 +1222,7 @@ impl Pane {
     /// 回来时才有条目），构造这一刻 `listing` 里一个条目都没有，恢复什么
     /// 都是空的。要接也得在 `fill_remote` 之后，那条路留到 P5后面的迭代。
     fn restore_selection(&mut self, cx: &mut Context<Self>) {
-        let dir = self.listing.path().to_path_buf();
+        let dir = self.core.listing().path().to_path_buf();
         if remote::parse_location(&dir).is_some() {
             return;
         }
@@ -1210,16 +1235,16 @@ impl Pane {
         let selected: Vec<PathBuf> = item
             .selected
             .iter()
-            .filter(|path| self.listing.entry(path).is_some())
+            .filter(|path| self.core.listing().entry(path).is_some())
             .cloned()
             .collect();
         let cursor = item
             .cursor
-            .filter(|path| self.listing.entry(path).is_some());
+            .filter(|path| self.core.listing().entry(path).is_some());
         self.selection.select_many(selected, cursor);
         let cursor = self.selection.cursor().map(Path::to_path_buf);
         if let Some(cursor) = cursor
-            && let Some(position) = self.listing.position_of(&cursor)
+            && let Some(position) = self.core.listing().position_of(&cursor)
         {
             self.scroll.scroll_to_item(position, ScrollStrategy::Center);
         }
@@ -1235,12 +1260,12 @@ impl Pane {
     pub fn select_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         // 从敲命令到窗口开出来之间，文件可能已经没了：那就只开到目录，
         // 别去选中一个列表里根本没有的东西。
-        if self.listing.entry(path).is_none() {
+        if self.core.listing().entry(path).is_none() {
             return;
         }
         self.selection.select(path.to_path_buf());
         self.note_restore();
-        if let Some(position) = self.listing.position_of(path) {
+        if let Some(position) = self.core.listing().position_of(path) {
             // 居中对齐而不是"刚好看得见"：这个文件可能在一万项里的某个
             // 角落，滚到边际上等于没说清是哪一个。
             self.scroll.scroll_to_item(position, ScrollStrategy::Center);
@@ -1254,13 +1279,13 @@ impl Pane {
     /// 什么时候记：选择变了就记。不是每次按键都记——那是一次写盘，
     /// 而按住 Shift 连选一串的时候一次按键能触发几十次。
     pub fn note_restore(&self) {
-        let dir = self.listing.path().to_path_buf();
+        let dir = self.core.listing().path().to_path_buf();
         if remote::parse_location(&dir).is_some() {
             // 远程的选中项记了也没地方恢复（见 `restore_selection`），
             // 写一份永远用不上的数据只是白白攒文件。
             return;
         }
-        let selected = self.selection.ordered(&self.listing);
+        let selected = self.selection.ordered(self.core.listing());
         let cursor = self.selection.cursor().map(Path::to_path_buf);
         let mut set = crate::restore::RestoreSet::load();
         set.note(dir, selected, cursor);
@@ -1270,7 +1295,7 @@ impl Pane {
     }
 
     pub fn path(&self) -> &Path {
-        self.listing.path()
+        self.core.listing().path()
     }
 
     /// 当前选中数量。命令面板据此决定哪些命令值得列出来。
@@ -1285,20 +1310,20 @@ impl Pane {
 
     /// 还有没有上一级可去（根目录就没有）。
     pub fn has_parent(&self) -> bool {
-        self.listing.path().parent().is_some()
+        self.core.listing().path().parent().is_some()
     }
 
     /// 套用这个目录上次记住的排序与视图；没去过就保持原样。
     fn apply_remembered_view(&mut self, cx: &mut Context<Self>) {
-        if let Some(remembered) = Settings::read(cx).view_for(self.listing.path()) {
-            self.listing.set_sort(remembered.sort);
+        if let Some(remembered) = Settings::read(cx).view_for(self.core.listing().path()) {
+            self.core.listing_mut().set_sort(remembered.sort);
             self.view = remembered.view;
         }
     }
 
     fn on_filter_changed(&mut self, cx: &mut Context<Self>) {
         let query = self.filter.read(cx).value().to_string();
-        if self.listing.set_query(&query) {
+        if self.core.listing_mut().set_query(&query) {
             self.sync_row_sizes();
             self.scroll_to_top();
             self.update_status(cx);
@@ -1331,7 +1356,7 @@ impl Pane {
 
     /// 虚拟列表一共要多少行。
     fn row_count(&self) -> usize {
-        self.listing.visible_count().div_ceil(self.columns())
+        self.core.listing().visible_count().div_ceil(self.columns())
     }
 
     /// 一行多高：网格的行比列表高得多，中间还夹一个间距。
@@ -1369,7 +1394,7 @@ impl Pane {
         self.remember_view(cx);
         self.sync_row_sizes();
         // 视图换了，光标那一项的"第几行"也变了，把它滚回视野。
-        if let Some(position) = self.selection.focus_position(&self.listing) {
+        if let Some(position) = self.selection.focus_position(self.core.listing()) {
             let row = self.row_of(position);
             self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
         }
@@ -1379,8 +1404,8 @@ impl Pane {
     /// 把当前排序与视图写进设置。改排序和改视图都要走这里，
     /// 否则改完视图再改排序，视图会被写回默认值。
     fn remember_view(&mut self, cx: &mut Context<Self>) {
-        let path = self.listing.path().to_path_buf();
-        let sort = self.listing.sort();
+        let path = self.core.listing().path().to_path_buf();
+        let sort = self.core.listing().sort();
         let view = self.view;
         Settings::update(cx, |settings| settings.remember_view(path, sort, view));
     }
@@ -1404,8 +1429,8 @@ impl Pane {
             return;
         }
 
-        let visible = self.listing.visible_count();
-        let total = self.listing.total_count();
+        let visible = self.core.listing().visible_count();
+        let total = self.core.listing().total_count();
         let mut text = if visible == total {
             crate::i18n::tr_args(cx, "{total} 个项目", &[("total", total.to_string())])
         } else {
@@ -1420,7 +1445,7 @@ impl Pane {
         };
         // 远程位置要写明：列表长得跟本地一样，不说的话用户会以为
         // 自己在本地目录里，删改起来心里没底。
-        if let Some((_, sub)) = remote::parse_location(self.listing.path()) {
+        if let Some((_, sub)) = remote::parse_location(self.core.listing().path()) {
             text = if sub.is_empty() {
                 crate::i18n::tr_args(cx, "远程位置 · {text}", &[("text", text)])
             } else {
@@ -1433,7 +1458,9 @@ impl Pane {
         }
         // 在云盘的同步文件夹里也要写明：这里删改会牵动另一台机器上的同一份，
         // 不说的话用户以为自己在动一个普通本地目录。
-        if let Some(root) = crate::cloud::root_for(self.listing.path(), crate::cloud::detected()) {
+        if let Some(root) =
+            crate::cloud::root_for(self.core.listing().path(), crate::cloud::detected())
+        {
             text = crate::i18n::tr_args(
                 cx,
                 "{provider} · {text}",
@@ -1481,7 +1508,7 @@ impl Pane {
     ) {
         // 离开之前把这一栏的现场记下来：`selection.clear()` 就在下面，
         // 走了就再也补不回来了。
-        if path != self.listing.path() {
+        if path != self.core.listing().path() {
             self.note_restore();
         }
         // 远程位置（dav://…）：本地那一套读不了，走后台那一支。
@@ -1491,11 +1518,11 @@ impl Pane {
         }
         match Listing::read(&path, shows_hidden(cx)) {
             Ok(listing) => {
-                if remember && path != self.listing.path() {
-                    self.back.push(self.listing.path().to_path_buf());
+                if remember && path != self.core.listing().path() {
+                    self.back.push(self.core.listing().path().to_path_buf());
                     self.forward.clear();
                 }
-                self.listing = listing;
+                self.core.set_listing(listing);
                 // 这个目录上次用什么排序、什么视图就还用什么；
                 // 没去过的地方沿用当前的。
                 self.apply_remembered_view(cx);
@@ -1534,11 +1561,11 @@ impl Pane {
         let Some((id, sub)) = remote::parse_location(&path) else {
             return;
         };
-        if remember && path != self.listing.path() {
-            self.back.push(self.listing.path().to_path_buf());
+        if remember && path != self.core.listing().path() {
+            self.back.push(self.core.listing().path().to_path_buf());
             self.forward.clear();
         }
-        self.listing = Listing::empty(path.clone());
+        self.core.set_listing(Listing::empty(path.clone()));
         self.selection.clear();
         self.error = None;
         self.clear_filter(window, cx);
@@ -1578,8 +1605,8 @@ impl Pane {
             .remotes
             .update(cx, |remotes, _| remotes.entries(path).cloned())
             .unwrap_or_default();
-        let query = self.listing.query().to_string();
-        let sort = self.listing.sort();
+        let query = self.core.listing().query().to_string();
+        let sort = self.core.listing().sort();
         let items = entries
             .into_iter()
             .map(|entry| {
@@ -1595,18 +1622,18 @@ impl Pane {
             Listing::from_entries_showing(path.to_path_buf(), items, shows_hidden(cx));
         listing.set_sort(sort);
         listing.set_query(&query);
-        self.listing = listing;
-        self.selection.retain_existing(&self.listing);
+        self.core.set_listing(listing);
+        self.selection.retain_existing(self.core.listing());
         self.error = None;
         self.sync_row_sizes();
     }
 
     fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.listing.query().is_empty() {
+        if self.core.listing().query().is_empty() {
             return;
         }
 
-        self.listing.set_query("");
+        self.core.listing_mut().set_query("");
         self.filter
             .update(cx, |filter, cx| filter.set_value("", window, cx));
     }
@@ -1621,7 +1648,7 @@ impl Pane {
     /// 幂等：编辑中再按一次 `cmd-l` 只是把路径重新填一遍并全选，
     /// 相当于"重来一次"（跟浏览器地址栏一样）。
     pub fn start_edit_location(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let path = self.listing.path().to_string_lossy().into_owned();
+        let path = self.core.listing().path().to_string_lossy().into_owned();
         self.editing_location = true;
         self.location.update(cx, |input, cx| {
             input.set_value(path, window, cx);
@@ -1653,7 +1680,7 @@ impl Pane {
             return;
         }
         let text = self.location.read(cx).value().to_string();
-        let cwd = self.listing.path().to_path_buf();
+        let cwd = self.core.listing().path().to_path_buf();
         // 远程位置（`dav://连接/子路径`）不是文件系统路径，交给导航那条支路
         // 自己认——跟侧栏点一个远程连接走的是同一条路。从别处拷一条远程
         // 路径粘进地址栏就该能直接过去；不认它的话，它会被当成相对路径，
@@ -1696,20 +1723,20 @@ impl Pane {
 
     pub fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.back.pop() {
-            self.forward.push(self.listing.path().to_path_buf());
+            self.forward.push(self.core.listing().path().to_path_buf());
             self.navigate_to(path, false, window, cx);
         }
     }
 
     pub fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.forward.pop() {
-            self.back.push(self.listing.path().to_path_buf());
+            self.back.push(self.core.listing().path().to_path_buf());
             self.navigate_to(path, false, window, cx);
         }
     }
 
     pub fn go_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(parent) = self.listing.path().parent() {
+        if let Some(parent) = self.core.listing().path().parent() {
             self.navigate_to(parent.to_path_buf(), true, window, cx);
         }
     }
@@ -1720,7 +1747,7 @@ impl Pane {
         // 只挂在命令面板上：Cmd+R 走的是窗格自己的 `on_action`，
         // 挂 app 层的话这条最常用的路反而漏掉了。
         crate::volumes::rescan_now();
-        let path = self.listing.path().to_path_buf();
+        let path = self.core.listing().path().to_path_buf();
         // 远程目录刷新 = 重新问一次服务器（缓存丢掉，别拿旧的糊弄）。
         if let Some((id, sub)) = remote::parse_location(&path) {
             self.remotes
@@ -1729,15 +1756,15 @@ impl Pane {
             cx.notify();
             return;
         }
-        let query = self.listing.query().to_string();
-        let sort = self.listing.sort();
+        let query = self.core.listing().query().to_string();
+        let sort = self.core.listing().sort();
 
         match Listing::read(&path, shows_hidden(cx)) {
             Ok(mut listing) => {
                 listing.set_sort(sort);
                 listing.set_query(&query);
-                self.listing = listing;
-                self.selection.retain_existing(&self.listing);
+                self.core.set_listing(listing);
+                self.selection.retain_existing(self.core.listing());
                 self.error = None;
                 self.sync_row_sizes();
             }
@@ -1755,7 +1782,11 @@ impl Pane {
     }
 
     pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let is_dir = self.listing.entry(&path).is_some_and(|entry| entry.is_dir);
+        let is_dir = self
+            .core
+            .listing()
+            .entry(&path)
+            .is_some_and(|entry| entry.is_dir);
         if is_dir {
             self.navigate_to(path, true, window, cx);
         } else if remote::parse_location(&path).is_some() {
@@ -1780,7 +1811,7 @@ impl Pane {
     /// 命令面板用它决定列不列这条命令——在本地目录里按 Cmd+Alt+E
     /// 不该弹一个"不在这里"的错误。
     pub fn edit_remote_enabled(&self) -> bool {
-        Self::editable_remote(&self.selection, &self.listing).is_some()
+        Self::editable_remote(&self.selection, self.core.listing()).is_some()
     }
 
     /// 选中项里有没有一个"能编辑的远程文件"：是就给出 `(连接 id, 服务器上的路径)`。
@@ -1801,7 +1832,7 @@ impl Pane {
     /// 只对选中**一个**远程文件生效：多选、目录、本地文件都不在语义里，
     /// 与其默默什么都不做，不如把原因写进状态栏。
     fn edit_remote(&mut self, cx: &mut Context<Self>) {
-        let Some((id, sub)) = Self::editable_remote(&self.selection, &self.listing) else {
+        let Some((id, sub)) = Self::editable_remote(&self.selection, self.core.listing()) else {
             self.error = Some(crate::i18n::Message::msg("先选中一个远程文件"));
             self.update_status(cx);
             cx.notify();
@@ -1812,12 +1843,12 @@ impl Pane {
     }
 
     fn toggle_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
-        self.listing.toggle_sort(key);
+        self.core.listing_mut().toggle_sort(key);
         // 记住这个目录的排序：下次回到这里还是这个顺序。
         self.remember_view(cx);
         self.sync_row_sizes();
         // 选中项按路径记，换排序之后还是原来那批文件；只把光标那行滚回视野。
-        if let Some(position) = self.selection.focus_position(&self.listing) {
+        if let Some(position) = self.selection.focus_position(self.core.listing()) {
             let row = self.row_of(position);
             self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
         }
@@ -1826,11 +1857,11 @@ impl Pane {
     }
 
     fn select_all(&mut self, cx: &mut Context<Self>) {
-        if self.listing.visible_count() == 0 {
+        if self.core.listing().visible_count() == 0 {
             return;
         }
 
-        self.selection.select_all(&self.listing);
+        self.selection.select_all(self.core.listing());
         self.note_restore();
         self.update_status(cx);
         cx.notify();
@@ -1856,12 +1887,12 @@ impl Pane {
 
     /// 方向键：`delta` 为负向上、为正向下；`extend` 是按住 Shift。
     fn move_cursor(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
-        let count = self.listing.visible_count();
+        let count = self.core.listing().visible_count();
         if count == 0 {
             return;
         }
 
-        let target = match self.selection.focus_position(&self.listing) {
+        let target = match self.selection.focus_position(self.core.listing()) {
             Some(position) => {
                 let moved = (position as isize + delta).clamp(0, count as isize - 1);
                 moved as usize
@@ -1890,13 +1921,13 @@ impl Pane {
     }
 
     fn focus_position(&mut self, position: usize, extend: bool, cx: &mut Context<Self>) {
-        let Some(entry) = self.listing.visible_entry(position) else {
+        let Some(entry) = self.core.listing().visible_entry(position) else {
             return;
         };
 
         let path = entry.path.clone();
         if extend {
-            self.selection.select_range(&self.listing, path);
+            self.selection.select_range(self.core.listing(), path);
         } else {
             self.selection.select(path);
         }
@@ -1914,7 +1945,7 @@ impl Pane {
     fn select_row(&mut self, path: PathBuf, modifiers: Modifiers) {
         if modifiers.shift {
             self.collapse_pending = None;
-            self.selection.select_range(&self.listing, path);
+            self.selection.select_range(self.core.listing(), path);
         } else if modifiers.secondary() {
             self.collapse_pending = None;
             self.selection.toggle(path);
@@ -1949,13 +1980,30 @@ impl Pane {
 
     /// 按列表顺序返回选中项，批量操作要用同一个顺序。
     pub fn selected_paths(&self) -> Vec<PathBuf> {
-        self.selection.ordered(&self.listing)
+        self.selection.ordered(self.core.listing())
     }
 
     fn request_new_folder(&mut self, cx: &mut Context<Self>) {
-        let parent = self.listing.path().to_path_buf();
+        let parent = self.core.listing().path().to_path_buf();
         self.ops
             .update(cx, |ops, cx| ops.request_new_folder(parent, cx));
+    }
+
+    /// 新建空白文件（快捷键那条路）。要挑模板走命令面板
+    /// （`Cmd+P` → 搜「新建 Markdown」）。
+    fn request_new_file(&mut self, cx: &mut Context<Self>) {
+        self.request_new_file_from(crate::templates::plain(), cx);
+    }
+
+    /// 按某个模板新建文件。命令面板里每条模板都走这儿。
+    pub(crate) fn request_new_file_from(
+        &mut self,
+        template: &'static crate::templates::FileTemplate,
+        cx: &mut Context<Self>,
+    ) {
+        let parent = self.core.listing().path().to_path_buf();
+        self.ops
+            .update(cx, |ops, cx| ops.request_new_file(parent, template, cx));
     }
 
     fn request_rename(&mut self, cx: &mut Context<Self>) {
@@ -1972,7 +2020,17 @@ impl Pane {
 
     fn request_trash(&mut self, cx: &mut Context<Self>) {
         let paths = self.selected_paths();
-        self.ops.update(cx, |ops, cx| ops.request_trash(paths, cx));
+        // 删哪种方式由 core 判：可移动介质上会自动变彻底删除。
+        self.ops
+            .update(cx, |ops, cx| ops.request_delete(paths, None, cx));
+    }
+
+    /// 显式要求彻底删除（不进回收站、不可撤销）。
+    fn request_delete_permanently(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        self.ops.update(cx, |ops, cx| {
+            ops.request_delete(paths, Some(crate::ops::DeleteMode::Permanent), cx)
+        });
     }
 
     fn request_copy(&mut self, cx: &mut Context<Self>) {
@@ -1986,7 +2044,7 @@ impl Pane {
     }
 
     fn request_paste(&mut self, cx: &mut Context<Self>) {
-        let dest = self.listing.path().to_path_buf();
+        let dest = self.core.listing().path().to_path_buf();
         self.ops.update(cx, |ops, cx| ops.request_paste(dest, cx));
     }
 
@@ -2041,7 +2099,7 @@ impl Pane {
         {
             return path;
         }
-        self.listing.path().to_path_buf()
+        self.core.listing().path().to_path_buf()
     }
 
     /// 在目标目录开一个终端窗口。失败时把原因写进状态栏，
@@ -2170,7 +2228,7 @@ impl Pane {
             self.close_search(window, cx);
             return;
         }
-        let root = self.listing.path().to_path_buf();
+        let root = self.core.listing().path().to_path_buf();
         let panel = cx.new(|cx| SearchPanel::new(root, window, cx));
         // 面板自己不认识窗格：跳文件、关面板都靠事件回传。
         self.subscriptions.push(cx.subscribe_in(
@@ -2209,7 +2267,7 @@ impl Pane {
             self.close_analyze(window, cx);
             return;
         }
-        let dir = self.listing.path().to_path_buf();
+        let dir = self.core.listing().path().to_path_buf();
         let selected = self.analyze_targets();
         let mode = AnalyzeMode::default_for(&selected);
         let panel = cx.new(|cx| AnalyzePanel::new(dir, selected, mode, cx));
@@ -2347,7 +2405,7 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.listing.path() != saved.root {
+        if self.core.listing().path() != saved.root {
             self.navigate_to(saved.root.clone(), true, window, cx);
         }
         if self.search.is_none() {
@@ -2510,7 +2568,7 @@ impl Pane {
         self.selection.select(path);
         self.note_restore();
         // 结果可能在列表很下面，把它滚回视野。
-        if let Some(position) = self.selection.focus_position(&self.listing) {
+        if let Some(position) = self.selection.focus_position(self.core.listing()) {
             let row = self.row_of(position);
             self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
         }
@@ -2541,7 +2599,7 @@ impl Pane {
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| state.name.clone());
-        let dest = archive::unused_dir(self.listing.path(), &stem);
+        let dest = archive::unused_dir(self.core.listing().path(), &stem);
         self.status = crate::i18n::tr_args(cx, "正在解压 {name}…", &[("name", state.name.clone())]);
 
         let (tx, rx) = async_channel::bounded(1);
@@ -2560,7 +2618,7 @@ impl Pane {
         if sources.is_empty() || self.archive_busy.is_some() {
             return;
         }
-        let base = self.listing.path().to_path_buf();
+        let base = self.core.listing().path().to_path_buf();
         // 只选中一个就用它的名字；多个就用当前目录的名字。
         let stem = if sources.len() == 1 {
             sources[0]
@@ -2682,9 +2740,11 @@ impl Pane {
         }
         match command {
             PaneCommand::NewFolder => self.request_new_folder(cx),
+            PaneCommand::NewFile => self.request_new_file(cx),
             PaneCommand::Rename => self.request_rename(cx),
             PaneCommand::BulkRename => self.request_bulk_rename(cx),
             PaneCommand::Trash => self.request_trash(cx),
+            PaneCommand::DeletePermanently => self.request_delete_permanently(cx),
             PaneCommand::Copy => self.request_copy(cx),
             PaneCommand::Cut => self.request_cut(cx),
             PaneCommand::Paste => self.request_paste(cx),
@@ -2721,14 +2781,14 @@ impl Pane {
     /// 而祖先列那一趟读盘挂在 [`Self::listing_version`] 上，
     /// 所以版本号要动 —— 否则分列视图里左列还是旧的过滤结果。
     pub fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
-        let next = !self.listing.shows_hidden();
-        if self.listing.set_show_hidden(next) {
-            self.selection.retain_existing(&self.listing);
+        let next = !self.core.listing().shows_hidden();
+        if self.core.listing_mut().set_show_hidden(next) {
+            self.selection.retain_existing(self.core.listing());
             self.sync_row_sizes();
             self.listing_version += 1;
         }
         // 设置写在切完之后：写的是 `next`，不是反过来读
-        // `self.listing.shows_hidden()`（那已经是改完的值了，
+        // `self.core.listing().shows_hidden()`（那已经是改完的值了，
         // 两次读之间没有别的写入，但把"状态在哪"讲成一个字面量更不容易搞错）。
         let show = next;
         crate::settings::Settings::update(cx, |settings| settings.show_hidden = show);
@@ -2760,7 +2820,11 @@ impl Pane {
             cx.notify();
             return;
         };
-        let is_dir = self.listing.entry(&path).is_some_and(|entry| entry.is_dir);
+        let is_dir = self
+            .core
+            .listing()
+            .entry(&path)
+            .is_some_and(|entry| entry.is_dir);
         let now_favorite = crate::settings::Settings::update(cx, |settings| {
             settings.toggle_favorite(path.clone(), is_dir)
         });
@@ -2826,7 +2890,7 @@ impl Pane {
     /// 开始监听当前目录；切换目录时旧任务被丢弃，监听随之停止。
     fn start_watching(&mut self, cx: &mut Context<Self>) {
         // 远程目录没有本地文件事件可听：notify 只能看着本机的文件系统。
-        if remote::parse_location(self.listing.path()).is_some() {
+        if remote::parse_location(self.core.listing().path()).is_some() {
             self.watch_task = None;
             return;
         }
@@ -2834,7 +2898,7 @@ impl Pane {
     }
 
     fn watch_local(&mut self, cx: &mut Context<Self>) {
-        let path = self.listing.path().to_path_buf();
+        let path = self.core.listing().path().to_path_buf();
         let Ok((watcher, rx)) = watch::watch_directory(&path) else {
             return;
         };
@@ -2859,7 +2923,7 @@ impl Pane {
 
     /// 监听回调：确认还在看同一个目录才刷新（导航后的旧回调双保险）。
     fn refresh_if_watching(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if self.listing.path() == path {
+        if self.core.listing().path() == path {
             self.refresh(cx);
         }
     }
@@ -2881,7 +2945,7 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path = self.listing.path().to_path_buf();
+        let path = self.core.listing().path().to_path_buf();
 
         // 当前目录被搬走：跟着去新家，不记历史（前进后退是浏览用的）。
         if let Some((_, to)) = renamed_to.iter().find(|(from, _)| *from == path) {
@@ -2958,7 +3022,7 @@ impl Pane {
                     .ghost()
                     .small()
                     .tooltip(crate::i18n::tr(cx, "上一级"))
-                    .disabled(self.listing.path().parent().is_none())
+                    .disabled(self.core.listing().path().parent().is_none())
                     .on_click(cx.listener(|this, _, window, cx| this.go_up(window, cx))),
             )
             // 面包屑吃掉这一行剩下的全部宽度：窄的时候它先被压到 18px，
@@ -3046,7 +3110,7 @@ impl Pane {
                             // 亮着 = 正在显示隐藏项。这是那一组里唯一
                             // **亮着跟"没生效"意思相反**的按钮——所以 tooltip
                             // 特意写"按下之后"的动作，不写状态。
-                            .selected(self.listing.shows_hidden())
+                            .selected(self.core.listing().shows_hidden())
                             .tooltip(crate::i18n::tr_args(
                                 cx,
                                 "{action}（Cmd+Shift+.）",
@@ -3311,6 +3375,7 @@ impl Pane {
                 let me_rename = me.clone();
                 let me_bulk = me.clone();
                 let me_trash = me.clone();
+                let me_permanent = me.clone();
                 let me_copy_path = me.clone();
                 let me_copy_name = me.clone();
                 let me_look = me.clone();
@@ -3342,6 +3407,17 @@ impl Pane {
                         .disabled(selected == 0)
                         .on_click(move |_, _, cx| {
                             run_on_pane(&me_trash, cx, |pane, cx| pane.request_trash(cx));
+                        }),
+                )
+                // 紧挨着放，但文案带省略号：它还会弹一次确认，且**不能撤销**。
+                // 有回收站可用的卷上不把它当默认动作——默认那条永远是可撤销的。
+                .item(
+                    PopupMenuItem::new(crate::i18n::tr(cx, "彻底删除…"))
+                        .disabled(selected == 0)
+                        .on_click(move |_, _, cx| {
+                            run_on_pane(&me_permanent, cx, |pane, cx| {
+                                pane.request_delete_permanently(cx)
+                            });
                         }),
                 )
                 .separator()
@@ -3500,7 +3576,7 @@ impl Pane {
     /// 折叠方案：超量的老段合并成一个「…」，点它回上一级——少看几层祖先，
     /// 一路点上去仍然能到根。当前目录那一段永远不折叠、名字太长出省略号。
     fn render_breadcrumb(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let path = self.listing.path();
+        let path = self.core.listing().path();
         let mut crumbs: Vec<(String, PathBuf)> = path
             .ancestors()
             .map(|ancestor| {
@@ -3769,7 +3845,7 @@ impl Pane {
         width: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let sort = self.listing.sort();
+        let sort = self.core.listing().sort();
         let active = sort.key == key;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
@@ -3818,7 +3894,7 @@ impl Pane {
         columns: ListColumns,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(entry) = self.listing.visible_entry(position) else {
+        let Some(entry) = self.core.listing().visible_entry(position) else {
             return ListItem::new(("row", position))
                 .w_full()
                 .h(px(ROW_HEIGHT))
@@ -3828,7 +3904,11 @@ impl Pane {
         let path = entry.path.clone();
         let open_path = entry.path.clone();
         let name = entry.name.clone();
-        let kind = entry.kind_label();
+        // 特殊对象的类型名按当前语言翻；普通文件/目录维持既有文案。
+        let kind = entry
+            .kind_label_key()
+            .map(|key| crate::i18n::tr(cx, key))
+            .unwrap_or_else(|| entry.kind_label());
         let is_dir = entry.is_dir;
         let is_selected = self.selection.contains(&entry.path);
         let icon_color = if is_dir {
@@ -4032,8 +4112,8 @@ impl Pane {
 
     fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // 列表空白处也能接：落下来就进当前目录。
-        let drop_here = self.listing.path().to_path_buf();
-        if self.listing.visible_count() == 0 {
+        let drop_here = self.core.listing().path().to_path_buf();
+        if self.core.listing().visible_count() == 0 {
             let empty = self.render_empty(cx);
             let empty = self.with_drag_and_drop(empty, None, Some(drop_here), cx);
             // 空目录：那一大片提示就是"空白处"，菜单对着当前这个目录。
@@ -4077,7 +4157,7 @@ impl Pane {
 
     /// 空目录（或筛选后一个都不剩）时的居中提示，两种视图共用。
     fn render_empty(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let (icon, label) = if self.listing.query().is_empty() {
+        let (icon, label) = if self.core.listing().query().is_empty() {
             (
                 IconName::FolderOpen,
                 crate::i18n::tr(cx, "这个文件夹是空的"),
@@ -4117,8 +4197,8 @@ impl Pane {
     /// 而 P2 的硬指标是十万项不卡。虚拟列表只画看得见的那几行。
     fn render_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // 网格空白处也能接：落下来就进当前目录。
-        let drop_here = self.listing.path().to_path_buf();
-        if self.listing.visible_count() == 0 {
+        let drop_here = self.core.listing().path().to_path_buf();
+        if self.core.listing().visible_count() == 0 {
             let empty = self.render_empty(cx);
             let empty = self.with_drag_and_drop(empty, None, Some(drop_here), cx);
             // 空目录：那一大片提示就是"空白处"，菜单对着当前这个目录。
@@ -4175,7 +4255,7 @@ impl Pane {
     /// 名字那个内层 div 沿用列表行的 id（`row-name`）：集成测试同一套
     /// `row_names` 助手在两种视图下都能用，不用为网格再写一遍。
     fn render_tile(&mut self, position: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let entry = self.listing.visible_entry(position)?;
+        let entry = self.core.listing().visible_entry(position)?;
         let path = entry.path.clone();
         let open_path = entry.path.clone();
         let name = entry.name.clone();
@@ -4339,15 +4419,16 @@ impl Pane {
     /// 从根目录到当前目录，每层一列。
     fn build_columns(&mut self) -> Vec<Column> {
         let mut chain: Vec<PathBuf> = self
-            .listing
+            .core
+            .listing()
             .path()
             .ancestors()
             .map(Path::to_path_buf)
             .collect();
         chain.reverse();
 
-        let sort = self.listing.sort();
-        let cursor = self.selection.focus_position(&self.listing);
+        let sort = self.core.listing().sort();
+        let cursor = self.selection.focus_position(self.core.listing());
         let current_sizes = self.row_sizes.clone();
         let mut columns = Vec::with_capacity(chain.len());
         for (index, path) in chain.iter().enumerate() {
@@ -4406,7 +4487,7 @@ impl Pane {
         // 祖先列跟着当前目录的隐藏开关走：**用户看到不一致才是问题**
         // （左边列出 `.git`，右边那列却不列）。用当前目录那个值而不是
         // 再去读一次设置——这一列是给当前目录做陪衬的，两者本该一致。
-        let mut listing = Listing::read(path, self.listing.shows_hidden())
+        let mut listing = Listing::read(path, self.core.listing().shows_hidden())
             .unwrap_or_else(|_| Listing::empty(path.to_path_buf()));
         // 跟着当前目录的排序走：不然两列之间顺序不一致，看着像换了内容。
         listing.set_sort(sort);
@@ -4517,11 +4598,15 @@ impl Pane {
         // 当前那一列没有缓存：直接问窗格自己的 `listing` 要，省一份拷贝。
         let row = match rows {
             Some(rows) => rows.get(position).cloned(),
-            None => self.listing.visible_entry(position).map(|entry| ColumnRow {
-                path: entry.path.clone(),
-                name: entry.name.clone(),
-                is_dir: entry.is_dir,
-            }),
+            None => self
+                .core
+                .listing()
+                .visible_entry(position)
+                .map(|entry| ColumnRow {
+                    path: entry.path.clone(),
+                    name: entry.name.clone(),
+                    is_dir: entry.is_dir,
+                }),
         };
         let Some(row) = row else {
             return div().h(px(ROW_HEIGHT)).into_any_element();
@@ -4661,8 +4746,8 @@ impl Pane {
         if cache.as_ref().is_none_or(|(key, _)| *key != fresh) {
             let mut total = 0usize;
             let mut names = Vec::new();
-            for position in 0..self.listing.visible_count() {
-                let Some(entry) = self.listing.visible_entry(position) else {
+            for position in 0..self.core.listing().visible_count() {
+                let Some(entry) = self.core.listing().visible_entry(position) else {
                     continue;
                 };
                 if !self.selection.contains(&entry.path) {
@@ -4888,7 +4973,7 @@ impl Pane {
             .on_action(cx.listener(|this, _: &SelectDown, _, cx| this.move_cursor(1, true, cx)))
             .on_action(cx.listener(|this, _: &MoveFirst, _, cx| this.focus_position(0, false, cx)))
             .on_action(cx.listener(|this, _: &MoveLast, _, cx| {
-                let last = this.listing.visible_count().saturating_sub(1);
+                let last = this.core.listing().visible_count().saturating_sub(1);
                 this.focus_position(last, false, cx);
             }))
             .on_action(cx.listener(|this, _: &PageUp, _, cx| this.move_page(-1, cx)))
@@ -4932,6 +5017,9 @@ impl Pane {
             .on_action(cx.listener(|this, _: &NewFolder, window, cx| {
                 this.run_command(PaneCommand::NewFolder, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &NewFile, window, cx| {
+                this.run_command(PaneCommand::NewFile, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &Rename, window, cx| {
                 this.run_command(PaneCommand::Rename, window, cx)
             }))
@@ -4940,6 +5028,9 @@ impl Pane {
             }))
             .on_action(cx.listener(|this, _: &Trash, window, cx| {
                 this.run_command(PaneCommand::Trash, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DeletePermanently, window, cx| {
+                this.run_command(PaneCommand::DeletePermanently, window, cx)
             }))
             .on_action(cx.listener(|this, _: &CopySelection, window, cx| {
                 this.run_command(PaneCommand::Copy, window, cx)
@@ -5016,7 +5107,7 @@ impl Pane {
         let selected = self
             .selection
             .single()
-            .and_then(|path| self.listing.entry(path));
+            .and_then(|path| self.core.listing().entry(path));
         // 多选态那两句走 `MultiSelectionSummary`（纯函数，要能被单测），
         // 所以语言在这里解析一次而不是让那两个函数收 `cx`。
         let locale = Settings::peek(cx, |settings| settings.locale());
@@ -5054,7 +5145,18 @@ impl Pane {
                 .child(detail_row(
                     "kind",
                     crate::i18n::tr(cx, "类型"),
-                    entry.kind_label(),
+                    entry
+                        .kind_label_key()
+                        .map(|key| crate::i18n::tr(cx, key))
+                        .unwrap_or_else(|| {
+                            // macOS Finder 别名没有固定扩展名，列目录时不能给每个
+                            // 文件都读一次头；只在选中这一项时按需认一次。
+                            // CloudPlaceholder 走上面的 Some 分支，绝不会到这里
+                            // 打开文件（Apple TN3150：读内容会触发云端下载）。
+                            crate::entry_kind::inspect_shortcut(&entry.path)
+                                .map(|flavor| crate::i18n::tr(cx, flavor.label()))
+                                .unwrap_or_else(|| entry.kind_label())
+                        }),
                     cx,
                 ))
                 .child(detail_row(
@@ -5112,6 +5214,14 @@ impl Pane {
                     entry.path.display().to_string(),
                     cx,
                 ))
+                .when_some(entry.link_target_text(), |this, target| {
+                    this.child(detail_row(
+                        "link-target",
+                        crate::i18n::tr(cx, "链接目标"),
+                        target,
+                        cx,
+                    ))
+                })
                 .into_any_element(),
             None if self.selection.len() > 1 => {
                 let summary = self.multi_selection_summary();
@@ -5185,7 +5295,7 @@ impl Pane {
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let sort = self.listing.sort();
+        let sort = self.core.listing().sort();
         h_flex()
             .h(px(26.))
             .px_3()
@@ -5287,9 +5397,11 @@ impl Pane {
     fn command_title(command: PaneCommand, cx: &gpui_kit::App) -> String {
         let text = match command {
             PaneCommand::NewFolder => "新建文件夹",
+            PaneCommand::NewFile => "新建文件",
             PaneCommand::Rename => "重命名",
             PaneCommand::BulkRename => "批量重命名",
             PaneCommand::Trash => "移到回收站",
+            PaneCommand::DeletePermanently => "彻底删除（不可撤销）",
             PaneCommand::Copy => "拷贝",
             PaneCommand::Cut => "剪切",
             PaneCommand::Paste => "粘贴",
@@ -5328,7 +5440,7 @@ impl Pane {
     /// 写成"当前状态"的话，用户按下之后字没变，
     /// 会以为按钮坏了。
     pub fn hidden_switch_title(&self, cx: &gpui_kit::App) -> String {
-        let text = if self.listing.shows_hidden() {
+        let text = if self.core.listing().shows_hidden() {
             "隐藏隐藏项"
         } else {
             "显示隐藏项"
@@ -5663,6 +5775,15 @@ pub(crate) fn icon_for_kind(kind: preview::Kind) -> IconName {
 
 impl Render for Pane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 订阅 core 的事件流：注入/命令落地后，下一帧重画一次。
+        // drain 会把队列清空，所以不会一直 notify（宽度探针那条同理）。
+        let mut core_changed = false;
+        while self.events.try_recv().is_ok() {
+            core_changed = true;
+        }
+        if core_changed {
+            cx.notify();
+        }
         // 探针写的是上一帧量到的宽度。网格的行数跟着列数走，
         // 所以宽度一变就得重排行高并再画一次；宽度稳定后自然收敛。
         let measured = self.width_probe.get();

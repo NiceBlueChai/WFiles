@@ -31,6 +31,11 @@ pub struct Volume {
     pub name: String,
     /// 挂载点，也就是导航时用的路径。
     pub path: PathBuf,
+    /// 还剩多少。探不出来就是 `None`——**别拿 0 顶替**，
+    /// 那会让侧栏显示成"0 字节可用"，用户会以为盘满了或者坏了。
+    ///
+    /// 网络共享、光盘、空读卡器、以及没权限的卷都可能报不出来。
+    pub capacity: Option<Capacity>,
 }
 
 impl Volume {
@@ -38,6 +43,108 @@ impl Volume {
     pub fn spoken(&self) -> String {
         format!("磁盘：{}", self.name)
     }
+}
+
+/// 一个挂载点的容量快照。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capacity {
+    /// 总量。
+    pub total: u64,
+    /// **调用者**还能写多少，不是文件系统的总空闲。
+    ///
+    /// 有配额、有每用户限额时两者差得很远，而用户关心的是自己还能写多少
+    /// （`statvfs` 的 `f_bavail` / `GetDiskFreeSpaceExW` 的第一个出参）。
+    pub free: u64,
+}
+
+impl Capacity {
+    /// 侧栏那一行字：「可用 120.0 GB / 共 500.0 GB」。
+    ///
+    /// 放 core 跟 [`crate::ops::summarize`] 同一个理由：GUI 侧栏、将来的 TUI
+    /// 状态栏必须说同一句话——这不是哪个界面自己的知识。
+    pub fn describe(&self) -> crate::i18n::Message {
+        crate::i18n::Message::args(
+            "可用 {free} / 共 {total}",
+            &[
+                ("free", crate::format::file_size(self.free)),
+                ("total", crate::format::file_size(self.total)),
+            ],
+        )
+    }
+}
+
+/// 一个挂载点还剩多少。探不出来回 `None`。
+///
+/// 单独一个函数而不是只在扫卷时顺手填：测试要能只验这一件事，而且
+/// "这个卷能不能报容量"和"这个卷算不算一块盘"是两回事。
+pub fn capacity_of(path: &Path) -> Option<Capacity> {
+    platform_capacity(path)
+}
+
+/// 三平台各一次系统调用。判不出来返回 `None`，**不猜**。
+#[cfg(unix)]
+fn platform_capacity(path: &Path) -> Option<Capacity> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `raw` 是有效的 NUL 结尾 C 字符串，`stats` 是合法的可写指针。
+    if unsafe { libc::statvfs(raw.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    // 用 `f_frsize`（一个块多少字节），不是 `f_bsize`（那是建议的 IO 块大小）。
+    // 这两个混用会让显示的容量差出好几倍，而且在小文件多的卷上最明显。
+    let block = stats.f_frsize as u64;
+    let total = (stats.f_blocks as u64).saturating_mul(block);
+    let free = (stats.f_bavail as u64).saturating_mul(block);
+    (total > 0).then_some(Capacity { total, free })
+}
+
+/// 手写 FFI 而不是拉 `windows-sys`：这里只用 kernel32 的一个函数，
+/// 跟 `entry_kind` 里那几件是同一个取舍。布局照官方文档抄。
+#[cfg(target_os = "windows")]
+fn platform_capacity(path: &Path) -> Option<Capacity> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    mod win32 {
+        unsafe extern "system" {
+            /// `GetDiskFreeSpaceExW(目录名, 调用者可用, 总量, 总空闲)`。
+            pub fn GetDiskFreeSpaceExW(
+                directory: *const u16,
+                free_to_caller: *mut u64,
+                total: *mut u64,
+                total_free: *mut u64,
+            ) -> i32;
+        }
+    }
+
+    // 目录名要宽字符 + NUL 结尾。
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_to_caller = 0u64;
+    let mut total = 0u64;
+    let mut total_free = 0u64;
+    // SAFETY: `wide` 以 NUL 结尾且活到调用结束，三个出参都是有效可写指针。
+    let ok = unsafe {
+        win32::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            &mut total,
+            &mut total_free,
+        )
+    };
+    (ok != 0 && total > 0).then_some(Capacity {
+        total,
+        free: free_to_caller,
+    })
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn platform_capacity(_path: &Path) -> Option<Capacity> {
+    None
 }
 
 /// 缓存里的一份快照。`Arc` 是为了让 [`detected`] 每次只多一次原子自增，
@@ -53,17 +160,17 @@ fn cache() -> &'static Mutex<(Instant, Snapshot)> {
 }
 
 /// 测试里指定"本机挂着哪些卷"。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static OVERRIDE: OnceLock<Mutex<Option<Snapshot>>> = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn override_slot() -> &'static Mutex<Option<Snapshot>> {
     OVERRIDE.get_or_init(|| Mutex::new(None))
 }
 
 /// 本机现在挂着哪些卷，带三秒缓存。
 pub fn detected() -> Snapshot {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Ok(guard) = override_slot().lock()
         && let Some(fixed) = guard.as_ref()
     {
@@ -84,7 +191,7 @@ pub fn detected() -> Snapshot {
 ///
 /// 没有它就没法在 CI 上验侧栏那几行——跑测试的机器上一个 U 盘都没有，
 /// 真扫永远是空的。传空列表就是"一个卷都没挂"。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_override(volumes: Vec<Volume>) {
     if let Ok(mut guard) = override_slot().lock() {
         *guard = Some(Arc::new(volumes));
@@ -92,7 +199,7 @@ pub fn set_override(volumes: Vec<Volume>) {
 }
 
 /// 测试专用：交还给真扫。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn clear_override() {
     if let Ok(mut guard) = override_slot().lock() {
         *guard = None;
@@ -205,13 +312,21 @@ fn mounted_under(root: &Path) -> Vec<Volume> {
         let Ok(kind) = entry.file_type() else {
             continue;
         };
+        if crate::entry_kind::is_link_or_junction(&entry) {
+            continue;
+        }
         if !kind.is_dir() {
             continue;
         }
         let Some(name) = mount_label(&path) else {
             continue;
         };
-        out.push(Volume { name, path });
+        let capacity = capacity_of(&path);
+        out.push(Volume {
+            name,
+            path,
+            capacity,
+        });
     }
     out
 }
@@ -243,6 +358,7 @@ fn drive_letters() -> Vec<Volume> {
                 // Windows API 依赖。盘符本身已经够用户认得了，
                 // 真要看卷标路径栏里也有。
                 name: format!("{}:", letter),
+                capacity: capacity_of(&path),
                 path,
             })
         })
@@ -258,18 +374,120 @@ fn whoami() -> Option<String> {
         .filter(|it| !it.is_empty())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 碰全局 override 的测试要串着来——那是一份进程级状态。
 ///
 /// UI 集成测试也用同一个锁：它们和这里的单测是两个线程池，
 /// 但改的是同一份 override，不共用一把锁就会互相盖。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static REMOVABLE_OVERRIDE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+fn removable_slot() -> &'static Mutex<Option<bool>> {
+    REMOVABLE_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+/// 测试专用：假装所有路径都在（或不在）可移动介质上。
+///
+/// 改它之前先拿 [`test_guard()`]——那是一份进程级状态，并行测试会互相盖。
+/// 传 `None` 交还给真探测。
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_removable_override(value: Option<bool>) {
+    if let Ok(mut guard) = removable_slot().lock() {
+        *guard = value;
+    }
+}
+
+/// 这个路径所在的卷是不是**可移动介质**（U 盘 / SD 卡 / 光盘）。
+///
+/// 影响删除方式：可移动介质上只允许彻底删除，因为卷上的回收站插到别的
+/// 机器上多半看不见、拔盘后"放回原处"也基本会失败。
+///
+/// **判不出来时一律返回 `false`**（当成固定磁盘）：宁可让用户走可撤销的回收站，
+/// 也不要在不知情的时候执行不可撤销的删除。
+pub fn is_removable(path: &Path) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Ok(guard) = removable_slot().lock()
+        && let Some(fixed) = *guard
+    {
+        return fixed;
+    }
+    probe_removable(path)
+}
+
+#[cfg(target_os = "macos")]
+fn probe_removable(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    /// `sys/mount.h`：`MNT_REMOVABLE 0x00000200`。
+    /// 本机实测：U 盘（ExFAT/USB）= 置位，系统卷 / `/System/Volumes/Data` = 不置位。
+    const MNT_REMOVABLE: u32 = 0x0000_0200;
+
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c_path` 是有效的 NUL 结尾字符串，`buf` 由内核填写。
+    if unsafe { libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let stat = unsafe { buf.assume_init() };
+    stat.f_flags & MNT_REMOVABLE != 0
+}
+
+#[cfg(target_os = "linux")]
+fn probe_removable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    let (major, minor) = (libc::major(meta.dev()), libc::minor(meta.dev()));
+    // sysfs 的 `removable` 是整盘属性，分区目录里通常有一份（或符号链接）。
+    match fs::read_to_string(format!("/sys/dev/block/{major}:{minor}/removable")) {
+        Ok(text) => text.trim() == "1",
+        // 读不到（容器、老内核、网络盘）就当固定磁盘。
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn probe_removable(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    /// `GetDriveTypeW` 的 `DRIVE_REMOVABLE`。
+    const DRIVE_REMOVABLE: u32 = 2;
+
+    unsafe extern "system" {
+        fn GetDriveTypeW(root_path_name: *const u16) -> u32;
+    }
+
+    // 这个 API 要的是盘符根（`C:\`），不是任意深度的路径。
+    let Some(prefix) = path.components().next() else {
+        return false;
+    };
+    let mut root: Vec<u16> = prefix.as_os_str().encode_wide().collect();
+    if !root.ends_with(&[b'\\' as u16]) {
+        root.push(b'\\' as u16);
+    }
+    root.push(0);
+    // SAFETY: `root` 是 NUL 结尾的宽字符串。
+    unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOVABLE }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn probe_removable(_path: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -290,6 +508,68 @@ mod tests {
     #[test]
     fn on_unix_the_machine_root_is_the_slash() {
         assert_eq!(machine_root(), Path::new("/"));
+    }
+
+    #[test]
+    fn the_system_volume_is_never_removable() {
+        // 判不出来（拿不到 flags / sysfs 不存在）也必须是 false：
+        // 说成"可移动"会让普通删除变成不可撤销的，方向反了会真丢数据。
+        let root = if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        };
+        assert!(!is_removable(&root), "{} 不该被判成可移动", root.display());
+    }
+
+    #[test]
+    fn removability_can_be_overridden_for_tests() {
+        let _guard = test_guard();
+        set_removable_override(Some(true));
+        assert!(is_removable(Path::new("/")));
+        set_removable_override(Some(false));
+        assert!(!is_removable(Path::new("/")));
+        set_removable_override(None);
+        assert!(!is_removable(Path::new("/")), "交还之后要按真探测来");
+    }
+
+    /// 容量能真探到，而且数字自洽。
+    ///
+    /// 判据盯**关系**不盯具体数字：每台机器、每个时刻都不一样，写死任何一个值
+    /// 就变成在测这台机器今天剩多少空间。
+    #[test]
+    fn capacity_of_a_real_volume_is_self_consistent() {
+        let capacity = capacity_of(&machine_root()).expect("根卷该能探到容量");
+        assert!(capacity.total > 0, "总量该大于 0");
+        assert!(
+            capacity.free <= capacity.total,
+            "可用 {} 不该超过总量 {}",
+            capacity.free,
+            capacity.total
+        );
+    }
+
+    /// 探不出来就是 `None`——**别拿 0 冒充"满了"**。
+    ///
+    /// 拿 0 顶替会让侧栏里每一块探不到的盘都显示成"0 字节可用"，
+    /// 用户第一反应是盘坏了或者满了，而真相只是"这个卷没告诉我们"。
+    #[test]
+    fn capacity_of_something_that_is_not_there_is_none() {
+        assert_eq!(capacity_of(Path::new("/压根不存在的挂载点")), None);
+    }
+
+    /// 侧栏那行字由 core 拼：GUI 与将来的 TUI 必须同一个说法。
+    #[test]
+    fn capacity_describes_itself_in_one_sentence() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let capacity = Capacity {
+            total: 500 * GB,
+            free: 120 * GB,
+        };
+        assert_eq!(
+            capacity.describe().say_in(crate::i18n::Locale::ZhHans),
+            "可用 120.0 GB / 共 500.0 GB"
+        );
     }
 
     /// Windows 扫盘符没法在 macOS 上验，跨平台的那部分逻辑放在
@@ -349,10 +629,12 @@ mod tests {
         let twice = vec![
             Volume {
                 name: "USB".into(),
+                capacity: None,
                 path: PathBuf::from("/mnt/USB"),
             },
             Volume {
                 name: "USB".into(),
+                capacity: None,
                 path: PathBuf::from("/media/USB"),
             },
         ];
@@ -361,10 +643,12 @@ mod tests {
         let same = vec![
             Volume {
                 name: "USB".into(),
+                capacity: None,
                 path: PathBuf::from("/mnt/USB"),
             },
             Volume {
                 name: "USB".into(),
+                capacity: None,
                 path: PathBuf::from("/mnt/USB"),
             },
         ];
@@ -402,6 +686,7 @@ mod tests {
         set_override(vec![Volume {
             name: "USB".into(),
             path: PathBuf::from("/Volumes/USB"),
+            capacity: None,
         }]);
         let found = detected();
         assert_eq!(found.len(), 1);

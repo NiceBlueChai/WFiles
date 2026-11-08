@@ -15,6 +15,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::entry_kind::{self, CopyOptions, EntryKind, LinkPolicy};
 use crate::remote::{self, Client};
 use crate::resume;
 
@@ -28,6 +29,38 @@ pub enum ConflictPolicy {
     Replace,
     /// 不动目标。
     Skip,
+}
+
+/// 重名怎么裁决：整批一个策略，还是**逐项问**。
+///
+/// 两种粒度都是真实存在的做法：
+///
+/// - [`Conflicts::Uniform`]——先问一次「全都替换 / 全都保留 / 全都跳过」，
+///   搬运中途不再打断。批量搬一百份时这是对的。
+/// - [`Conflicts::Ask`]——每碰到一项问一次。用户在对话框里能看到具体是
+///   哪个文件、各多大、谁更新，而不是闭着眼睛对一百项下一个结论。
+///
+/// 逐项问会把 [`transfer_entries_deciding`] 变成**要等**的函数：`ask` 返回
+/// 之前它一直阻塞在这一项上。这不是缺点——人类回答问题本来就要时间，
+/// 而调用方（内核）本来就把搬运放在别的线程上跑。
+///
+/// `ask` 收到的是**已经拼好的落点**（`dest/名字`），不是源路径：用户要判断的是
+/// "要不要覆盖那一个"，左边那份他才刚选过。
+pub enum Conflicts<'a> {
+    /// 一次问清，整批照办。
+    Uniform(ConflictPolicy),
+    /// 逐项问。`None` = 别问了，收手（用户按了中止）。
+    Ask(&'a mut dyn FnMut(&Path) -> Option<ConflictPolicy>),
+}
+
+impl Conflicts<'_> {
+    /// 这一项该怎么办。`None` 表示搬运该停了。
+    fn decide(&mut self, target: &Path) -> Option<ConflictPolicy> {
+        match self {
+            Conflicts::Uniform(policy) => Some(*policy),
+            Conflicts::Ask(ask) => ask(target),
+        }
+    }
 }
 
 /// 一次操作的进度快照，界面据此画进度条、算速度和剩余时间。
@@ -51,7 +84,7 @@ pub struct Progress {
 /// UI 拿一份、工作线程拿一份（两个句柄指向同一份状态），
 /// 所以"暂停"和"中止"不需要任何回调或消息往返——
 /// 工作线程在每个数据块之间自己问一次就行。
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct Control(Arc<AtomicU8>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,17 +152,29 @@ pub struct Outcome {
     pub touched: Vec<PathBuf>,
     /// 移动操作的“源 -> 目标”配对，撤销移动要用。
     pub transfers: Vec<(PathBuf, PathBuf)>,
+    /// 降级说明（如目标卷不支持链接，自动改为复制目标内容）。
+    /// 用 `Msg` 而不是 `String`：界面要按当前语言 `say(cx)`，不能把中文钉死。
+    pub warnings: Vec<crate::i18n::Msg>,
 }
 
 // ---------------------------------------------------------------------------
 // 命名与冲突
 // ---------------------------------------------------------------------------
 
+/// "这个名字有没有被占"必须问 `symlink_metadata`，不能问 `Path::exists()`。
+///
+/// `exists()` 会跟随符号链接：一条指向不存在目标的断链会答 false，可它明明
+/// 占着目录里的一个名字。照它判冲突，重命名会把链接本身悄悄覆盖掉，
+/// "保留两者"也会挑出一个实际被占的候选名。junction / 云占位同理。
+fn path_occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 /// 在 `parent` 下为“未命名文件夹”找一个没人用的名字。
 pub fn fresh_folder_path(parent: &Path) -> PathBuf {
     let mut candidate = parent.join("未命名文件夹");
     let mut round = 2;
-    while candidate.exists() {
+    while path_occupied(&candidate) {
         candidate = parent.join(format!("未命名文件夹 {round}"));
         round += 1;
     }
@@ -156,7 +201,7 @@ pub fn unique_sibling(target: &Path) -> PathBuf {
     let mut round = 2;
     loop {
         let candidate = target.with_file_name(format!("{stem} {round}{extension}"));
-        if !candidate.exists() {
+        if !path_occupied(&candidate) {
             return candidate;
         }
         round += 1;
@@ -190,7 +235,7 @@ pub fn create_folder_named(parent: &Path, name: &str) -> Result<PathBuf, crate::
     valid_name(name)?;
     let trimmed = name.trim();
     let path = parent.join(trimmed);
-    if path.exists() {
+    if path_occupied(&path) {
         return Err(crate::i18n::Message::args(
             "“{trimmed}”已存在",
             &[("trimmed", trimmed.to_string())],
@@ -199,6 +244,61 @@ pub fn create_folder_named(parent: &Path, name: &str) -> Result<PathBuf, crate::
     fs::create_dir(&path)
         .map_err(|error| crate::i18n::Message::caused("无法创建文件夹：{error}", error))?;
     Ok(path)
+}
+
+/// 按模板新建一个文件。同名已存在时拒绝，**绝不覆盖**。
+///
+/// 覆盖的代价比"报个错让用户改名"大得多：用户可能只是想新建一个
+/// `README.md`，而目录里那份是他刚写了两小时的。
+pub fn create_file_from_template(
+    parent: &Path,
+    name: &str,
+    template: &crate::templates::FileTemplate,
+) -> Result<PathBuf, crate::i18n::Msg> {
+    valid_name(name)?;
+    let trimmed = name.trim();
+    let path = parent.join(trimmed);
+    // 用 `path_occupied`（symlink_metadata）而不是 `exists()`：一条断链也占着名字。
+    if path_occupied(&path) {
+        return Err(crate::i18n::Message::args(
+            "“{trimmed}”已存在",
+            &[("trimmed", trimmed.to_string())],
+        ));
+    }
+    fs::write(&path, template.contents)
+        .map_err(|error| crate::i18n::Message::caused("无法创建文件：{error}", error))?;
+    if template.executable {
+        make_executable(&path);
+    }
+    Ok(path)
+}
+
+/// 给「新建文件」预填一个没被占用的名字：`未命名.md` / `未命名 2.md`。
+pub fn fresh_file_path(parent: &Path, template: &crate::templates::FileTemplate) -> PathBuf {
+    let mut candidate = parent.join(format!("未命名{}", template.extension));
+    let mut round = 2;
+    while path_occupied(&candidate) {
+        candidate = parent.join(format!("未命名 {round}{}", template.extension));
+        round += 1;
+    }
+    candidate
+}
+
+/// 补可执行位。只在 unix 上有意义；Windows 没有这个位，忽略。
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(metadata) = fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(permissions.mode() | 0o755);
+            let _ = fs::set_permissions(path, permissions);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 /// 重命名。只改名字，不换目录。
@@ -210,7 +310,8 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, crate::i18n::Msg> 
         .parent()
         .ok_or_else(|| crate::i18n::Message::msg("没有父目录，无法重命名"))?;
     let target = parent.join(trimmed);
-    if target.exists() && !same_file(path, &target) {
+    // 改名成自己（大小写差异也算）是 no-op，不该被"已存在"挡住。
+    if target != path && path_occupied(&target) && !same_file(path, &target) {
         return Err(crate::i18n::Message::args(
             "“{trimmed}”已存在",
             &[("trimmed", trimmed.to_string())],
@@ -226,6 +327,9 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, crate::i18n::Msg> 
 ///
 /// 删除时刻是撤销的关键依据：回收站里的同名项可能不止一个
 /// （删过一次又删一次），只有“这次删的”才该被放回来。
+///
+/// 这是 [`delete`] 的便捷封装（只处理本地、只要时刻）。需要"彻底删除"、
+/// 远程路径或失败明细时用 [`delete`]。
 pub fn trash(paths: &[PathBuf]) -> Vec<(PathBuf, SystemTime)> {
     let mut trashed = Vec::new();
     for path in paths {
@@ -239,6 +343,178 @@ pub fn trash(paths: &[PathBuf]) -> Vec<(PathBuf, SystemTime)> {
         }
     }
     trashed
+}
+
+/// 删除方式。两种语义完全不同，调用方必须显式选一个，没有默认暗坑。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeleteMode {
+    /// 移进系统回收站：可撤销、能放回原处。
+    #[default]
+    Trash,
+    /// 彻底删除：**不可撤销**、不写回收站、不进撤销栈。
+    Permanent,
+}
+
+/// 一次删除的结果。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    /// 真的删掉的路径（保持输入顺序）。
+    pub deleted: Vec<PathBuf>,
+    /// 删不掉的，带一句原因。
+    pub failed: Vec<(PathBuf, crate::i18n::Msg)>,
+    /// 实际用的方式。可移动介质上会被强制成 [`DeleteMode::Permanent`]。
+    pub mode: DeleteMode,
+    /// 走回收站时每项的删除时刻，**撤销栈要用**。
+    /// 只有 `Trash` 模式的本地路径会进来；彻底删除与远程删除都是空
+    /// （它们不可撤销，记了也没意义）。
+    pub trashed_at: Vec<(PathBuf, SystemTime)>,
+}
+
+/// 这次删除该用哪种方式。
+///
+/// 只要有一项在**可移动介质**上就整体走彻底删除：那些卷上的回收站
+/// （macOS `/.Trashes`、Windows `$Recycle.Bin`、Linux `.Trash-<uid>`）
+/// 插到别的机器上多半看不见，拔盘后"放回原处"也基本会失败——
+/// 给用户一个按了也回不来的"可撤销"比直接说"不可撤销"更糟。
+pub fn delete_mode_for(paths: &[PathBuf]) -> DeleteMode {
+    for path in paths {
+        // 远程位置没有本机回收站这回事。
+        if remote::parse_location(path).is_some() {
+            return DeleteMode::Permanent;
+        }
+        if crate::volumes::is_removable(path) {
+            return DeleteMode::Permanent;
+        }
+    }
+    DeleteMode::Trash
+}
+
+/// 删除一批路径。
+///
+/// - `Trash`：逐项走平台 trash API，保留"放回原处"的元数据。
+/// - `Permanent`：自己递归删，不跟链接、不跟 junction、只读先改权限。
+/// - 远程位置两种方式都走 `Remote::remove`（远程没有本机回收站这回事）。
+pub fn delete(
+    paths: &[PathBuf],
+    mode: DeleteMode,
+    clients: &HashMap<String, Client>,
+) -> DeleteOutcome {
+    let mut outcome = DeleteOutcome {
+        mode,
+        ..DeleteOutcome::default()
+    };
+    for path in paths {
+        // 时刻要在**动手之前**记：`trash::delete` 跑完那一刻才是真正落进回收站，
+        // 中间差几百毫秒，撤销时按这个时刻去找候选名（见 `ops::trash`）。
+        let trashed_at = SystemTime::now();
+        let is_remote = remote::parse_location(path).is_some();
+        match remove_one(path, mode, clients) {
+            Ok(()) => {
+                outcome.deleted.push(path.clone());
+                // 远程删除没有本机回收站这回事，不进撤销栈。
+                if mode == DeleteMode::Trash && !is_remote {
+                    outcome.trashed_at.push((path.clone(), trashed_at));
+                }
+            }
+            Err(message) => outcome.failed.push((path.clone(), message)),
+        }
+    }
+    outcome
+}
+
+/// 删一项：远程交给服务器，本地按 `mode` 分。
+fn remove_one(
+    path: &Path,
+    mode: DeleteMode,
+    clients: &HashMap<String, Client>,
+) -> Result<(), crate::i18n::Msg> {
+    if let Some((id, sub)) = remote::parse_location(path) {
+        let client = clients
+            .get(&id)
+            .ok_or_else(|| crate::i18n::Message::msg("这条远程连接已经不在了"))?;
+        return client.remove(&sub);
+    }
+    match mode {
+        DeleteMode::Trash => trash::delete(path).map_err(|error| {
+            crate::i18n::Message::caused("移进回收站失败：{error}", error.to_string())
+        }),
+        DeleteMode::Permanent => remove_permanently(path),
+    }
+}
+
+/// 彻底删除一项：不跟链接、不跟 junction、只读先改权限。
+fn remove_permanently(path: &Path) -> Result<(), crate::i18n::Msg> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| crate::i18n::Message::msg("这一项已经不存在了"))?;
+    // 链接 / 联接点 / 未知 reparse：只删这一项本身，绝不递归进去。
+    //
+    // **不能只看 `metadata.is_dir()`**：Windows 的 junction 在那里是 `true`，
+    // 照它递归会把联接点指向的整棵树删掉，而且这一步不可撤销。
+    // 目录型重定向用 `remove_dir`（删的是重解析点本身），其余用 `remove_file`。
+    if crate::entry_kind::is_redirect_path(path) {
+        return remove_leaf(path, metadata.is_dir());
+    }
+    if metadata.is_dir() {
+        return remove_tree(path);
+    }
+    remove_leaf(path, false)
+}
+
+fn remove_tree(dir: &Path) -> Result<(), crate::i18n::Msg> {
+    let entries = fs::read_dir(dir)
+        .map_err(|error| crate::i18n::Message::caused("读不了这个文件夹：{error}", error))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| crate::i18n::Message::caused("读不了这个文件夹：{error}", error))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| crate::i18n::Message::caused("删不掉：{error}", error))?;
+        if crate::entry_kind::is_redirect_path(&path) {
+            remove_leaf(&path, metadata.is_dir())?;
+        } else if metadata.is_dir() {
+            remove_tree(&path)?;
+        } else {
+            remove_leaf(&path, false)?;
+        }
+    }
+    remove_leaf(dir, true)
+}
+
+/// 删一项本身（文件 / 链接 / 空目录）。只读挡住了就先摘掉只读再试一次。
+fn remove_leaf(path: &Path, is_dir: bool) -> Result<(), crate::i18n::Msg> {
+    let remove = || {
+        if is_dir {
+            fs::remove_dir(path)
+        } else {
+            fs::remove_file(path)
+        }
+    };
+    let Err(first) = remove() else {
+        return Ok(());
+    };
+    // 只读会挡住删除：Windows 上是文件属性；unix 上删目录还看父目录写权限。
+    let _ = clear_read_only(path);
+    remove().map_err(|_| crate::i18n::Message::caused("删除失败：{error}", first))
+}
+
+fn clear_read_only(path: &Path) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    if !permissions.readonly() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        // 只补上"属主可写"这一位。别用 `set_readonly(false)`：在 unix 上它等于
+        // `chmod a+w`，会把一个本该只读的文件变成所有人可写。
+        let mode = permissions.mode();
+        permissions.set_mode(mode | 0o200);
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(false);
+    }
+    fs::set_permissions(path, permissions)
 }
 
 /// 从回收站放回原处。
@@ -462,17 +738,88 @@ fn copy_entry(
     source: &Path,
     dest: &Path,
     report: &mut dyn FnMut(u64) -> bool,
+    options: CopyOptions,
+    seen: &mut Vec<PathBuf>,
+    warnings: &mut Vec<crate::i18n::Msg>,
 ) -> Result<(), crate::i18n::Msg> {
-    let metadata = fs::symlink_metadata(source)?;
-    if metadata.is_dir() {
+    let kind = entry_kind::classify(&entry_kind::probe_path(source));
+    if kind.needs_hydration() {
+        return Err(crate::i18n::Message::msg(
+            "这是云端占位文件，请先下载再操作",
+        ));
+    }
+
+    let preserving = options.link_policy == LinkPolicy::Preserve;
+    match &kind {
+        // 只有真正的符号链接能按原样重建（Unix symlink / Windows symlink）。
+        EntryKind::Symlink { .. } if preserving => {
+            if let Some(target) = kind.target() {
+                let is_dir_link = fs::metadata(source).is_ok_and(|meta| meta.is_dir());
+                if recreate_link(target, dest, is_dir_link).is_ok() {
+                    return Ok(());
+                }
+                // 目标卷不支持链接（exFAT/FAT32 等）：自动降级为跟随内容，
+                // 并留下一条可追溯的说明，不静默改语义。
+                warnings.push(crate::i18n::Message::args(
+                    "“{name}”：目标不支持链接，已改为复制目标内容",
+                    &[("name", display_name(source))],
+                ));
+                crate::logfile::info("链接保留失败，自动降级为复制目标内容");
+            }
+        }
+        // junction / 未知 reparse point **不是**符号链接。微软要求
+        // FSCTL_SET_REPARSE_POINT + SE_CREATE_SYMBOLIC_LINK_NAME 才能重建，
+        // 用 symlink_dir 建出来的是另一种 tag，等于偷偷换了对象类型。
+        // 宁可明确降级并告知，也不假装"已保留"。
+        EntryKind::Junction { .. } | EntryKind::ReparseOther { .. } if preserving => {
+            warnings.push(crate::i18n::Message::args(
+                "“{name}”：联接点无法原样保留，已复制目标内容",
+                &[("name", display_name(source))],
+            ));
+        }
+        _ => {}
+    }
+
+    // 默认策略跟随目标内容。判目录必须跟着链接看：`symlink_metadata`
+    // 对目录软链接答 false，照它判会掉进 copy_file 然后打不开目录。
+    let is_dir = fs::metadata(source).is_ok_and(|meta| meta.is_dir());
+    if is_dir {
+        // canonical 路径判环：junction / 指回祖先的链接不会把整棵树无限复制。
+        let canonical = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        if seen.contains(&canonical) {
+            return Err(crate::i18n::Message::msg("检测到链接循环，已跳过这一层"));
+        }
+        seen.push(canonical);
         fs::create_dir_all(dest)?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
-            copy_entry(&entry.path(), &dest.join(entry.file_name()), report)?;
+            copy_entry(
+                &entry.path(),
+                &dest.join(entry.file_name()),
+                report,
+                options,
+                seen,
+                warnings,
+            )?;
         }
+        seen.pop();
         Ok(())
     } else {
         copy_file(source, dest, report)
+    }
+}
+
+#[cfg(unix)]
+fn recreate_link(target: &Path, dest: &Path, _is_dir_link: bool) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, dest)
+}
+
+#[cfg(target_os = "windows")]
+fn recreate_link(target: &Path, dest: &Path, is_dir_link: bool) -> io::Result<()> {
+    if is_dir_link {
+        std::os::windows::fs::symlink_dir(target, dest)
+    } else {
+        std::os::windows::fs::symlink_file(target, dest)
     }
 }
 
@@ -704,7 +1051,8 @@ fn remove_entry(path: &Path) -> io::Result<()> {
 
 /// 把一组条目拷进 `dest_dir`。
 ///
-/// 冲突按 `policy` 统一处理（界面先问一次，不再逐项打断）。
+/// 冲突按 `policy` 统一处理（界面先问一次，整批照办，中途不再打断）。
+/// 要逐项问就用 [`transfer_entries_deciding`] 配 [`Conflicts::Ask`]。
 /// `on_progress` 每完成一项、以及每拷完一个数据块都调用一次；
 /// 返回 false 表示用户要求中止（暂停由调用方在它内部等，worker 不必知道）。
 ///
@@ -716,7 +1064,34 @@ pub fn copy_entries(
     remote: &RemoteSides,
     on_progress: &mut dyn FnMut(&Progress) -> bool,
 ) -> Outcome {
-    transfer_entries(sources, dest_dir, policy, false, remote, on_progress)
+    copy_entries_with_options(
+        sources,
+        dest_dir,
+        policy,
+        remote,
+        on_progress,
+        CopyOptions::default(),
+    )
+}
+
+/// 带链接策略的复制。默认选项与 `copy_entries` 的行为完全一致。
+pub fn copy_entries_with_options(
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    policy: ConflictPolicy,
+    remote: &RemoteSides,
+    on_progress: &mut dyn FnMut(&Progress) -> bool,
+    options: CopyOptions,
+) -> Outcome {
+    transfer_entries(
+        sources,
+        dest_dir,
+        policy,
+        false,
+        remote,
+        on_progress,
+        options,
+    )
 }
 
 /// 把一组条目移进 `dest_dir`；跨卷时按“复制成功后删源”处理。
@@ -727,7 +1102,34 @@ pub fn move_entries(
     remote: &RemoteSides,
     on_progress: &mut dyn FnMut(&Progress) -> bool,
 ) -> Outcome {
-    transfer_entries(sources, dest_dir, policy, true, remote, on_progress)
+    move_entries_with_options(
+        sources,
+        dest_dir,
+        policy,
+        remote,
+        on_progress,
+        CopyOptions::default(),
+    )
+}
+
+/// 带链接策略的移动。
+pub fn move_entries_with_options(
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    policy: ConflictPolicy,
+    remote: &RemoteSides,
+    on_progress: &mut dyn FnMut(&Progress) -> bool,
+    options: CopyOptions,
+) -> Outcome {
+    transfer_entries(
+        sources,
+        dest_dir,
+        policy,
+        true,
+        remote,
+        on_progress,
+        options,
+    )
 }
 
 fn transfer_entries(
@@ -737,6 +1139,33 @@ fn transfer_entries(
     remove_source: bool,
     remote: &RemoteSides,
     on_progress: &mut dyn FnMut(&Progress) -> bool,
+    options: CopyOptions,
+) -> Outcome {
+    transfer_entries_deciding(
+        sources,
+        dest_dir,
+        Conflicts::Uniform(policy),
+        remove_source,
+        remote,
+        on_progress,
+        options,
+    )
+}
+
+/// 「重名了，这一项怎么办」由调用方一项一项回答的搬运。
+///
+/// 除了重名裁决这一处，其余行为与 [`copy_entries`] / [`move_entries`] 完全一致，
+/// 所以两版共用同一段实现：`conflicts` 只决定"碰到重名时问谁"。
+/// 传 [`Conflicts::Ask`] 时这个函数会**阻塞**在每一项冲突上等答案——
+/// 想不阻塞就传 [`Conflicts::Uniform`]，那就是老行为。
+pub fn transfer_entries_deciding(
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    mut conflicts: Conflicts<'_>,
+    remove_source: bool,
+    remote: &RemoteSides,
+    on_progress: &mut dyn FnMut(&Progress) -> bool,
+    options: CopyOptions,
 ) -> Outcome {
     let total = sources.len();
     // 总字节数在后台线程里数：这一趟本来就要遍历一遍，顺手就出来了。
@@ -770,11 +1199,16 @@ fn transfer_entries(
         let same_dir = source.parent() == Some(dest_dir);
         let exists = match remote.dest.as_deref() {
             Some(client) => remote_exists(client, &target),
-            None => target.exists(),
+            None => path_occupied(&target),
         };
         let conflict = exists && !same_file(source, &target) && !same_dir;
 
         let Some(target) = (if conflict {
+            // 逐项问就在这里阻塞；`None` 是用户叫停，别再往下搬。
+            let Some(policy) = conflicts.decide(&target) else {
+                outcome.skipped += total - ix;
+                return outcome;
+            };
             resolve_target(&target, policy, remote.dest.as_deref())
         } else {
             Some(target)
@@ -794,6 +1228,7 @@ fn transfer_entries(
 
         // 把上报器关进一个块里：它借走了 `on_progress`，
         // 不先还回来下一轮的进度就发不出去了。
+        let mut warnings = Vec::new();
         let result = {
             let mut report = |bytes: u64| {
                 bytes_done += bytes;
@@ -805,8 +1240,17 @@ fn transfer_entries(
                     bytes_total,
                 })
             };
-            transfer_one(source, &target, remove_source, remote, &mut report)
+            transfer_one(
+                source,
+                &target,
+                remove_source,
+                remote,
+                &mut report,
+                options,
+                &mut warnings,
+            )
         };
+        outcome.warnings.extend(warnings);
 
         match result {
             Ok(()) => {
@@ -926,9 +1370,11 @@ fn transfer_one(
     remove_source: bool,
     remote: &RemoteSides,
     report: &mut dyn FnMut(u64) -> bool,
+    options: CopyOptions,
+    warnings: &mut Vec<crate::i18n::Msg>,
 ) -> Result<(), TransferError> {
     match (remote.source.as_deref(), remote.dest.as_deref()) {
-        (None, None) => local_to_local(source, target, remove_source, report),
+        (None, None) => local_to_local(source, target, remove_source, report, options, warnings),
         // 远程 -> 本地：下载。移动时下载成功后删掉服务器上的那一份。
         (Some(client), None) => {
             let sub = sub_of(source)?;
@@ -974,6 +1420,8 @@ fn local_to_local(
     target: &Path,
     remove_source: bool,
     report: &mut dyn FnMut(u64) -> bool,
+    options: CopyOptions,
+    warnings: &mut Vec<crate::i18n::Msg>,
 ) -> Result<(), TransferError> {
     if remove_source {
         // 同卷移动一步到位；跨卷先拷贝再删源。
@@ -985,7 +1433,8 @@ fn local_to_local(
     // 拷到一半停下时，没拷完的那一个留在续传暂存处，目标里本来就没有它，
     // 所以这里不用、也不能删 `target`：拷目录时 `target` 是整棵子树，
     // 里面有已经拷好的东西。
-    copy_entry(source, target, report).map_err(|error| {
+    let mut seen = Vec::new();
+    copy_entry(source, target, report, options, &mut seen, warnings).map_err(|error| {
         if is_aborted(&error) {
             TransferError::Aborted
         } else {
@@ -1462,21 +1911,35 @@ impl<R: Write> Write for Reporting<'_, R> {
 /// `client` 是源那一端在远程时的客户端：远程得靠列目录数，
 /// 而列目录是要走一趟网络的。
 pub fn count_entries(paths: &[PathBuf], client: Option<&dyn remote::Remote>) -> usize {
-    paths.iter().map(|path| count_one(path, client)).sum()
+    paths
+        .iter()
+        .map(|path| {
+            let mut seen = Vec::new();
+            count_one(path, client, &mut seen)
+        })
+        .sum()
 }
 
 /// 拷/移之前先数一遍总字节数：进度条、"还剩多久"都要这个分母。
 ///
 /// 数不出来的（没权限、失效链接）按 0 算，界面退化成只看条目数。
+/// 口径必须跟 `copy_entry` 一致：它跟随目录链接真的复制两遍，分母也得算两遍；
+/// `seen` 用 canonical 路径挡住指回祖先的链接，别把分母数成无限大。
 pub fn count_bytes(paths: &[PathBuf], client: Option<&dyn remote::Remote>) -> u64 {
-    paths.iter().map(|path| bytes_of(path, client)).sum()
+    paths
+        .iter()
+        .map(|path| {
+            let mut seen = Vec::new();
+            bytes_of(path, client, &mut seen)
+        })
+        .sum()
 }
 
-fn bytes_of(path: &Path, client: Option<&dyn remote::Remote>) -> u64 {
+fn bytes_of(path: &Path, client: Option<&dyn remote::Remote>, seen: &mut Vec<PathBuf>) -> u64 {
     if let (Some(client), Some((_, sub))) = (client, remote::parse_location(path)) {
         return bytes_remote(client, &sub);
     }
-    bytes_local(path)
+    bytes_local(path, seen)
 }
 
 /// 远程一棵子树的总字节数：一趟递归的 PROPFIND。
@@ -1496,33 +1959,41 @@ fn bytes_remote(client: &dyn remote::Remote, sub: &str) -> u64 {
         .sum()
 }
 
-fn bytes_local(path: &Path) -> u64 {
-    let Ok(link) = fs::symlink_metadata(path) else {
+fn bytes_local(path: &Path, seen: &mut Vec<PathBuf>) -> u64 {
+    // 云占位会被 copy_entry 直接拒绝，分母按 0 算，别把元数据大小当内容。
+    // 这里只读 flags，绝不读内容（Apple TN3150：读会触发下载）。
+    if entry_kind::classify(&entry_kind::probe_path(path)).needs_hydration() {
         return 0;
-    };
-    // 目录只看链接本身：跟着链接走进一个指向父目录的链接会无限递归。
-    if link.is_dir() {
-        let Ok(read_dir) = fs::read_dir(path) else {
-            return 0;
-        };
-        return read_dir
-            .flatten()
-            .map(|entry| bytes_of(&entry.path(), None))
-            .sum();
     }
-    // 文件跟着链接走：真要拷的是链接指向的内容，
-    // 链接自己那几十个字节（目标路径的长度）不是我们要搬的量。
-    // 失效链接在这里取不到元数据，按 0 算。
-    fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
+    // 跟 copy_entry 同一把尺：跟随链接看目标是不是目录。目录型链接会真的
+    // 递归复制，分母就得跟着算；seen 保证指回祖先的链接不成环。
+    let is_dir = fs::metadata(path).is_ok_and(|meta| meta.is_dir());
+    if is_dir {
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if seen.contains(&canonical) {
+            return 0;
+        }
+        seen.push(canonical);
+        let total = fs::read_dir(path)
+            .map(|read_dir| {
+                read_dir
+                    .flatten()
+                    .map(|entry| bytes_of(&entry.path(), None, seen))
+                    .sum()
+            })
+            .unwrap_or(0);
+        seen.pop();
+        return total;
+    }
+    // 文件型软链接取目标大小；断链 metadata 失败按 0。
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
-fn count_one(path: &Path, client: Option<&dyn remote::Remote>) -> usize {
+fn count_one(path: &Path, client: Option<&dyn remote::Remote>, seen: &mut Vec<PathBuf>) -> usize {
     if let (Some(client), Some((_, sub))) = (client, remote::parse_location(path)) {
         return count_remote(client, &sub);
     }
-    count_local(path)
+    count_local(path, seen)
 }
 
 fn count_remote(client: &dyn remote::Remote, sub: &str) -> usize {
@@ -1541,21 +2012,27 @@ fn count_remote(client: &dyn remote::Remote, sub: &str) -> usize {
         .sum::<usize>()
 }
 
-fn count_local(path: &Path) -> usize {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return 1;
-    };
-    if !metadata.is_dir() {
+fn count_local(path: &Path, seen: &mut Vec<PathBuf>) -> usize {
+    // 同 bytes_local：跟随链接看目标，seen 挡环。
+    let is_dir = fs::metadata(path).is_ok_and(|meta| meta.is_dir());
+    if !is_dir {
         return 1;
     }
-
-    let Ok(read_dir) = fs::read_dir(path) else {
-        return 1;
-    };
-    1 + read_dir
-        .flatten()
-        .map(|entry| count_local(&entry.path()))
-        .sum::<usize>()
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if seen.contains(&canonical) {
+        return 1; // 环：链接本身算一项，不再往下数
+    }
+    seen.push(canonical);
+    let total = 1 + fs::read_dir(path)
+        .map(|read_dir| {
+            read_dir
+                .flatten()
+                .map(|entry| count_local(&entry.path(), seen))
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    seen.pop();
+    total
 }
 
 // ---------------------------------------------------------------------------
@@ -1644,6 +2121,8 @@ impl HistoryEntry {
                 if exists_any(to, clients) != Some(true) {
                     return Err(crate::i18n::Message::msg("原文件已经不在改名后的位置了"));
                 }
+                // 撤销之后栈里更早的记录要改回旧名字——由 `pop_undo` 统一做
+                // （这里只有这一条 entry，拿不到整个栈）。
                 move_back(from, to, clients)
             }
             Self::Copied { created } => {
@@ -1755,7 +2234,19 @@ fn move_back(
         // 撤销跑在后台线程上，不用报进度，给个一律放行的上报器。
         _ => {
             let mut report = |_bytes: u64| true;
-            match transfer_one(to, from, true, &sides, &mut report) {
+            // 撤销搬回的是"上一次操作已经落地的那一端"，不是用户新选的特殊对象：
+            // 一律按默认策略跟随内容，不再重建链接（重建等于把撤销变成第二次复制）。
+            // 这条路径跑在后台线程，进度/警告都无处上屏，给独立的空 sinks。
+            let mut undo_warnings = Vec::new();
+            match transfer_one(
+                to,
+                from,
+                true,
+                &sides,
+                &mut report,
+                CopyOptions::default(),
+                &mut undo_warnings,
+            ) {
                 Ok(()) => Ok(()),
                 Err(TransferError::Aborted) => Err(crate::i18n::Message::aborted()),
                 Err(TransferError::Failed(message)) => Err(message),
@@ -1768,6 +2259,58 @@ fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// 一次搬运的结论，主句加若干**条件出现**的子句。
+///
+/// 放 core 而不是界面：GUI 的状态栏、TUI 的一行、新前端的回执都该说同一句
+/// 话——「拷贝完成 5 项，跳过 2 项」不是哪个界面自己的知识。
+///
+/// 返回 [`crate::i18n::Msg`] 而不是 `String`：子句里可能有失败原因（本身也是
+/// `Msg`），拼成字符串就把它冻成中文了。英文那边动词是过去式、子句是分词
+/// 短语，语序跟中文不同，所以主句与子句各自一条 key，渲染时
+/// [`crate::i18n::Message::then_clause`] 按语言接起来。
+pub fn summarize(outcome: &Outcome, cut: bool, aborted: bool) -> crate::i18n::Msg {
+    use crate::i18n::Message;
+
+    let done = outcome.done.to_string();
+    let mut message = if aborted {
+        Message::args(
+            if cut {
+                "已中止：移动完成 {count} 项"
+            } else {
+                "已中止：拷贝完成 {count} 项"
+            },
+            &[("count", done)],
+        )
+    } else if cut {
+        Message::args("移动完成 {count} 项", &[("count", done)])
+    } else {
+        Message::args("拷贝完成 {count} 项", &[("count", done)])
+    };
+    // 中止时报跳过没有意义：那些是被用户叫停的，不是"跳过了"。
+    if outcome.skipped > 0 && !aborted {
+        message = message.then_clause(Message::args(
+            "跳过 {count} 项",
+            &[("count", outcome.skipped.to_string())],
+        ));
+    }
+    if let Some((path, reason)) = outcome.failed.first() {
+        message = message.then_caused_clause(
+            "{count} 项失败（{name}：{error}）",
+            &[
+                ("count", outcome.failed.len().to_string()),
+                ("name", display_name(path)),
+            ],
+            reason.clone(),
+        );
+    }
+    // 降级说明（目标卷不支持链接、junction 不能原样保留…）必须上屏：
+    // 躺在 Outcome 里没人看，等于静默改了用户选的语义。
+    for warning in &outcome.warnings {
+        message = message.then_clause(warning.clone());
+    }
+    message
 }
 
 /// 撤销栈。只记能撤的；失败的操作不进栈。
@@ -1808,7 +2351,18 @@ impl History {
             .pop()
             .ok_or_else(|| crate::i18n::Message::msg("没有可撤销的操作"))?;
         match entry.undo(clients) {
-            Ok(()) => Ok(entry.describe()),
+            Ok(()) => {
+                // 撤销改名要把栈里更早的记录改回旧名字。
+                //
+                // `note_renamed` 在**改名时**把更早的记录指向了新名字；
+                // 现在文件改回去了，那些记录也得跟着回去——否则
+                // 「新建 a → 改名 b → 撤销改名 → 撤销新建」这条链上，
+                // 最后一步会去删一个已经不存在的 `b`，报"这一项已经不存在了"。
+                if let HistoryEntry::Renamed { from, to } = &entry {
+                    self.note_renamed(to, from);
+                }
+                Ok(entry.describe())
+            }
             Err(error) => {
                 // 撤不动就放回栈里，下一次重试。
                 self.entries.push(entry);
@@ -1927,6 +2481,78 @@ mod tests {
         );
     }
 
+    // ---- 新建文件（模板）----
+
+    #[test]
+    fn a_new_file_gets_the_template_contents() {
+        let root = temp();
+        let template = crate::templates::template("markdown").expect("模板");
+        let path = create_file_from_template(root.path(), "readme.md", template).expect("建文件");
+        assert_eq!(fs::read_to_string(&path).unwrap(), template.contents);
+    }
+
+    #[test]
+    fn a_new_file_never_overwrites_an_existing_one() {
+        // 覆盖的代价比"报个错让用户改名"大得多。
+        let root = temp();
+        fs::write(root.path().join("a.txt"), "keep me").unwrap();
+        assert!(
+            create_file_from_template(root.path(), "a.txt", crate::templates::plain()).is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "keep me"
+        );
+    }
+
+    #[test]
+    fn the_suggested_file_name_skips_taken_ones() {
+        let root = temp();
+        let template = crate::templates::template("markdown").expect("模板");
+        assert_eq!(
+            fresh_file_path(root.path(), template)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("未命名.md")
+        );
+        fs::write(root.path().join("未命名.md"), "x").unwrap();
+        assert_eq!(
+            fresh_file_path(root.path(), template)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("未命名 2.md"),
+            "第一个名字被占了要往后跳"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_template_comes_out_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp();
+        let template = crate::templates::template("shell").expect("模板");
+        let path = create_file_from_template(root.path(), "run.sh", template).expect("建脚本");
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "脚本新建出来就该能直接跑，实际权限 {mode:o}"
+        );
+    }
+
+    #[test]
+    fn a_bad_file_name_is_refused_without_leaving_anything_behind() {
+        let root = temp();
+        let template = crate::templates::plain();
+        assert!(create_file_from_template(root.path(), "  ", template).is_err());
+        assert!(create_file_from_template(root.path(), "a/b.txt", template).is_err());
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "被拒的请求不该在磁盘上留东西"
+        );
+    }
+
     #[test]
     fn unique_sibling_keeps_extension_and_hidden_dot_files() {
         let root = temp();
@@ -1976,6 +2602,71 @@ mod tests {
         fs::write(root.path().join("b.txt"), "x").unwrap();
 
         assert!(rename(&root.path().join("a.txt"), "b.txt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_link_still_occupies_its_name() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp();
+        let missing = root.path().join("nowhere");
+        fs::write(root.path().join("a.txt"), "x").unwrap();
+        // 故意让"候选名"本身是断链：旧实现用 exists() 会答 false，
+        // 于是把 a 2.txt 当成空位还回去。断链放在 a.txt 上反而测不出差别。
+        symlink(&missing, root.path().join("a 2.txt")).unwrap();
+        assert!(
+            !root.path().join("a 2.txt").exists(),
+            "断链确实 exists()=false"
+        );
+        assert_eq!(
+            unique_sibling(&root.path().join("a.txt")),
+            root.path().join("a 3.txt")
+        );
+
+        // 重命名到断链同名：旧实现会直接把链接本身覆盖掉（数据丢失且不可撤销）。
+        fs::write(root.path().join("src.txt"), "x").unwrap();
+        assert!(rename(&root.path().join("src.txt"), "a 2.txt").is_err());
+        assert!(
+            fs::symlink_metadata(root.path().join("a 2.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "断链必须还在原地"
+        );
+
+        // 新建同名文件夹也一样不能被放行。
+        assert!(create_folder_named(root.path(), "a 2.txt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skip_policy_refuses_to_overwrite_a_broken_link() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp();
+        let src = root.path().join("src");
+        let dest = root.path().join("dest");
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(src.join("a.txt"), "x").unwrap();
+        symlink(root.path().join("nowhere"), dest.join("a.txt")).unwrap();
+
+        let outcome = copy_entries(
+            &[src.join("a.txt")],
+            &dest,
+            ConflictPolicy::Skip,
+            &RemoteSides::default(),
+            &mut |_| true,
+        );
+        assert_eq!(outcome.skipped, 1, "被断链占着的落点要判成冲突");
+        assert!(
+            fs::symlink_metadata(dest.join("a.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "复制链接还在，没被覆盖"
+        );
     }
 
     #[test]
@@ -2488,6 +3179,27 @@ mod tests {
         assert_eq!(count_bytes(&paths, None), 5);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn count_bytes_follows_a_directory_link_but_never_loops() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp();
+        fs::create_dir(root.path().join("sub")).unwrap();
+        fs::write(root.path().join("a.txt"), "12345").unwrap(); // 5
+        fs::write(root.path().join("sub/b.txt"), "1234567").unwrap(); // 7
+        symlink(root.path().join("sub"), root.path().join("alias")).unwrap();
+        // 指回根目录：真跟进去会无限递归，必须被 canonical seen 挡住。
+        symlink(root.path(), root.path().join("loop")).unwrap();
+
+        // copy_entry 会跟随目录链接把 sub 复制两遍，分母就得是 5+7+7=19；
+        // loop 那一支贡献 0。分母不跟随（12）或成环（爆栈/巨大值）都要红。
+        let root_path = root.path().to_path_buf();
+        assert_eq!(count_bytes(std::slice::from_ref(&root_path), None), 19);
+        // 条目数同样不能成环：root + a.txt + sub(2) + alias(2) + loop(1) = 7。
+        assert_eq!(count_entries(&[root_path], None), 7);
+    }
+
     #[test]
     fn copying_reports_the_bytes_it_has_written() {
         let root = temp();
@@ -2589,6 +3301,150 @@ mod tests {
 
         assert_eq!(count_entries(std::slice::from_ref(&src), None), 6);
         assert_eq!(count_entries(&[src.join("a.txt"), src], None), 7);
+    }
+
+    // ---- 删除：回收站 vs 彻底删除 ----
+
+    #[test]
+    fn permanent_delete_removes_files_and_folders() {
+        let root = temp();
+        fs::write(root.path().join("a.txt"), "x").unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("dir/inner.txt"), "y").unwrap();
+
+        let outcome = delete(
+            &[root.path().join("a.txt"), root.path().join("dir")],
+            DeleteMode::Permanent,
+            &HashMap::new(),
+        );
+        assert!(
+            outcome.failed.is_empty(),
+            "不该有失败：{:?}",
+            outcome.failed
+        );
+        assert_eq!(outcome.deleted.len(), 2);
+        assert_eq!(outcome.mode, DeleteMode::Permanent);
+        assert!(!root.path().join("a.txt").exists());
+        assert!(!root.path().join("dir").exists(), "目录要连内容一起删");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanent_delete_removes_the_link_not_its_target() {
+        use std::os::unix::fs::symlink;
+
+        // 删链接必须只删链接本身。跟进去会把整棵目标树干掉——这是不可撤销的。
+        let root = temp();
+        fs::create_dir(root.path().join("target")).unwrap();
+        fs::write(root.path().join("target/keep.txt"), "keep").unwrap();
+        symlink(root.path().join("target"), root.path().join("link")).unwrap();
+
+        let outcome = delete(
+            &[root.path().join("link")],
+            DeleteMode::Permanent,
+            &HashMap::new(),
+        );
+        assert_eq!(outcome.deleted.len(), 1);
+        assert!(!root.path().join("link").exists(), "链接该没了");
+        assert!(
+            root.path().join("target/keep.txt").exists(),
+            "链接指向的内容必须原封不动"
+        );
+    }
+
+    #[test]
+    fn permanent_delete_reports_failures_instead_of_swallowing_them() {
+        let root = temp();
+        let outcome = delete(
+            &[root.path().join("nope")],
+            DeleteMode::Permanent,
+            &HashMap::new(),
+        );
+        assert!(outcome.deleted.is_empty());
+        assert_eq!(outcome.failed.len(), 1, "删不掉要报出来，不能假装成功");
+    }
+
+    #[test]
+    fn deleting_nothing_is_not_an_error() {
+        let outcome = delete(&[], DeleteMode::Permanent, &HashMap::new());
+        assert!(outcome.deleted.is_empty());
+        assert!(outcome.failed.is_empty());
+    }
+
+    #[test]
+    fn only_the_trash_mode_records_a_deletion_moment() {
+        // 撤销要靠这个时刻去回收站找候选名；彻底删除记了也没用（不能撤）。
+        let root = temp();
+        fs::write(root.path().join("a.txt"), "x").unwrap();
+        let outcome = delete(
+            &[root.path().join("a.txt")],
+            DeleteMode::Permanent,
+            &HashMap::new(),
+        );
+        assert_eq!(outcome.deleted.len(), 1);
+        assert!(outcome.trashed_at.is_empty(), "彻底删除不该记删除时刻");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanent_delete_clears_a_read_only_file() {
+        // 只读文件在 Windows 上直接删会失败；递归删要先改权限。
+        // unix 上不会失败，这条钉的是"实现里真的处理了只读"，不是平台差异。
+        let root = temp();
+        let dir = root.path().join("locked");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("f.txt");
+        fs::write(&file, "x").unwrap();
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file, permissions).unwrap();
+
+        let outcome = delete(
+            std::slice::from_ref(&dir),
+            DeleteMode::Permanent,
+            &HashMap::new(),
+        );
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_removable_volume_forces_permanent_delete() {
+        let _guard = crate::volumes::test_guard();
+        crate::volumes::set_removable_override(Some(true));
+        assert_eq!(
+            delete_mode_for(&[PathBuf::from("/whatever/a.txt")]),
+            DeleteMode::Permanent,
+            "可移动介质上只允许彻底删除"
+        );
+        crate::volumes::set_removable_override(Some(false));
+        assert_eq!(
+            delete_mode_for(&[PathBuf::from("/whatever/a.txt")]),
+            DeleteMode::Trash,
+            "固定磁盘默认走回收站"
+        );
+        crate::volumes::set_removable_override(None);
+    }
+
+    #[test]
+    fn a_remote_path_never_goes_to_the_trash() {
+        // 远程没有本机回收站这回事，方式和"是不是可移动介质"无关。
+        assert_eq!(
+            delete_mode_for(&[PathBuf::from("dav://conn/dir/a.txt")]),
+            DeleteMode::Permanent
+        );
+    }
+
+    #[test]
+    fn a_remote_delete_without_a_client_is_reported() {
+        // 拿不到客户端要报出来，不能悄悄当本地路径删（那必然失败且看不出原因）。
+        let outcome = delete(
+            &[PathBuf::from("dav://gone/dir/a.txt")],
+            DeleteMode::Trash,
+            &HashMap::new(),
+        );
+        assert!(outcome.deleted.is_empty());
+        assert_eq!(outcome.failed.len(), 1);
     }
 
     // ---- 撤销 ----

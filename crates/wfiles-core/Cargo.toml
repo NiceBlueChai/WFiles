@@ -1,0 +1,73 @@
+[package]
+name = "wfiles-core"
+version = "0.1.0"
+edition = "2024"
+description = "WFiles core: UI-independent business logic shared by the GUI, a future TUI and any other frontend"
+license = "MIT"
+publish = false
+
+[features]
+# UI 层的集成测试要借 core 里的假服务器（`remote::fake`）。依赖 crate 永远
+# 不会以 cfg(test) 编译，所以只能用 feature 把夹具开放出去；正式构建不带它。
+test-support = []
+
+# SFTP。默认开（GUI/TUI/NSH 都要它），但**可以被关掉**：
+# `russh` 把 `rsa` 钉在 `=0.10.0-rc.18`，而 `quickjs-jit-stdlib`（NSH 的 web host
+# 用它跑 JS）的 optional `rsa ^0.10.0-rc.19` 会要 `pkcs1 ^0.8.0-rc.5`，两者在同一个
+# 依赖图里无交集。这一冲突**在 NSH 那一侧解决**（剪掉 host 的 `nsh-js/crypto` 那条
+# feature 边，见 `docs/nsh-client.md` §6.5），所以这里保持默认开。
+#
+# 真遇到只能靠关它来的构建时，关掉之后 `remote::Kind::Sftp` 仍然存在（界面照样能
+# 列出这个选项），只是连接时会明确报"这个构建没有包含 SFTP 支持"，不会静默失败。
+default = ["sftp"]
+sftp = ["dep:tokio", "dep:russh", "dep:russh-sftp"]
+
+[dependencies]
+# 下面每一项都来自主 crate 原有的依赖，没有引入新的第三方库。
+# **这一节里没有（也绝不能有）gpui-kit / gpui / 任何界面框架**：
+# 这是「core 不依赖具体界面实现」的编译期保证，不是口头约定。
+dirs = "6"
+notify = "8.2.0"
+trash = "5.2.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
+md5 = "0.8"
+sha1 = "0.10"
+sha2 = "0.10"
+digest = "0.10"
+hmac = "0.12"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+quick-xml = { version = "0.38", default-features = false }
+suppaftp = "12"
+# SFTP 那一组默认开、可关（见 [features] 里的说明）。
+russh = { version = "0.64", optional = true }
+russh-sftp = { version = "3", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util"], optional = true }
+async-channel = "2.5.0"
+
+# 密码存系统钥匙串：按平台分开声明，理由同主 crate 的 Cargo.toml。
+[target.'cfg(unix)'.dependencies]
+# 判"这个卷是不是可移动介质"要一次 statfs（macOS 的 MNT_REMOVABLE）/
+# 读 sysfs 的设备号（Linux）。为这一件事拉一个平台层依赖，好过解析
+# diskutil 的外部输出（慢、格式会变、还得起进程）。
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "linux-native", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# 自己依赖自己：只为把 `test-support` 打进**测试**构建，让 `tests/` 里的
+# 集成测试能用 `volumes::set_override` 这类夹具。集成测试是独立 crate，
+# 永远看不到 `cfg(test)`（见本文件 [features] 的说明），所以只能这么开。
+# 正式构建不带这个 feature，生产代码路径一点不受影响。
+wfiles-core = { path = ".", features = ["test-support"] }

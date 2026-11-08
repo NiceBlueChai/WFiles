@@ -42,6 +42,25 @@ fn open_app_of_width(
     open_app_at(cx, width, None)
 }
 
+/// 默认窗口高度。
+///
+/// 布局验收大多只关心宽度（列数、工具栏折叠），高度就取一个"够高"的值；
+/// **侧栏那种竖向溢出**反过来只关心高度，得能自己指定——见
+/// [`open_app_of_size`]。
+const TEST_HEIGHT: f32 = 760.;
+
+/// 指定宽高开一个：竖向装不下时才需要它。
+///
+/// 只改宽度的话，"侧栏内容长过窗口"这一类缺陷永远复现不出来——
+/// 1180 × 760 的窗口比大多数机器的侧栏内容还高。
+fn open_app_of_size(
+    cx: &mut TestAppContext,
+    width: f32,
+    height: f32,
+) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<WFilesApp>) {
+    open_app_sized_starting(cx, width, height, Starting::primary(None))
+}
+
 /// 带着命令行目标开一个窗口：验"启动时落到哪儿"那几条路。
 ///
 /// 目标从外面喂进来而不是真去读 `std::env::args`：命令行解析那一层
@@ -61,12 +80,25 @@ fn open_app_starting(
     width: f32,
     starting: Starting,
 ) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<WFilesApp>) {
+    open_app_sized_starting(cx, width, TEST_HEIGHT, starting)
+}
+
+/// 真正的开窗动作：宽、高、来路都由调用方定。
+fn open_app_sized_starting(
+    cx: &mut TestAppContext,
+    width: f32,
+    height: f32,
+    starting: Starting,
+) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<WFilesApp>) {
     cx.background_executor.allow_parking();
     // 每个测试的状态目录隔开。放在这里而不是让每个测试自己记得调：
     // 原来只有 22 / 75 个测试调了 `isolate_session`，剩下的会读写用户
     // 真实的 `~/Library/Application Support/WFiles/`——只要用户用过一次
     // 应用，那些测试的断言就可能被真机状态带偏（并跑时才挂，最难查）。
     ensure_isolated();
+    // 上一条测试留在盘上的界面语言清掉（理由见 [`clear_leftover_locale`]）：
+    // 必须赶在 `WFilesApp::new` 读设置**之前**，开完窗再改就晚了。
+    clear_leftover_locale();
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::app::init(cx);
@@ -74,7 +106,7 @@ fn open_app_starting(
 
         let bounds = Bounds {
             origin: Point::default(),
-            size: size(px(width), px(760.)),
+            size: size(px(width), px(height)),
         };
         let (window, app) = gpui_kit::open_window(
             WindowOptions {
@@ -149,12 +181,54 @@ fn ensure_isolated() {
     let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let dir = tempfile::tempdir().expect("临时目录");
     unsafe { std::env::set_var("WFILES_SESSION_DIR", dir.path()) };
+    // 语言环境一并钉死。界面语言在「跟随系统」那一档是从 `LC_ALL` /
+    // `LC_MESSAGES` / `LANG` 推出来的（`i18n::Locale::from_env`），而这三个
+    // 变量跟着**跑测试的 shell** 走：同一份代码在 `LANG=en_US.UTF-8` 的机器上
+    // 整批变成英文界面、中文文案的断言全红，换个 shell 又全绿（本机实测：
+    // 单跑 `the_pane_status_bar_speaks_english` / 那条命令面板切语言的测试
+    // 必挂）。产品读环境是对的；测试要的是确定，所以这里把测试进程当成一台
+    // 「系统语言就是中文」的机器。要验英文的那十几条自己改设置——设置排在
+    // 环境前面，不受这里影响。
+    unsafe {
+        for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+            std::env::set_var(key, "zh_CN.UTF-8");
+        }
+    }
     OWNED.with(|slot| {
         slot.replace(Some(Owned {
             _guard: guard,
             _dir: dir,
         }))
     });
+}
+
+/// 把上一条测试留在隔离目录里的界面语言清成"没选过"（跟随系统）。
+///
+/// 语言是**当场落盘**的设置（`Settings::update` 里就 `save`），而隔离目录按
+/// worker 线程复用：改英文的那十几条测试（都是先开窗、再改语言）会把 `en`
+/// 留在 `settings.json` 里，同线程下一条测试开窗时被当成"用户选过英文"
+/// 读回来——探针实测：盘上留 `en`，侧栏读出来就是 `Local file system`。
+///
+/// **要赶在应用构造之前**（[`open_app_starting`] 里挂的就是这个时机）：
+/// `WFilesApp::new` 一上来就读这份设置，而且状态栏那类文案是*在事件里算好、
+/// 缓存进 `self.status`* 的（见 `pane::update_status`）——开完窗再改语言已经
+/// 晚了，第一条断言看到的仍是上一份设置算出来的英文。
+///
+/// 只清语言那一格：别的字段可能是这条测试自己种下的（记住的视图、标记、
+/// 布局…），动它们等于把测试现场也清了。盘上没有设置文件、或者语言本来
+/// 就是空的，一个字节都不写；要验英文的那几条在开窗**之后**自己写。
+fn clear_leftover_locale() {
+    let Some(path) = crate::settings::Settings::file_path() else {
+        return;
+    };
+    let Some(mut stored) = crate::settings::Settings::load_from(&path) else {
+        return;
+    };
+    if stored.locale.is_empty() {
+        return;
+    }
+    stored.locale = String::new();
+    let _ = stored.save_to(&path);
 }
 
 /// 隔离状态目录，并把路径交给调用方（用来往里写 session.json）。
@@ -193,6 +267,21 @@ impl SessionIsolation {
 fn settle(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
     window.render_frame(cx);
     window.render_frame(cx);
+}
+
+/// 把侧栏滚到露出下半截（云盘 / 远程那几段）。
+///
+/// 侧栏中间那几段是**真滚动**的容器：内容高过窗口时多出来的部分滚出来，
+/// 而不是溢出到窗口外面（页脚「本地文件系统」也不会被顶出去）。
+/// 代价是折叠以下那几行在无头窗口里确实看不见——想点它们就得像真用户
+/// 那样先滚一下，别指望 `click` 自己会滚。
+fn scroll_sidebar(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
+    window.scroll(
+        "sidebar-scroll",
+        gpui_kit::ScrollDelta::Lines(point(0., -8.)),
+        cx,
+    );
+    settle(window, cx);
 }
 
 /// 等一个后台任务的产物出现。
@@ -3845,6 +3934,8 @@ fn a_cloud_sync_folder_is_called_out_in_the_sidebar_and_the_details(cx: &mut Tes
     assert_eq!(label, "Dropbox", "侧栏该列出本机的云盘：{label}");
 
     step(cx, handle, |window, cx| {
+        // 云盘那一段在折叠线以下：先滚到它，再点。
+        scroll_sidebar(window, cx);
         window.click(("cloud", 0usize), cx);
     });
 
@@ -3967,6 +4058,8 @@ fn the_sidebar_lists_volumes_and_one_click_goes_there(cx: &mut TestAppContext) {
     crate::volumes::set_override(vec![crate::volumes::Volume {
         name: "USB".to_string(),
         path: disk.clone(),
+        // 探不出容量就不显示那一行（光盘、网络共享就是这样）。
+        capacity: None,
     }]);
     let (session, handle) = open_in(cx, dir.path());
 
@@ -4001,6 +4094,94 @@ fn the_sidebar_lists_volumes_and_one_click_goes_there(cx: &mut TestAppContext) {
 
     drop(session);
     crate::volumes::clear_override();
+}
+
+/// 卷上"还剩多少"：探得到才显示，探不到就只显示名字。
+///
+/// 判据盯**那一行字本身**（由 `Capacity::describe` 拼）。只断言"侧栏有容量区"
+/// 是挑错层——名字本来就在那儿，多一层也能满足。
+#[gpui_kit::test]
+fn a_volume_shows_how_much_is_left_only_when_it_knows(cx: &mut TestAppContext) {
+    let _serial = crate::volumes::test_guard();
+    const GB: u64 = 1024 * 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("Backup")).unwrap();
+    std::fs::create_dir(dir.path().join("CD")).unwrap();
+
+    crate::volumes::set_override(vec![
+        crate::volumes::Volume {
+            name: "备份盘".to_string(),
+            path: dir.path().join("Backup"),
+            capacity: Some(crate::volumes::Capacity {
+                total: 500 * GB,
+                free: 120 * GB,
+            }),
+        },
+        crate::volumes::Volume {
+            name: "光盘".to_string(),
+            path: dir.path().join("CD"),
+            // 光盘 / 网络共享 / 空读卡器都可能报不出容量。
+            capacity: None,
+        },
+    ]);
+
+    let (session, handle) = open_in(cx, dir.path());
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        let text = window
+            .try_find(("volume-capacity", 0usize))
+            .and_then(|node| node.label().map(|label| label.to_string()))
+            .unwrap_or_default();
+        assert_eq!(
+            text, "可用 120.0 GB / 共 500.0 GB",
+            "探得到容量就该显示出来，实际是 {text:?}"
+        );
+        // 探不出来的那块：不显示那一行，**更不许编一个 0 出来**。
+        assert!(
+            window.try_find(("volume-capacity", 1usize)).is_none(),
+            "探不出容量的卷不该显示那一行"
+        );
+    });
+
+    drop(session);
+    crate::volumes::clear_override();
+}
+
+/// 窗口矮到侧栏一定装不下时，底部那颗「本地文件系统」仍得点得到。
+///
+/// 真事：磁盘那节每行多了一行「剩多少」，侧栏就装不下了，底部那颗被顶到
+/// 窗口外面。旧结构下它照样"可见"（没有裁剪祖先），于是判据绿着、界面残着；
+/// 现在的结构把它钉在底部、中间那几段自己滚。
+///
+/// 用**矮窗口**而不是塞十几块假盘来制造溢出：`volumes::set_override` 是
+/// 进程级的，塞一串假盘会把并行跑的其他侧栏判据一起顶到折叠线以下。
+#[gpui_kit::test]
+fn a_short_window_keeps_the_sidebar_footer_reachable(cx: &mut TestAppContext) {
+    let root = crate::volumes::machine_root();
+    // 360 px：连「位置」那几条都装不完，云盘与远程更是远在折叠线以下。
+    let (handle, app) = open_app_of_size(cx, 1180., 360.);
+    step(cx, handle, settle);
+
+    let before = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert!(
+        !same_dir(&before[0], &root),
+        "起点不该已经就是本机根（{}），否则这条测试什么都没验到",
+        root.display(),
+    );
+
+    // `click` 先查可见性：被顶出可见区的那颗在这里就报 not visible。
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("sidebar-local", cx);
+    });
+    step(cx, handle, settle);
+
+    let live = cx.update(|cx| app.read(cx).tab_paths(cx));
+    assert!(
+        same_dir(&live[0], &root),
+        "窗口再矮，底部那颗也得在：实际停在 {}",
+        live[0].display(),
+    );
 }
 
 #[gpui_kit::test]
@@ -6932,6 +7113,43 @@ fn the_sidebar_speaks_english_when_english_is_chosen(cx: &mut TestAppContext) {
     assert_eq!(english.2, "Local file system");
 }
 
+/// 上一条测试留在盘上的「英文」不该改变下一条看到的界面——那次偶发失败的
+/// 最小场景。
+///
+/// 语言是**当场落盘**的设置，而隔离目录按 worker 线程复用（同一条测试里可以
+/// 重入，跨测试却是同一个目录）。要验英文本地化的那十来条测试一改语言就
+/// 落了盘，同线程后面的测试再开窗时会把那份 `en` 当成"用户的选择"读回来——
+/// 表现是"单跑必过、全量偶发挂"，而且一挂就是几十条跟语言不相干的文案
+/// 断言，从失败信息上根本看不出是语言的事。
+///
+/// 挡它的地方在 [`open_app_starting`] 开窗**之前**调的
+/// [`clear_leftover_locale`]：把盘上那份语言清成"没选过"。这条测试先把盘上
+/// 写成英文，再看界面——修之前这一条必然挂（探针实测：侧栏读出来是
+/// `Local file system`）。
+#[gpui_kit::test]
+fn a_leftover_settings_file_cannot_change_what_the_next_test_sees(cx: &mut TestAppContext) {
+    let isolation = isolate_session();
+    let mut leftover = Settings::default();
+    leftover.set_locale(crate::i18n::Locale::En);
+    leftover
+        .save_to(&isolation.path().join("settings.json"))
+        .expect("写一份上一条测试留下的设置");
+
+    let handle = open_app(cx);
+    let seen = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            a11y_label_at(window, "sidebar-tagline"),
+            a11y_label_at(window, "sidebar-local"),
+        )
+    });
+    assert_eq!(
+        (seen.0.as_str(), seen.1.as_str()),
+        ("快速、清楚、可撤销", "本地文件系统"),
+        "盘上留着的英文不该盖住这一条测试"
+    );
+}
+
 /// 侧栏左下那颗「本地文件系统」是**能点的**：一步回到本机根。
 ///
 /// 这颗真正的用途是从远程连接里退回来——本机根由
@@ -8284,6 +8502,44 @@ fn cmd_shift_n_creates_a_folder_on_disk(cx: &mut TestAppContext) {
     assert_eq!(listed, vec!["未命名文件夹"], "新建的文件夹该出现在列表里");
 }
 
+/// `cmd-alt-n` 新建空白文件：预填「未命名.txt」，确认后磁盘上真的多一个**空文件**。
+///
+/// 顺带钉住两件事：预填名按模板后缀来（不是「未命名文件夹」），
+/// 空白模板的内容是 0 字节（不是写了个换行）。
+#[gpui_kit::test]
+fn cmd_alt_n_creates_an_empty_file_on_disk(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("临时目录");
+    let dir = root.path().join("plain");
+    std::fs::create_dir(&dir).expect("建目录");
+    let (_session, handle) = open_in(cx, &dir);
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-alt-n", cx);
+    });
+
+    let asked = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.try_find("prompt-ok").is_some()
+    });
+    assert!(asked, "Cmd+Alt+N 该弹出新建文件的输入框");
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.click("prompt-ok", cx);
+    });
+
+    let (on_disk, contents) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            names_on_disk(&dir),
+            std::fs::read_to_string(dir.join("未命名.txt")).unwrap_or_default(),
+        )
+    });
+    assert_eq!(on_disk, vec!["未命名.txt"], "确认之后磁盘上该多出一个文件");
+    assert_eq!(contents, "", "空白模板就是 0 字节");
+}
+
 /// `f2` 改名：输入新名字、回车，磁盘上真的换了名。
 ///
 /// 输入框预填的是原名、光标落在开头，所以先 `cmd-a` 全选再打字
@@ -8892,6 +9148,82 @@ fn trashing_asks_before_touching_the_disk(cx: &mut TestAppContext) {
     assert_eq!(after, vec!["doomed.txt"], "取消之后文件该还在");
 }
 
+/// 可移动介质上按同一个删除键，必须变成**彻底删除**，而且要在确认框里
+/// 说清两件事：为什么不能进回收站、这一步不能撤销。
+///
+/// 判据盯的是**文案**：用户按的是「删除」，程序不能悄悄换成不可撤销的操作
+/// 还不吭声。策略接没接上、文案有没有说清，这条都会红。
+#[gpui_kit::test]
+fn a_removable_volume_asks_before_deleting_for_good(cx: &mut TestAppContext) {
+    let _lock = crate::volumes::test_guard();
+    crate::volumes::set_removable_override(Some(true));
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+        settle(window, cx);
+        window.press("cmd-backspace", cx);
+        settle(window, cx);
+    });
+
+    let (title, body) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            a11y_label_at(window, "overlay-title"),
+            a11y_label_at(window, "confirm-message"),
+        )
+    });
+    crate::volumes::set_removable_override(None);
+
+    assert_eq!(title, "彻底删除", "介质上不该再提回收站");
+    assert!(
+        body.contains("可移动介质"),
+        "正文要说明为什么不能进回收站：{body}"
+    );
+    assert!(body.contains("不能撤销"), "必须说清不可撤销：{body}");
+    assert!(
+        !body.contains("之后还可以撤销"),
+        "别给用户留能撤销的错觉：{body}"
+    );
+}
+
+/// 固定磁盘上显式要求彻底删除（`Cmd+Shift+Backspace`）：不进回收站、
+/// 也不能撤销。这条不依赖介质判定，走的是用户明确的那条路。
+#[gpui_kit::test]
+fn the_permanent_delete_shortcut_skips_the_trash(cx: &mut TestAppContext) {
+    let _lock = crate::volumes::test_guard();
+    crate::volumes::set_removable_override(Some(false));
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    std::fs::write(dir.path().join("a.txt"), "x").expect("造文件");
+    let (_session, handle) = open_in(cx, dir.path());
+
+    step(cx, handle, |window, cx| {
+        settle(window, cx);
+        window.press("cmd-a", cx);
+        settle(window, cx);
+        window.press("cmd-shift-backspace", cx);
+        settle(window, cx);
+    });
+
+    let (title, body) = step_value(cx, handle, |window, cx| {
+        settle(window, cx);
+        (
+            a11y_label_at(window, "overlay-title"),
+            a11y_label_at(window, "confirm-message"),
+        )
+    });
+    crate::volumes::set_removable_override(None);
+
+    assert_eq!(title, "彻底删除");
+    assert!(body.contains("不会进回收站"), "要说清后果：{body}");
+    assert!(body.contains("不能撤销"), "要说清不可撤销：{body}");
+}
+
 // ---- 右键菜单 ----
 //
 // 这批钉的是"右键那一按落在哪儿，菜单就对着谁"：行上对着这一批、空白处
@@ -9205,7 +9537,8 @@ fn the_remote_menu_asks_before_forgetting_the_connection(cx: &mut TestAppContext
     });
 
     step(cx, handle, |window, cx| {
-        settle(window, cx);
+        // 远程那一段在折叠线以下：先滚到它，再右键。
+        scroll_sidebar(window, cx);
         window.right_click(("remote", 0usize), cx);
     });
     step(cx, handle, |window, cx| {

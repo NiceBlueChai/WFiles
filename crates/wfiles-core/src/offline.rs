@@ -1,6 +1,6 @@
 //! 离线缓存：远程目录列表落盘，断网也能翻。
 //!
-//! 内存里的那层（[`crate::remotes`] 的 `listed`）只活到进程退出：拔了网线、
+//! 内存里的那层（界面层远程注册表的 `listed`）只活到进程退出：拔了网线、
 //! 服务器关了、公司 VPN 断了，再打开就只剩一个转圈。真正需要"离线还能翻"
 //! 的是**翻目录**这件事本身——看一眼昨天有什么文件、确认某个文件在不在，
 //! 不需要真把内容拉下来。
@@ -28,7 +28,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::remote::Entry;
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 use crate::session;
 
 /// 缓存总量预算：超过就整条丢掉最久没动的那一条连接。
@@ -74,13 +74,13 @@ pub struct Store {
 impl Store {
     /// 落在哪儿。测试走系统临时目录，跟真机缓存隔开。
     pub fn root() -> PathBuf {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let dir = {
             // 测试一律指到临时目录：真机的缓存是用户自己的，
             // 测试里到处是"列一个目录就存一下"，不隔开会把它们攒起来。
             take_root_override().unwrap_or_else(|| test_root().join("listing"))
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let dir = machine_root();
         dir
     }
@@ -246,7 +246,7 @@ fn short_key(id: &str) -> String {
 /// 真机上离线缓存放哪儿：优先 `WFILES_SESSION_DIR`（便携安装用），
 /// 否则按平台惯例落在缓存目录——跟续传暂存同一套规则，
 /// 用户清一次系统缓存就把两者一起清掉了。
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn machine_root() -> PathBuf {
     if let Some(dir) = session::session_dir_override() {
         return dir.join("listing");
@@ -268,27 +268,27 @@ fn machine_root() -> PathBuf {
 /// 里每个调用点都传一遍，只为测试方便不值得。这个覆盖只在测试构建里存在。
 ///
 /// **它是进程级的**，所以碰它的测试必须串着来——拿 [`test_guard`] 那把锁。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static ROOT_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 /// 碰缓存根覆盖的测试要串着来。
 ///
 /// 两个测试各指一个目录、然后同时跑的话，会互相把对方的覆盖顶掉——
 /// 症状是"单跑必过、全量并行挂"，最难查的那种。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 指到哪儿去（`None` 是恢复默认）。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_root_override(dir: Option<PathBuf>) {
     *ROOT_OVERRIDE.lock().unwrap_or_else(|it| it.into_inner()) = dir;
 }
 
 /// 现在的覆盖值（守卫拿去恢复用）。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn take_root_override() -> Option<PathBuf> {
     ROOT_OVERRIDE
         .lock()
@@ -296,7 +296,7 @@ pub fn take_root_override() -> Option<PathBuf> {
         .clone()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn test_root() -> &'static std::path::Path {
     use std::sync::OnceLock;
     static ROOT: OnceLock<PathBuf> = OnceLock::new();

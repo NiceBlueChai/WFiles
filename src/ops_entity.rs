@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use gpui_kit::{AsyncApp, WeakEntity, *};
@@ -15,6 +15,7 @@ use gpui_kit::{AsyncApp, WeakEntity, *};
 use std::collections::HashMap;
 
 use crate::bulk_rename::{self, BulkRename, BulkRenamePreview};
+use crate::kernel::Kernel;
 use crate::ops::{
     self, ConflictPolicy, Control, ControlState, History, Outcome, Progress, RemoteSides,
 };
@@ -75,12 +76,20 @@ pub struct Confirm {
 
 #[derive(Clone, Debug)]
 pub enum PendingAction {
-    /// 把选中的路径移进回收站。
-    Trash { paths: Vec<PathBuf> },
+    /// 删掉选中的路径。`mode` 已经在确认之前算好了（可移动介质会是彻底删除）。
+    Delete {
+        paths: Vec<PathBuf>,
+        mode: crate::ops::DeleteMode,
+    },
     /// 撤销上一步操作。
     Undo,
     /// 新建文件夹（输入名字后）。
     CreateFolder { parent: PathBuf },
+    /// 按模板新建文件（输入名字后）。
+    CreateFile {
+        parent: PathBuf,
+        template: &'static crate::templates::FileTemplate,
+    },
     /// 重命名。
     Rename { path: PathBuf },
     /// 删掉一条远程连接。
@@ -242,8 +251,8 @@ enum WorkerMessage {
 }
 
 enum JobResult {
-    /// 移进回收站的结果。
-    Trashed(Vec<(PathBuf, SystemTime)>),
+    /// 删除的结果（回收站或彻底删除，看 `outcome.mode`）。
+    Deleted(crate::ops::DeleteOutcome),
     /// 拷贝/移动的结果。
     Transferred {
         outcome: Outcome,
@@ -280,7 +289,8 @@ enum JobResult {
 
 pub struct Ops {
     clipboard: Clipboard,
-    history: History,
+    /// 撤销栈与事件流的唯一持有者，住在 wfiles-core（不再自己 new 一份）。
+    kernel: Kernel,
     running: Option<Running>,
     /// 当前任务的控制手柄；队列里等着的还没有。
     control: Option<Control>,
@@ -318,7 +328,7 @@ impl Ops {
             remotes,
             limiter: Arc::new(Mutex::new(Limiter::new(0))),
             clipboard: Clipboard::default(),
-            history: History::default(),
+            kernel: Kernel::new(),
             running: None,
             control: None,
             queue: VecDeque::new(),
@@ -428,7 +438,7 @@ impl Ops {
 
     /// “撤销”按钮的文案；没有可撤销操作时返回 None。
     pub fn undo_label(&self) -> Option<crate::i18n::Msg> {
-        self.history.last_describe()
+        self.kernel.history().last_describe()
     }
 
     /// 状态栏那句话。**给的是 `Msg` 不是 `&str`**：上屏那一刻才翻，
@@ -472,6 +482,30 @@ impl Ops {
         cx.notify();
     }
 
+    /// 新建文件：先问名字（按模板后缀预填「未命名.md」），内容由模板给。
+    pub fn request_new_file(
+        &mut self,
+        parent: PathBuf,
+        template: &'static crate::templates::FileTemplate,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = ops::fresh_file_path(&parent, template)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("未命名{}", template.extension));
+        self.prompt = Some(Prompt {
+            // 标题直接用模板名（"Markdown 文档"），比笼统的"新建文件"更能说明
+            // 接下来会得到什么；预填名再带一遍后缀，两处对得上。
+            title: crate::i18n::Message::msg(template.label),
+            label: crate::i18n::Message::msg("名称"),
+            initial,
+            error: None,
+            action: PendingAction::CreateFile { parent, template },
+        });
+        cx.emit(OpsEvent::PromptChanged { open: true });
+        cx.notify();
+    }
+
     /// 重命名：预填当前名字。
     pub fn request_rename(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let initial = path
@@ -507,21 +541,57 @@ impl Ops {
         cx.notify();
     }
 
-    /// 移到回收站：破坏性操作，先确认。
-    pub fn request_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    /// 删除：破坏性操作，先确认。
+    ///
+    /// `forced` 为 `None` 表示**按介质自动判**（`ops::delete_mode_for`）：
+    /// 可移动介质上会变成彻底删除，确认框里要说明原因——用户按的是
+    /// 「删除」，不该在没被告知的情况下执行不可撤销的操作。
+    /// 传 `Some(Permanent)` 是用户显式要求（`Cmd+Shift+Backspace`）。
+    pub fn request_delete(
+        &mut self,
+        paths: Vec<PathBuf>,
+        forced: Option<ops::DeleteMode>,
+        cx: &mut Context<Self>,
+    ) {
         if paths.is_empty() {
             return;
         }
+        let mode = forced.unwrap_or_else(|| ops::delete_mode_for(&paths));
+        // 只有"没被显式要求、却被介质逼成彻底删除"才需要解释。
+        let forced_by_volume = forced.is_none() && mode == ops::DeleteMode::Permanent;
         let count = paths.len();
-        self.confirm = Some(Confirm {
-            title: crate::i18n::Message::msg("移到回收站"),
-            message: crate::i18n::Message::args(
-                "确定把 {count} 个项目移到回收站吗？之后还可以撤销。",
-                &[("count", count.to_string())],
+        let (title, message, ok_label) = match (mode, forced_by_volume) {
+            (ops::DeleteMode::Trash, _) => (
+                crate::i18n::Message::msg("移到回收站"),
+                crate::i18n::Message::args(
+                    "确定把 {count} 个项目移到回收站吗？之后还可以撤销。",
+                    &[("count", count.to_string())],
+                ),
+                crate::i18n::Message::msg("移到回收站"),
             ),
-            ok_label: crate::i18n::Message::msg("移到回收站"),
+            (ops::DeleteMode::Permanent, true) => (
+                crate::i18n::Message::msg("彻底删除"),
+                crate::i18n::Message::args(
+                    "这 {count} 个项目在可移动介质上。这类卷的回收站换台机器就看不见、拔盘后也放不回原处，所以只能彻底删除——不能撤销。",
+                    &[("count", count.to_string())],
+                ),
+                crate::i18n::Message::msg("彻底删除"),
+            ),
+            (ops::DeleteMode::Permanent, false) => (
+                crate::i18n::Message::msg("彻底删除"),
+                crate::i18n::Message::args(
+                    "确定彻底删除 {count} 个项目吗？不会进回收站，也不能撤销。",
+                    &[("count", count.to_string())],
+                ),
+                crate::i18n::Message::msg("彻底删除"),
+            ),
+        };
+        self.confirm = Some(Confirm {
+            title,
+            message,
+            ok_label,
             ok_dangerous: true,
-            action: PendingAction::Trash { paths },
+            action: PendingAction::Delete { paths, mode },
         });
         cx.notify();
     }
@@ -582,14 +652,15 @@ impl Ops {
     }
 
     pub fn request_undo(&mut self, cx: &mut Context<Self>) {
-        if self.history.is_empty() {
+        if self.kernel.history().is_empty() {
             self.last_message = Some(crate::i18n::Message::msg("没有可撤销的操作"));
             self.last_message_is_error = false;
             cx.notify();
             return;
         }
         let describe = self
-            .history
+            .kernel
+            .history()
             .last_describe()
             .unwrap_or_else(|| crate::i18n::Message::msg("上一步操作"));
         self.confirm = Some(Confirm {
@@ -676,12 +747,19 @@ impl Ops {
         cx.notify();
 
         match confirm.action {
-            PendingAction::Trash { paths } => self.start_trash(paths, cx),
+            PendingAction::Delete { paths, mode } => self.start_delete(paths, mode, cx),
             PendingAction::Undo => self.run_undo(cx),
             // 新建/重命名走输入对话框，不会出现在确认框里；留着兜底。
             PendingAction::CreateFolder { parent } => {
                 let name = "未命名文件夹".to_string();
                 self.finish_create_folder(parent, name, cx)
+            }
+            PendingAction::CreateFile { parent, template } => {
+                let name = ops::fresh_file_path(&parent, template)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("未命名{}", template.extension));
+                self.finish_create_file(parent, name, template, cx)
             }
             PendingAction::Rename { path } => {
                 let name = path
@@ -708,6 +786,9 @@ impl Ops {
         match prompt.action {
             PendingAction::CreateFolder { parent, .. } => {
                 self.finish_create_folder(parent, value, cx)
+            }
+            PendingAction::CreateFile { parent, template } => {
+                self.finish_create_file(parent, value, template, cx)
             }
             PendingAction::Rename { path, .. } => self.finish_rename(path, value, cx),
             _ => {}
@@ -742,7 +823,40 @@ impl Ops {
         match ops::create_folder_named(&parent, &name) {
             Ok(path) => {
                 self.prompt = None;
-                self.history
+                self.kernel
+                    .history_mut()
+                    .push(ops::HistoryEntry::Created { path: path.clone() });
+                self.last_message = Some(crate::i18n::Message::args(
+                    "已创建“{name}”",
+                    &[("name", display_name(&path))],
+                ));
+                self.last_message_is_error = false;
+                cx.emit(OpsEvent::PromptChanged { open: false });
+                cx.notify();
+                cx.emit(OpsEvent::Changed {
+                    removed: Vec::new(),
+                    changed: vec![path],
+                    renamed_to: Vec::new(),
+                });
+            }
+            Err(error) => self.reject_prompt(error, cx),
+        }
+    }
+
+    fn finish_create_file(
+        &mut self,
+        parent: PathBuf,
+        name: String,
+        template: &'static crate::templates::FileTemplate,
+        cx: &mut Context<Self>,
+    ) {
+        match ops::create_file_from_template(&parent, &name, template) {
+            Ok(path) => {
+                self.prompt = None;
+                // 撤销就是把新文件删掉：`HistoryEntry::Created` 的撤销对文件
+                // 走 `remove_file`，对目录才要求"必须为空"（见 `remove_any`）。
+                self.kernel
+                    .history_mut()
                     .push(ops::HistoryEntry::Created { path: path.clone() });
                 self.last_message = Some(crate::i18n::Message::args(
                     "已创建“{name}”",
@@ -765,9 +879,9 @@ impl Ops {
         match ops::rename(&path, &name) {
             Ok(renamed) => {
                 // 先把更早的记录指向新路径，再压入本次记录，避免改到自己头上。
-                self.history.note_renamed(&path, &renamed);
+                self.kernel.history_mut().note_renamed(&path, &renamed);
                 self.prompt = None;
-                self.history.push(ops::HistoryEntry::Renamed {
+                self.kernel.history_mut().push(ops::HistoryEntry::Renamed {
                     from: path.clone(),
                     to: renamed.clone(),
                 });
@@ -798,7 +912,7 @@ impl Ops {
 
     fn run_undo(&mut self, cx: &mut Context<Self>) {
         // 先取出栈顶涉及的路径（撤销前后都要刷新），再执行。
-        let involved = self.history.last_paths();
+        let involved = self.kernel.history().last_paths();
         // 客户端要在主线程上取好再交给撤销：它跑在后台线程里。
         let clients = self.clients_for(&involved, cx);
         if clients.is_empty() {
@@ -808,7 +922,7 @@ impl Ops {
         // 撤销涉及远程：搬回去要下载或上传，那是网络，不能堵在 UI 线程上。
         // 撤销栈整条搬进后台线程，跑完再原样搬回来——
         // 撤不动时要能把这条记录放回栈里重试，所以不能只搬栈顶一条。
-        let history = std::mem::take(&mut self.history);
+        let history = self.kernel.take_history();
         self.enqueue(
             Job {
                 label: "正在撤销…".to_string(),
@@ -835,7 +949,7 @@ impl Ops {
         involved: &[PathBuf],
         cx: &mut Context<Self>,
     ) {
-        match self.history.pop_undo(clients) {
+        match self.kernel.history_mut().pop_undo(clients) {
             Ok(describe) => {
                 self.last_message = Some(crate::i18n::Message::caused("已撤销{what}", describe));
                 self.last_message_is_error = false;
@@ -983,6 +1097,13 @@ impl Ops {
         // 限速可能刚在面板里改过：每一趟开工前都照设置重设一次，
         // 这样不必在"改设置"那条路上到处找谁来同步。
         let limit = Settings::read(cx).speed_limit;
+        // 链接策略同样开工前从设置取一次：GUI 的搬运走自己的后台线程，
+        // 不经过契约层的 Kernel；两边用的是同一个 LinkPolicy / CopyOptions
+        // 和同一组 ops::*_with_options，核心逻辑仍然只有一份。
+        let options = crate::entry_kind::CopyOptions {
+            link_policy: Settings::read(cx).link_policy(),
+            ..crate::entry_kind::CopyOptions::default()
+        };
         if let Ok(mut limiter) = self.limiter.lock() {
             limiter.set_rate(limit);
         }
@@ -1030,11 +1151,32 @@ impl Ops {
                         tx.try_send(WorkerMessage::Progress(progress.clone()))
                             .is_ok()
                     };
-                    let outcome = if cut {
-                        ops::move_entries(&sources, &dest, policy, &remote, &mut report)
+                    let mut outcome = if cut {
+                        ops::move_entries_with_options(
+                            &sources,
+                            &dest,
+                            policy,
+                            &remote,
+                            &mut report,
+                            options,
+                        )
                     } else {
-                        ops::copy_entries(&sources, &dest, policy, &remote, &mut report)
+                        ops::copy_entries_with_options(
+                            &sources,
+                            &dest,
+                            policy,
+                            &remote,
+                            &mut report,
+                            options,
+                        )
                     };
+                    // 跨卷搬运前扫一遍元数据丢失风险（AGENTS.md 铁律）。
+                    // 在这条后台线程里跑：`xattr` / ADS 枚举都要起系统调用，
+                    // 放 UI 线程会把窗口卡住。结果并进 warnings，
+                    // 搬完由状态栏那句话统一说清楚，不额外弹窗打断。
+                    if let Some(note) = crate::entry_kind::metadata_risk_note(&sources, &dest) {
+                        outcome.warnings.push(note);
+                    }
                     let aborted = control.state() == ControlState::Aborting;
                     let _ = tx.try_send(WorkerMessage::Done(JobResult::Transferred {
                         outcome,
@@ -1067,16 +1209,22 @@ impl Ops {
         cx.notify();
     }
 
-    fn start_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    fn start_delete(&mut self, paths: Vec<PathBuf>, mode: ops::DeleteMode, cx: &mut Context<Self>) {
         let total = paths.len();
+        let clients = self.clients_for(&paths, cx);
+        let label = if mode == ops::DeleteMode::Trash {
+            format!("正在移到回收站 {total} 项")
+        } else {
+            format!("正在删除 {total} 项")
+        };
         self.enqueue(
             Job {
-                label: format!("正在移到回收站 {total} 项"),
+                label,
                 total,
                 can_pause: false,
                 run: Box::new(move |_control, tx| {
-                    let trashed = ops::trash(&paths);
-                    let _ = tx.try_send(WorkerMessage::Done(JobResult::Trashed(trashed)));
+                    let outcome = ops::delete(&paths, mode, &clients);
+                    let _ = tx.try_send(WorkerMessage::Done(JobResult::Deleted(outcome)));
                 }),
             },
             cx,
@@ -1158,27 +1306,50 @@ impl Ops {
         self.running = None;
         self.control = None;
         match result {
-            JobResult::Trashed(trashed) => {
-                if trashed.is_empty() {
-                    self.last_message = Some(crate::i18n::Message::msg("没有项目能移进回收站"));
-                    self.last_message_is_error = true;
-                } else {
-                    // 删除会让更早的“新建/复制”记录失效，先清理再压栈。
-                    for (path, _) in &trashed {
-                        self.history.note_removed(path);
-                    }
-                    self.history.push(ops::HistoryEntry::Trashed {
-                        originals: trashed.clone(),
+            JobResult::Deleted(outcome) => {
+                let deleted = outcome.deleted.len();
+                let failed = outcome.failed.len();
+                let to_trash = outcome.mode == ops::DeleteMode::Trash;
+
+                // 删掉的东西会让更早的“新建/复制”记录失效，两种方式都要清理。
+                for path in &outcome.deleted {
+                    self.kernel.history_mut().note_removed(path);
+                }
+                // **只有回收站能撤销**。彻底删除进栈会让 Cmd+Z 去回收站
+                // 找一条根本不存在的记录，比没有撤销更糟。
+                if to_trash && !outcome.trashed_at.is_empty() {
+                    self.kernel.history_mut().push(ops::HistoryEntry::Trashed {
+                        originals: outcome.trashed_at.clone(),
                     });
-                    let removed: Vec<PathBuf> =
-                        trashed.iter().map(|(path, _)| path.clone()).collect();
-                    self.last_message = Some(crate::i18n::Message::args(
+                }
+
+                let mut message = if deleted == 0 && failed > 0 {
+                    crate::i18n::Message::msg("没有项目能删除")
+                } else if to_trash {
+                    crate::i18n::Message::args(
                         "已移到回收站 {count} 项",
-                        &[("count", trashed.len().to_string())],
-                    ));
-                    self.last_message_is_error = false;
+                        &[("count", deleted.to_string())],
+                    )
+                } else {
+                    crate::i18n::Message::args(
+                        "已彻底删除 {count} 项（不能撤销）",
+                        &[("count", deleted.to_string())],
+                    )
+                };
+                if let Some((path, reason)) = outcome.failed.first() {
+                    message = message.then_caused_clause(
+                        "{count} 项失败（{name}：{error}）",
+                        &[("count", failed.to_string()), ("name", display_name(path))],
+                        reason.clone(),
+                    );
+                }
+                self.last_message = Some(message);
+                self.last_message_is_error = failed > 0;
+                log_delete(&outcome);
+
+                if !outcome.deleted.is_empty() {
                     cx.emit(OpsEvent::Changed {
-                        removed,
+                        removed: outcome.deleted.clone(),
                         changed: Vec::new(),
                         renamed_to: Vec::new(),
                     });
@@ -1188,11 +1359,13 @@ impl Ops {
                 if !renamed.is_empty() {
                     // 先把更早的记录指向新路径，再压入整批记录。
                     for (from, to) in &renamed {
-                        self.history.note_renamed(from, to);
+                        self.kernel.history_mut().note_renamed(from, to);
                     }
-                    self.history.push(ops::HistoryEntry::BulkRenamed {
-                        moves: renamed.clone(),
-                    });
+                    self.kernel
+                        .history_mut()
+                        .push(ops::HistoryEntry::BulkRenamed {
+                            moves: renamed.clone(),
+                        });
                 }
                 let mut message = crate::i18n::Message::args(
                     "已重命名 {count} 项",
@@ -1255,11 +1428,11 @@ impl Ops {
                 };
 
                 if cut {
-                    self.history.push(ops::HistoryEntry::Moved {
+                    self.kernel.history_mut().push(ops::HistoryEntry::Moved {
                         moves: outcome.transfers.clone(),
                     });
                 } else if !outcome.touched.is_empty() {
-                    self.history.push(ops::HistoryEntry::Copied {
+                    self.kernel.history_mut().push(ops::HistoryEntry::Copied {
                         created: outcome.touched.clone(),
                     });
                 }
@@ -1275,7 +1448,8 @@ impl Ops {
                     cx.emit(OpsEvent::ClipboardChanged);
                 }
 
-                self.last_message = Some(summarize(&outcome, cut, aborted));
+                // 结论那句话由 core 拼：新前端与这里必须说同一句。
+                self.last_message = Some(ops::summarize(&outcome, cut, aborted));
                 self.last_message_is_error = !outcome.failed.is_empty();
                 log_transfer(&outcome, cut, aborted);
                 cx.emit(OpsEvent::Changed {
@@ -1296,7 +1470,7 @@ impl Ops {
                 result,
             } => {
                 // 栈整条先还回来：撤不动时那条记录还在里面，可以再试一次。
-                self.history = history;
+                self.kernel.put_history(history);
                 match result {
                     Ok(describe) => {
                         self.last_message =
@@ -1354,49 +1528,28 @@ fn log_transfer(outcome: &Outcome, cut: bool, aborted: bool) {
     }
 }
 
-/// 一次搬运的结论，主句加若干**条件出现**的子句。
-///
-/// 返回 `Msg` 而不是 `String`：子句里的失败原因本身是一个 `Msg`
-/// （上一批刚把它结构化），拼成字符串就把它冻成中文了。
-/// 英文那边动词是过去式、子句是分词短语，语序跟中文不同——
-/// 所以主句与子句各自一条 key，渲染时 [`Message::then_clause`] 按语言接起来。
-fn summarize(outcome: &Outcome, cut: bool, aborted: bool) -> crate::i18n::Msg {
-    use crate::i18n::Message;
-    let done = outcome.done.to_string();
-    let mut message = if aborted {
-        Message::args(
-            if cut {
-                "已中止：移动完成 {count} 项"
-            } else {
-                "已中止：拷贝完成 {count} 项"
-            },
-            &[("count", done)],
-        )
-    } else if cut {
-        Message::args("移动完成 {count} 项", &[("count", done)])
+/// 删除的日志。「回收站」和「彻底删除」必须能分辨——用户回头来查
+/// "我的东西哪去了"，这两者的答案完全不同（一个能捞回来，一个不能）。
+fn log_delete(outcome: &ops::DeleteOutcome) {
+    use crate::logfile::{self, Level};
+    let how = if outcome.mode == ops::DeleteMode::Trash {
+        "回收站"
     } else {
-        Message::args("拷贝完成 {count} 项", &[("count", done)])
+        "彻底删除"
     };
-    // 中止时报跳过没有意义：那些是被用户叫停的，不是"跳过了"。
-    if outcome.skipped > 0 && !aborted {
-        message = message.then_clause(Message::args(
-            "跳过 {count} 项",
-            &[("count", outcome.skipped.to_string())],
-        ));
+    let mut head = format!("删除结束（{how}）：完成 {} 项", outcome.deleted.len());
+    if outcome.failed.is_empty() {
+        logfile::log(Level::Info, &head);
+    } else {
+        head.push_str(&format!("，失败 {} 项", outcome.failed.len()));
+        logfile::log(Level::Error, &head);
+        for (path, why) in &outcome.failed {
+            logfile::log(Level::Error, &format!("  失败 {}：{why}", path.display()));
+        }
     }
-    if let Some((path, reason)) = outcome.failed.first() {
-        message = message.then_caused_clause(
-            "{count} 项失败（{name}：{error}）",
-            &[
-                ("count", outcome.failed.len().to_string()),
-                ("name", display_name(path)),
-            ],
-            reason.clone(),
-        );
-    }
-    message
 }
 
+/// 文件名（没有就整条路径）。只用于拼给人看的句子。
 fn display_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())

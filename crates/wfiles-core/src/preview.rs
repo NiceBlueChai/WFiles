@@ -79,6 +79,24 @@ impl Kind {
             Self::Image | Self::Pdf | Self::Audio | Self::Video | Self::Archive
         )
     }
+
+    /// 稳定的机器可读 id（`"image"` / `"pdf"` / …）。
+    ///
+    /// 界面要按类型分支（比如"是图片才画缩略图"）时用这个，**不要拿
+    /// [`Kind::label`] 去比中文**：文案会改、会本地化，而分支逻辑不该跟着变。
+    /// 与 `label()` 相邻放着，加新类型时两处一起改——单测会盯着它们是否一一对应。
+    pub fn id(&self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Pdf => "pdf",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Archive => "archive",
+            Self::Text => "text",
+            Self::Code => "code",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// 读出来的文本内容。
@@ -401,6 +419,60 @@ const TEXT: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 界面靠 `Kind::id()` 分支出"要不要画缩略图"，所以这张表不能有洞：
+    /// 互不相同、全是小写 ASCII、且一个都不能空。新加一种类型忘了写 id
+    /// （比如复制粘贴后留着旧值）会在这里红。
+    #[test]
+    fn kind_ids_are_distinct_machine_readable() {
+        let all = [
+            Kind::Image,
+            Kind::Pdf,
+            Kind::Audio,
+            Kind::Video,
+            Kind::Archive,
+            Kind::Text,
+            Kind::Code,
+            Kind::Other,
+        ];
+        let ids: Vec<&str> = all.iter().map(|k| k.id()).collect();
+
+        for id in &ids {
+            assert!(!id.is_empty(), "id 不能是空串");
+            assert!(
+                id.chars().all(|c| c.is_ascii_lowercase()),
+                "id 必须是小写 ASCII，界面拿它做比较：{id:?}"
+            );
+        }
+
+        let unique: std::collections::BTreeSet<&&str> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "有两个类型共用了同一个 id：{ids:?}");
+    }
+
+    /// 图片这一支必须叫 `image`：NSH 客户端与后续前端都按它判缩略图。
+    /// 改名字不是重构，是改契约。
+    #[test]
+    fn image_id_is_stable() {
+        assert_eq!(Kind::Image.id(), "image");
+    }
+
+    /// `label()` 与 `id()` 必须一一对应：加类型时只改一处的话，
+    /// 会出现"有 id 没中文"或"有中文没 id"的半截状态。
+    #[test]
+    fn every_kind_has_both_label_and_id() {
+        for kind in [
+            Kind::Image,
+            Kind::Pdf,
+            Kind::Audio,
+            Kind::Video,
+            Kind::Archive,
+            Kind::Text,
+            Kind::Code,
+            Kind::Other,
+        ] {
+            assert!(!kind.label().is_empty(), "{:?} 少了中文标签", kind.id());
+        }
+    }
 
     fn write(name: &str, contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let root = tempfile::tempdir().unwrap();

@@ -194,7 +194,7 @@ impl Search {
                 };
                 // 符号链接一概不跟：目录环、`/proc` 那种无限深，
                 // 都能把搜索拖到天荒地老。
-                if file_type.is_symlink() {
+                if crate::entry_kind::is_link_or_junction(&entry) {
                     continue;
                 }
                 let is_dir = file_type.is_dir();

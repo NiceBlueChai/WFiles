@@ -13,7 +13,7 @@
 
 use crate::ops::Control;
 use digest::Digest;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -121,7 +121,7 @@ pub fn size_of(
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if kind.is_symlink() {
+            if crate::entry_kind::is_link_or_junction(&entry) {
                 continue;
             }
             if kind.is_dir() {
@@ -234,6 +234,8 @@ pub fn duplicates(
 ) -> DupStats {
     let mut stats = DupStats::default();
     let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    // 硬链接去重：同一份数据只让第一个名字参加比对。
+    let mut seen_ids: HashSet<(u64, u64)> = HashSet::new();
 
     let mut stack = vec![options.root.clone()];
     while let Some(dir) = stack.pop() {
@@ -252,7 +254,7 @@ pub fn duplicates(
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if kind.is_symlink() {
+            if crate::entry_kind::is_link_or_junction(&entry) {
                 continue;
             }
             let path = entry.path();
@@ -266,8 +268,18 @@ pub fn duplicates(
             if !kind.is_file() {
                 continue;
             }
-            let bytes = entry.metadata().map_or(0, |it| it.len());
+            let metadata = entry.metadata().ok();
+            let bytes = metadata.as_ref().map_or(0, |it| it.len());
             if bytes < options.min_bytes {
+                continue;
+            }
+            // 同一 inode 的多个硬链接**不是**「重复文件」：它们是同一份数据，
+            // 删掉一个不释放任何空间，报给用户只会让人误删。
+            // 按 (dev, ino) 只留第一个名字参与比对。拿不到身份（Windows）
+            // 就照旧——宁可多报，也不能把两份真数据当成一份。
+            if let Some(id) = metadata.as_ref().and_then(crate::entry_kind::file_identity)
+                && !seen_ids.insert(id)
+            {
                 continue;
             }
             stats.scanned += 1;
@@ -643,6 +655,21 @@ mod tests {
         assert_eq!(groups[0].paths.len(), 2);
         assert_eq!(groups[0].bytes, 15);
         assert_eq!(stats.wasted, 15, "删掉一个省 15 字节");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_are_not_reported_as_duplicates() {
+        // 同一份数据的两个名字：删掉一个**不释放任何空间**，
+        // 当成"重复文件"报出来只会引导用户白删。
+        let root = TempDir::new().expect("临时目录");
+        write(root.path().join("a.txt"), "0123456789");
+        fs::hard_link(root.path().join("a.txt"), root.path().join("b.txt")).expect("建硬链接");
+
+        let (groups, stats) = dups(root.path());
+        assert!(groups.is_empty(), "硬链接不是重复文件：{groups:?}");
+        assert_eq!(stats.wasted, 0);
+        assert_eq!(stats.scanned, 1, "同一 (dev, ino) 只算一个名字");
     }
 
     #[test]

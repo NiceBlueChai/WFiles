@@ -2,6 +2,8 @@
 //!
 //! 这一层不依赖任何 UI 类型：它只负责读目录、排序、过滤，以及记住哪些路径被选中。
 
+use crate::entry_kind::{self, EntryKind};
+
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -32,6 +34,9 @@ pub struct FileEntry {
     /// 每敲一个过滤字母就要扫一遍全部条目，而 `starts_with('.')`
     /// 虽然便宜，十 万次字符串切片在一帧里仍能感觉到。
     hidden: bool,
+    /// 这一项到底是什么（普通项 / 链接 / 联接点 / 硬链接 / 快捷方式 / 云占位）。
+    /// 三平台共用一份判定，见 `entry_kind`。
+    pub kind: EntryKind,
 }
 
 impl FileEntry {
@@ -69,6 +74,11 @@ impl FileEntry {
             created: None,
             sort_name,
             sort_kind,
+            kind: if is_dir {
+                EntryKind::Directory
+            } else {
+                EntryKind::File
+            },
         }
     }
 
@@ -76,6 +86,7 @@ impl FileEntry {
         let path = dir_entry.path();
         let name = path.file_name()?.to_string_lossy().into_owned();
         let metadata = Self::metadata_of(dir_entry, &path)?;
+        let kind = entry_kind::classify(&entry_kind::probe(dir_entry));
         let sort_kind = if metadata.is_dir() {
             String::new()
         } else {
@@ -97,6 +108,7 @@ impl FileEntry {
                 .ok()
                 .filter(|time| *time != SystemTime::UNIX_EPOCH),
             sort_kind,
+            kind,
         })
     }
 
@@ -145,10 +157,19 @@ impl FileEntry {
             size,
             modified,
             created: None,
+            kind: if is_dir {
+                EntryKind::Directory
+            } else {
+                EntryKind::File
+            },
         }
     }
 
     pub fn kind_label(&self) -> String {
+        // 特殊对象优先报自己的身份，别被扩展名盖过去（铁律 5）。
+        if !matches!(self.kind, EntryKind::File | EntryKind::Directory) {
+            return self.kind.label().to_owned();
+        }
         if self.is_dir {
             return "文件夹".to_string();
         }
@@ -157,6 +178,26 @@ impl FileEntry {
         }
 
         format!("{} 文件", self.sort_kind.to_uppercase())
+    }
+
+    /// 特殊对象的类型名是 i18n key，交给界面按当前语言翻译。
+    ///
+    /// 普通文件/目录返回 `None`：它们走 `kind_label()` 的既有文案
+    /// （`"RS 文件"` 这类动态串不是表里的 key，硬送进 `tr` 反而会把
+    /// 「文件」误翻成表头用的 "Files"）。
+    pub fn kind_label_key(&self) -> Option<&'static str> {
+        if matches!(self.kind, EntryKind::File | EntryKind::Directory) {
+            None
+        } else {
+            Some(self.kind.label())
+        }
+    }
+
+    /// 链接 / 快捷方式指向哪儿，给界面显示在详情里。
+    pub fn link_target_text(&self) -> Option<String> {
+        self.kind
+            .target()
+            .map(|path| path.to_string_lossy().into_owned())
     }
 }
 

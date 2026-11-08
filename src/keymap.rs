@@ -82,9 +82,15 @@ impl KeyMap {
 pub fn defaults(command: PaneCommand) -> &'static [&'static str] {
     match command {
         PaneCommand::NewFolder => &["cmd-shift-n"],
+        // 新建文件（空白）。要别的模板走命令面板，别为八个模板占八个快捷键。
+        PaneCommand::NewFile => &["cmd-alt-n"],
         PaneCommand::Rename => &["f2"],
         PaneCommand::BulkRename => &["cmd-shift-r"],
         PaneCommand::Trash => &["cmd-backspace"],
+        // 跟 macOS Finder 的「立即删除」同一个键位（⌥⌘⌫ 换成 shift 是因为
+        // `cmd-alt-backspace` 在某些输入法下会被吞）。这一条**不可撤销**，
+        // 所以它不参与「可移动介质自动降级」——用户已经显式要求了。
+        PaneCommand::DeletePermanently => &["cmd-shift-backspace"],
         PaneCommand::Copy => &["cmd-c"],
         PaneCommand::Cut => &["cmd-x"],
         PaneCommand::Paste => &["cmd-v"],

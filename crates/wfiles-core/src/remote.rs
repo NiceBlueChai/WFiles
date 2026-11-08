@@ -307,7 +307,19 @@ pub fn open(config: &Config, password: &str) -> Result<Client, crate::i18n::Msg>
     let client: Client = match config.kind {
         Kind::WebDav => std::sync::Arc::new(Dav::new(config, password)?),
         Kind::S3 => std::sync::Arc::new(crate::s3::S3::new(config, password)?),
-        Kind::Sftp => std::sync::Arc::new(crate::sftp::Sftp::new(config, password)?),
+        Kind::Sftp => {
+            // `sftp` 是可选 feature（见 `Cargo.toml`）。关掉时**明确报错**，
+            // 别让界面显示一个按了没反应的选项。
+            #[cfg(feature = "sftp")]
+            {
+                std::sync::Arc::new(crate::sftp::Sftp::new(config, password)?)
+            }
+            #[cfg(not(feature = "sftp"))]
+            {
+                let _ = password;
+                return Err(crate::i18n::Message::msg("这个构建没有包含 SFTP 支持"));
+            }
+        }
         Kind::Ftp => std::sync::Arc::new(crate::ftp::Ftp::new(config, password)?),
     };
     Ok(client)
@@ -958,9 +970,9 @@ fn leap(year: i64) -> bool {
 /// 也能真的连一次，而不是只在协议层自测。
 /// 一份三项目的 PROPFIND 响应：目录 `folder` 里有一个文件和一个子目录。
 ///
-/// 测试用（协议层的解析、假服务器的目录列表都靠它），所以标了 `#[cfg(test)]`
-/// 之外的普通私有常量——`fake` 模块在 `#[cfg(test)]` 下，能看见它。
-#[cfg(test)]
+/// 测试用（协议层的解析、假服务器的目录列表都靠它），所以标了 `#[cfg(any(test, feature = "test-support"))]`
+/// 之外的普通私有常量——`fake` 模块在 `#[cfg(any(test, feature = "test-support"))]` 下，能看见它。
+#[cfg(any(test, feature = "test-support"))]
 const MULTISTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:multistatus xmlns:d="DAV:">
   <d:response>
@@ -989,7 +1001,7 @@ const MULTISTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 
 /// 只描述一个文件的 PROPFIND 响应：`stat` 取的是第一项，
 /// 问"某个文件在不在"时服务器回的就是这种。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const FILESTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:multistatus xmlns:d="DAV:">
   <d:response>
@@ -1014,7 +1026,7 @@ const FILESTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 ///
 /// 1 MB 配 8 KB 一块就是一百多块，停在哪都不可能贴着末尾。
 /// 分块边界本身也别指望 socket：见 [`write_chunked`]。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const BIG_LEN: usize = 1024 * 1024;
 
 /// 假服务器分块写正文时每块多大。
@@ -1026,14 +1038,14 @@ const BIG_LEN: usize = 1024 * 1024;
 /// 得比 `io::copy` 的缓冲**大**才有意义：分块 4 KB 的话，客户端读满自己
 /// 8 KB 的缓冲照样把两块一起拿走，等于什么都没做。16 KB 才是真的把边界
 /// 按在这儿定的——实测每块降到 4096 字节。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const CHUNK: usize = 16 * 1024;
 
 /// 写 HTTP 正文：按 [`CHUNK`] 分块写，每块之间 `flush` 一次。
 ///
 /// 每块都 flush 是关键。不 flush 的话这几块会一起进内核缓冲，
 /// 客户端照样一次全读完——那就等于什么都没做。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn write_chunked(stream: &mut impl std::io::Write, payload: &[u8]) {
     for piece in payload.chunks(CHUNK) {
         let _ = stream.write_all(piece);
@@ -1043,14 +1055,14 @@ fn write_chunked(stream: &mut impl std::io::Write, payload: &[u8]) {
 
 /// `big.bin` 的内容：按序号取模，第 i 个字节就是 `(i % 251)`。
 /// 断点接错地方（比如漏了几个字节）对得上对不上，一比就知道。
-#[cfg(test)]
-pub(crate) fn big_bytes() -> Vec<u8> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn big_bytes() -> Vec<u8> {
     (0..BIG_LEN).map(|ix| (ix % 251) as u8).collect()
 }
 
 /// `big.bin` 的 PROPFIND 响应：大小必须跟 [`big_bytes`] 一致，
 /// 不然续传账本会以为源变了。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn big_status() -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -1072,17 +1084,17 @@ fn big_status() -> String {
 ///
 /// [`big_bytes`] 反而不适合验这个——它有多大全看 socket 缓冲，
 /// 这块缓冲一变，"一次读完全文"就从必然变成偶尔，测试就成了薛定谔的。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const SMALL_LEN: usize = 64;
 
 /// [`big_bytes`] 的小号版，同样按序号取模，好逐字节核对。
-#[cfg(test)]
-pub(crate) fn small_bytes() -> Vec<u8> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn small_bytes() -> Vec<u8> {
     (0..SMALL_LEN).map(|ix| (ix % 251) as u8).collect()
 }
 
 /// `small.bin` 的 PROPFIND 响应，大小跟 [`small_bytes`] 一致。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn small_status() -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -1100,8 +1112,8 @@ fn small_status() -> String {
     )
 }
 
-#[cfg(test)]
-pub(crate) mod fake {
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake {
     use super::{FILESTATUS, MULTISTATUS, big_bytes, big_status, small_bytes, small_status};
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};

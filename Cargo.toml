@@ -6,7 +6,15 @@ description = "A fast, cross-platform file manager built with GPUI Kit"
 license = "MIT"
 publish = false
 
+[workspace]
+members = ["crates/wfiles-core"]
+# 根上敲 `cargo test` / `cargo build` 时两个 crate 一起跑：core 的纯逻辑测试
+# 以前属于主 crate，拆出去之后不能变成「默认不跑」的那种绿。
+default-members = [".", "crates/wfiles-core"]
+
 [dependencies]
+wfiles-core = { path = "crates/wfiles-core" }
+# 界面层只单向依赖 core；core 的依赖表里没有 gpui-kit。
 gpui-kit = "0.7.1"
 async-channel = "2.5.0"
 dirs = "6"
@@ -78,3 +86,6 @@ ttf-parser = { opt-level = 3 }
 # 只在 cargo test 时生效，不影响正式构建。
 gpui-kit = { version = "0.7.1", features = ["test-support"] }
 tempfile = "3.27.0"
+# 集成测试要借 core 的假远程服务器（`remote::fake`）。依赖 crate 不会以
+# cfg(test) 编译，只能用 feature 把夹具开放出去；正式构建不带这个 feature。
+wfiles-core = { path = "crates/wfiles-core", features = ["test-support"] }
