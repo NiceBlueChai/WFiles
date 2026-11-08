@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>搜索与预览工具集成参考 · WFiles</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: #f5f7f8;
+      --surface: #ffffff;
+      --ink: #26323b;
+      --muted: #586773;
+      --line: #d7dfe4;
+      --accent: #175f68;
+      --tint: #edf4f5;
+      --code: #eff2f4;
+      --table-head: #f0f4f6;
+      --focus: #167381;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-padding-top: 1.5rem; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 16px;
+      line-height: 1.85;
+      overflow-wrap: anywhere;
+    }
+    a {
+      color: var(--accent);
+      text-decoration-thickness: 1px;
+      text-underline-offset: .2em;
+    }
+    a:hover { text-decoration-thickness: 2px; }
+    :focus-visible { outline: 3px solid var(--focus); outline-offset: 4px; }
+    .skip-link {
+      position: absolute;
+      top: .75rem;
+      left: 1rem;
+      z-index: 2;
+      padding: .5rem 1rem;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      transform: translateY(-200%);
+    }
+    .skip-link:focus { transform: translateY(0); }
+    .layout {
+      display: grid;
+      grid-template-columns: 14rem minmax(0, 1fr);
+      gap: 3rem;
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 3rem 2rem 5rem;
+      align-items: start;
+    }
+    .sidebar { position: sticky; top: 2rem; min-width: 0; }
+    .brand {
+      margin: 0 0 .25rem;
+      color: var(--accent);
+      font-size: .8rem;
+      font-weight: 700;
+      letter-spacing: .12em;
+    }
+    .nav-title { margin: 0 0 1.25rem; font-weight: 600; }
+    nav {
+      max-height: calc(100vh - 8rem);
+      overflow-y: auto;
+      padding: .3rem;
+      margin: -.3rem;
+      font-size: .875rem;
+    }
+    nav ol { margin: 0; padding: 0; list-style: none; }
+    nav a {
+      display: block;
+      padding: .55rem .75rem;
+      border-left: 2px solid var(--line);
+      color: var(--muted);
+      text-decoration: none;
+    }
+    nav a:hover, nav a:focus-visible {
+      border-left-color: var(--accent);
+      background: var(--tint);
+      color: var(--accent);
+    }
+    .source-link { display: inline-block; margin: 1.25rem .75rem .3rem; }
+    main { min-width: 0; }
+    .reading-note {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .25rem 1rem;
+      justify-content: space-between;
+      margin: 0 0 1.25rem;
+      color: var(--muted);
+      font-size: .8125rem;
+    }
+    article {
+      padding: 2.75rem;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: .625rem;
+      min-width: 0;
+    }
+    h1, h2, h3 { line-height: 1.45; font-weight: 650; }
+    h1 { margin: 0 0 1.75rem; font-size: clamp(1.75rem, 3vw, 2.35rem); letter-spacing: -.035em; }
+    h2 { margin: 0 0 1.25rem; font-size: 1.45rem; letter-spacing: -.02em; }
+    h3 { margin: 2rem 0 1rem; font-size: 1.1rem; }
+    section { margin-top: 3rem; padding-top: 2rem; border-top: 1px solid var(--line); }
+    [id] { scroll-margin-top: 1rem; }
+    h2:target, h3:target { color: var(--accent); }
+    p { margin: 0 0 1rem; }
+    blockquote {
+      margin: 0;
+      padding: 1.15rem 1.35rem;
+      border-left: 3px solid var(--accent);
+      border-radius: 0 .375rem .375rem 0;
+      background: var(--tint);
+      font-size: .9rem;
+    }
+    blockquote p:first-child { font-weight: 600; }
+    blockquote p:last-child, section > :last-child { margin-bottom: 0; }
+    ul, ol { padding-left: 1.5rem; margin: 1rem 0 1.5rem; }
+    li { margin: .65rem 0; padding-left: .15rem; }
+    li::marker { color: var(--muted); }
+    strong { font-weight: 650; }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: .875em;
+    }
+    :not(pre) > code {
+      padding: .12em .3em;
+      border-radius: .2rem;
+      background: var(--code);
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      border: 1px solid var(--line);
+      border-radius: .375rem;
+      background: var(--code);
+      line-height: 1.8;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      tab-size: 2;
+    }
+    pre code { font-size: inherit; }
+    .table-scroll {
+      max-width: 100%;
+      min-width: 0;
+      overflow-x: auto;
+      margin: 1.5rem 0;
+      border: 1px solid var(--line);
+      border-radius: .375rem;
+      overscroll-behavior-x: contain;
+    }
+    table {
+      width: 100%;
+      min-width: 36rem;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: .875rem;
+      line-height: 1.8;
+    }
+    .wide-table { min-width: 42rem; }
+    th, td { padding: .9rem 1rem; vertical-align: top; }
+    th { background: var(--table-head); font-weight: 650; }
+    td { border-top: 1px solid var(--line); }
+    td:first-child { font-weight: 550; }
+    th:first-child, td:first-child { width: 22%; }
+    .wide-table th:first-child, .wide-table td:first-child { width: 18%; }
+    tbody tr:hover { background: var(--tint); }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #151c22;
+        --surface: #1c252c;
+        --ink: #e0e7ec;
+        --muted: #a9b8c3;
+        --line: #3b4a55;
+        --accent: #91cbd0;
+        --tint: #24353b;
+        --code: #29353f;
+        --table-head: #27343d;
+        --focus: #9edce2;
+      }
+    }
+    @media (max-width: 1050px) {
+      .layout { gap: 1.75rem; padding: 2rem 1.5rem 4rem; grid-template-columns: 12.5rem minmax(0, 1fr); }
+      article { padding: 2rem; }
+    }
+    @media (max-width: 780px) {
+      .layout { display: block; padding: 1.5rem 1rem 3rem; }
+      .sidebar { position: static; margin-bottom: 2rem; }
+      .nav-title { margin-bottom: .75rem; }
+      nav { max-height: none; }
+      nav ol { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .source-link { margin-top: .75rem; }
+      article { padding: 1.5rem; }
+      section { margin-top: 2.25rem; padding-top: 1.75rem; }
+    }
+    @media (max-width: 420px) {
+      .layout { padding: 1.25rem .75rem 2rem; }
+      article { padding: 1.25rem 1rem; }
+      nav ol { grid-template-columns: minmax(0, 1fr); }
+      h2 { font-size: 1.3rem; }
+      blockquote { padding: 1rem; }
+      th, td { padding: .75rem; }
+    }
+    @media print {
+      :root {
+        color-scheme: light;
+        --page: #ffffff;
+        --surface: #ffffff;
+        --ink: #111111;
+        --muted: #444444;
+        --line: #aaaaaa;
+        --accent: #111111;
+        --tint: #ffffff;
+        --code: #ffffff;
+        --table-head: #ffffff;
+      }
+      @page { margin: 15mm; }
+      body { font-size: 10pt; line-height: 1.65; }
+      .sidebar, .skip-link, .reading-note { display: none; }
+      .layout { display: block; max-width: none; margin: 0; padding: 0; }
+      article { padding: 0; border: 0; border-radius: 0; }
+      h1 { font-size: 22pt; }
+      h2 { font-size: 15pt; }
+      h3 { font-size: 12pt; }
+      h1, h2, h3 { break-after: avoid; }
+      section { margin-top: 1.5rem; padding-top: 1rem; }
+      blockquote { border-left-width: 2px; }
+      .table-scroll { overflow: visible; max-width: none; border: 0; border-radius: 0; }
+      table, table.wide-table { min-width: 0; width: 100%; table-layout: fixed; font-size: 9pt; }
+      thead { display: table-header-group; }
+      th, td { padding: .5rem; border: 1px solid var(--line); overflow-wrap: anywhere; }
+      tr { break-inside: avoid; }
+      pre { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; }
+      a { color: inherit; }
+      a[href^="https://"]::after { content: " (" attr(href) ")"; font-size: .85em; overflow-wrap: anywhere; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#document">跳到正文</a>
+  <div class="layout">
+    <aside class="sidebar" aria-label="文档导航">
+      <p class="brand">WFILES / DOCS</p>
+      <p class="nav-title" id="toc-title">搜索与预览工具集成参考</p>
+      <nav aria-labelledby="toc-title">
+        <ol>
+          <li><a href="#conclusion">1. 先看结论</a></li>
+          <li><a href="#cli-and-libraries">2. CLI 与库不是一回事</a></li>
+          <li><a href="#current-code">3. 当前代码已经有什么</a></li>
+          <li><a href="#ownership">4. 分层、数据与状态归属</a></li>
+          <li><a href="#integration">5. 各项怎么接、哪些坑先挡住</a></li>
+          <li><a href="#implementation">6. 实施顺序与验收</a></li>
+          <li><a href="#decisions">7. 实施前必须拍板的问题</a></li>
+          <li><a href="#sources">8. 来源与维护</a></li>
+        </ol>
+        <a class="source-link" href="search-preview-integration.md">阅读 Markdown 主稿</a>
+      </nav>
+    </aside>
+    <main id="document" tabindex="-1">
+      <div class="reading-note">
+        <span>离线阅读版 · 窄屏可在表格内横向滚动</span>
+        <a href="search-preview-integration.md">返回 Markdown 主稿</a>
+      </div>
+      <article aria-labelledby="document-title">
+        <header>
+          <h1 id="document-title">搜索与预览工具集成参考</h1>
+          <blockquote>
+            <p>状态：候选方案，尚未集成；不是排期，也不是已批准的依赖清单。</p>
+            <p>核对日期：2026-11-07。依据当前未提交的重构工作树，不只依据 main 的历史提交；后续实施前须重新核对代码与上游 API。</p>
+            <p>Markdown 是主稿；<a href="search-preview-integration.html">HTML 离线阅读版</a>保留相同正文，修改时同步更新。配套：<a href="architecture.md">架构</a>、<a href="core-capabilities.md">核心能力</a>、<a href="cross-platform-filesystem.md">文件系统约束</a>、<a href="../ROADMAP.md">路线图</a>。</p>
+          </blockquote>
+        </header>
+
+        <section aria-labelledby="conclusion">
+          <h2 id="conclusion">1. 先看结论</h2>
+          <p><strong>复用底层库，不把四个终端程序整体嵌进文件管理器。搜索与匹配进核心，交互与着色留客户端。</strong></p>
+          <div class="table-scroll" role="region" aria-label="集成方向与引入条件" tabindex="0">
+            <table class="wide-table">
+              <thead><tr><th scope="col">想解决的问题</th><th scope="col">优先评估</th><th scope="col">默认落点</th><th scope="col">什么时候值得引入</th></tr></thead>
+              <tbody>
+                <tr><td>文件内容搜索</td><td>ripgrep 的 <code>grep-searcher</code>、<code>grep-regex</code></td><td><code>wfiles-core</code></td><td>现有内容搜索出现可测量的读取、内存或匹配瓶颈，或确实需要新的匹配能力</td></tr>
+                <tr><td>递归找文件与忽略规则</td><td>fd / ripgrep 共用的 <code>ignore</code></td><td><code>wfiles-core</code></td><td>需要可配置的忽略规则或并行遍历，并验证收益超过接入成本</td></tr>
+                <tr><td>模糊匹配与相关性排序</td><td><code>nucleo-matcher</code>；大候选集再评估 <code>nucleo</code></td><td><code>wfiles-core</code></td><td>命令面板或快速找文件明确需要不连续字符匹配</td></tr>
+                <tr><td>代码预览语法高亮</td><td>bat 底层的 <code>syntect</code></td><td>客户端</td><td>确认要给源码预览增加高亮，现有客户端能力不能直接满足</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>引入次序跟随实际功能需求，不因工具知名就一次接齐。没有需求或实测收益时，保留现有实现也是正确决定。</p>
+        </section>
+
+        <section aria-labelledby="cli-and-libraries">
+          <h2 id="cli-and-libraries">2. CLI 与库不是一回事</h2>
+          <div class="table-scroll" role="region" aria-label="CLI 与库的形态及边界" tabindex="0">
+            <table class="wide-table">
+              <thead><tr><th scope="col">工具</th><th scope="col">已核实的库形态</th><th scope="col">WFiles 的选择与边界</th></tr></thead>
+              <tbody>
+                <tr><td>fzf</td><td>Go 实现；<code>github.com/junegunn/fzf/src</code> 有可调用接口，但不是原生 Rust crate</td><td>不为复用终端选择器引入 Go 运行时或跨语言桥接。<code>nucleo</code> / <code>nucleo-matcher</code> 是独立 Rust 项目，不是 fzf 官方 Rust 绑定，也不承诺完全相同的排名</td></tr>
+                <tr><td>rg / ripgrep</td><td>Rust；<code>grep</code> 是聚合库，重新导出 matcher、regex、searcher、printer 等组件</td><td>可直接调用 Rust 组件，不需要 C FFI。优先依赖实际使用的组件；GUI 不需要把终端彩色打印器作为数据接口</td></tr>
+                <tr><td>fd</td><td>Rust；核对时 <code>fd-find</code> 只有可执行目标，没有库目标；底层依赖 <code>ignore</code></td><td><code>ignore</code> 提供遍历和忽略规则，不是完整的 fd：文件条件、结果语义与错误处理仍由 WFiles 实现</td></tr>
+                <tr><td>bat</td><td>Rust；提供 <code>bat::PrettyPrinter</code>，内部模块的 API 更容易变化</td><td>PrettyPrinter 偏向格式化输出；GUI 通常直接使用 <code>syntect</code> 得到文本样式片段，而不是解析 ANSI 颜色字符串</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>直接调用 CLI 可以作为一次性验证手段，不是默认产品架构。若未来确实采用子进程，必须另行解决可执行文件来源与版本、三平台分发、进程取消、输出协议及非 UTF-8 路径；用参数数组传值，不拼接 shell 命令。不要把“用户已安装这些 CLI”当作 WFiles 正常工作的前提。</p>
+        </section>
+
+        <section aria-labelledby="current-code">
+          <h2 id="current-code">3. 当前代码已经有什么</h2>
+          <p>以下是核对时的现状，不是后续承诺。行号随重构变化，以符号名和最新源码为准。</p>
+          <div class="table-scroll" role="region" aria-label="当前实现与源码入口" tabindex="0">
+            <table class="wide-table">
+              <thead><tr><th scope="col">能力</th><th scope="col">当前实现与限制</th><th scope="col">实施前入口</th></tr></thead>
+              <tbody>
+                <tr><td>目录搜索</td><td><code>Search::walk</code> 用 <code>read_dir</code> 广度优先遍历；跳过链接/联接点，使用固定跳过目录表；不是持久化全文索引</td><td><a href="../crates/wfiles-core/src/search.rs#L163">search.rs:163</a></td></tr>
+                <tr><td>内容匹配</td><td>单文件元数据大小不超过 8 MiB 才尝试读；当前 <code>Text::read</code> 整份读取 UTF-8 文本并生成小写副本；展示第一条相关命中行</td><td><a href="../crates/wfiles-core/src/search.rs#L359">search.rs:359</a></td></tr>
+                <tr><td>查询语义</td><td><code>Query</code> 已有布尔组合、名称正则、通配符、大小、日期、标签、颜色与 <code>content:</code>；<code>content:</code> 当前是子串，不是正则</td><td><a href="../crates/wfiles-core/src/query.rs#L99">query.rs:99</a>、<a href="../crates/wfiles-core/src/query.rs#L247">query.rs:247</a></td></tr>
+                <tr><td>搜索调度</td><td>core 的 <code>search::spawn</code> 分批发送结果；GUI 直接调用它，并用 generation 丢弃旧任务结果；core 默认上限 5,000，GUI 另传面板上限</td><td><a href="../crates/wfiles-core/src/search.rs#L301">search.rs:301</a>、<a href="../src/search_entity.rs#L234">search_entity.rs:234</a></td></tr>
+                <tr><td>命令面板</td><td>纯逻辑已在 core；精确、前缀、包含和关键词匹配，不是 fzf 式模糊评分</td><td><a href="../crates/wfiles-core/src/palette.rs#L50">palette.rs:50</a></td></tr>
+                <tr><td>文本预览</td><td>core 返回文本、语言、行数与截断标志；默认预算 256 KiB / 500 行；GUI 当前按等宽纯文本显示</td><td><a href="../crates/wfiles-core/src/preview.rs#L26">preview.rs:26</a>、<a href="../crates/wfiles-core/src/preview.rs#L86">preview.rs:86</a>、<a href="../src/app.rs#L5228">app.rs:5228</a></td></tr>
+                <tr><td>统一契约</td><td><code>contract::Command</code> 目前覆盖浏览、本地搬运与撤销，尚无递归搜索、模糊匹配或预览命令</td><td><a href="../crates/wfiles-core/src/contract.rs#L23">contract.rs:23</a>、<a href="../crates/wfiles-core/src/contract.rs#L66">contract.rs:66</a></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p><strong>能力在 core，不等于能力已接入统一 Command / Event。</strong> 重构期间不要为这四项另外创建一套 Kernel、撤销栈或全局设置，也不要把现有直调模块描述成已经统一走契约。</p>
+        </section>
+
+        <section aria-labelledby="ownership">
+          <h2 id="ownership">4. 分层、数据与状态归属</h2>
+          <p>判断标准不是“有没有 UI 依赖”，而是“换客户端后，哪些业务结果仍应一致”。不依赖 GPUI 的代码，也可能只是某个客户端的显示辅助逻辑。</p>
+          <div class="table-scroll" role="region" aria-label="核心、客户端与任务的职责" tabindex="0">
+            <table class="wide-table">
+              <thead><tr><th scope="col">归属</th><th scope="col">负责</th><th scope="col">不负责</th></tr></thead>
+              <tbody>
+                <tr><td>核心业务</td><td>文件访问与安全规则、查询解析、遍历、内容匹配、模糊评分、结果排序、预览读取预算、任务取消与结果事实</td><td>窗口、键位、焦点、主题、ANSI、HTML 或 GPUI 类型</td></tr>
+                <tr><td>客户端</td><td>读取设置并传参、发起请求、展示批次与状态、维护选择和滚动、应用主题与语法样式</td><td>另写一份查询解释器、遍历策略或文件搜索结果判定</td></tr>
+                <tr><td>每次任务</td><td>搜索器、匹配缓存、取消标志、该次请求的选项快照</td><td>无需求就建立全局单例，或把瞬时 UI 状态塞进 Kernel</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>建议的数据流（概念示意，不是现有 API 定义）：</p>
+          <pre><code class="language-text">客户端：查询输入 / 选项 / 预览请求
+  → 核心：查询解释 + 遍历与匹配，或预算内读取文件
+  → 数据：路径 / 命中行 / 匹配范围 / 统计，或文本 / 语言 / 截断标志
+  → 客户端：结果列表 / 键盘选择 / syntect 高亮 / 主题与排版
+</code></pre>
+          <ul>
+            <li>设置仍由客户端持久化；core 只接收这次请求的显式参数，不读取 GPUI 的全局 Settings、进程环境偏好或工具配置文件。</li>
+            <li>若当前只替换内部算法，先保留模块现有入口；若多客户端需要统一的搜索生命周期，再扩展现有契约，而非绕过它另建长期入口。</li>
+            <li>若统一契约覆盖异步搜索，先定请求标识、批次、完成/取消/失败、结果上限及队列背压；旧请求的批次不能混入新查询。不要把完整扫描塞进 UI 线程同步执行。</li>
+            <li>跨层优先使用 WFiles 数据类型。第三方 matcher、主题或工作线程句柄不直接成为公共契约；只转换本次功能确实需要的结果，不预建通用引擎抽象。</li>
+            <li>查询与相同选项下，完成搜索的结果集合和最终排序规则应跨客户端一致；并行扫描的到达顺序不必一致，提前截断返回哪批结果则必须明确约定。</li>
+          </ul>
+        </section>
+
+        <section aria-labelledby="integration">
+          <h2 id="integration">5. 各项怎么接、哪些坑先挡住</h2>
+          <h3 id="ripgrep">5.1 ripgrep：替换内容搜索机制，不替换查询语言</h3>
+          <ul>
+            <li>在 core 的搜索执行器中接 <code>grep-searcher</code>；需要其正则实现时用 <code>grep-regex</code>。按请求编译匹配器，不在每个文件或每行重复编译。</li>
+            <li>保留 WFiles 的条件树和标签、日期、大小等业务条件；不能把整个查询字符串直接交给 ripgrep，也不能把现有 <code>content:</code> 悄悄改成正则语义。</li>
+            <li>文件级 AND 可能由不同行分别满足；OR、NOT 和“未读取/二进制/失败”也不能简化成逐行一次匹配。先用现有行为建立回归夹具，再替换读取与匹配机制。</li>
+            <li>UTF-8、大小写与 NFC/NFD 的规则须单独核对；现有“小写后 contains”不必然等价于正则引擎的不区分大小写。不能因换库静默改变结果。</li>
+            <li>明确是否仍只显示一条命中行；若要全部命中行、上下文或新的编码支持，它们是独立的产品语义变化，不是换库顺带开启。</li>
+            <li>保留结果与读取预算，真正读数据时也执行上限：只在读取前检查 metadata 不能约束随后增长的文件。流式读取、长行和并发任务都须可取消且有内存界限。</li>
+          </ul>
+
+          <h3 id="ignore">5.2 ignore：用于递归搜索，不接管日常目录列表</h3>
+          <ul>
+            <li>先替换递归搜索内部的遍历器，不把浏览列表、复制、大小分析等遍历一次全部改掉；不同任务的隐藏、链接和统计语义不同。</li>
+            <li>显式配置隐藏项、gitignore、父目录规则、全局 Git 规则、<code>.ignore</code> 与链接行为，避免库默认值或机器配置偷偷决定结果。</li>
+            <li>文件浏览器不是源码工具：遵守 <code>.gitignore</code> 不等于“找到所有文件”。是否启用项目忽略规则需要产品决定，不能随换库悄悄开启；现有固定跳过目录表也应明确保留或调整。</li>
+            <li>不改变 <code>Listing</code> 的真实条目计数与显示隐藏项语义。搜索忽略规则不能渗入普通目录浏览，让文件看起来凭空消失。</li>
+            <li>仍使用 WFiles 的链接/联接点与特殊对象判定；不跟随符号链接还不等于已经满足 Windows junction 等全部约束。</li>
+            <li>并行遍历不保证当前的“浅层先出来”。上线前决定批次顺序、限额截断规则与最大并发；外置盘或机械盘上更多线程不保证更快。</li>
+          </ul>
+
+          <h3 id="nucleo">5.3 nucleo：匹配下沉，选择器不上移</h3>
+          <ul>
+            <li>命令面板优先评估低层 <code>nucleo-matcher</code>；候选集很大且确实需要增量、并行调度时，再评估高层 <code>nucleo</code>，不叠加两套后台任务机制。</li>
+            <li>在 core 计算评分、排序和命中位置；客户端继续维护输入框、候选项焦点、键盘选择、滚动及命中着色。</li>
+            <li>首次可只作用于命令面板，不把普通目录的包含筛选自动改成模糊排序。是否保留“精确 &gt; 前缀 &gt; 其它”、关键词权重及稳定同分顺序，要用测试锁定。</li>
+            <li>模糊匹配允许不连续字符，不等于拼写纠错、拼音检索或语义搜索；不承诺与 fzf 完全相同的分数和排名。</li>
+            <li>路径身份仍用 <code>PathBuf</code> / <code>OsStr</code>；匹配用的显示文本只是派生视图。不能拿有损转换后的字符串定位、打开或操作文件。</li>
+            <li>标清命中位置的单位：字符索引、UTF-8 字节偏移与 UI 字形位置不可混用。归一化后若长度变化，映射回原始显示文本再着色。</li>
+          </ul>
+
+          <h3 id="syntect">5.4 syntect：读取在核心，高亮默认在客户端</h3>
+          <ul>
+            <li>core 的 <code>preview</code> 继续负责文件类型、语言提示、安全读取、预算和截断；客户端把预览文本交给高亮器，再转换成自身的文本样式。</li>
+            <li>优先检查客户端已有组件是否已经支持语法高亮；确需 <code>syntect</code> 时声明在客户端依赖表，不为了“纯 Rust”就塞进 core。</li>
+            <li>语法资源加载、解析与缓存避开逐帧渲染路径；缓存有界。多行语法按前文状态解析，不能把每行都当成独立文件。</li>
+            <li>保留纯文本显示作为无法识别语言或高亮失败时的可用结果；长行和复杂输入的开销需要测量，不在 UI 线程同步处理整份文件。</li>
+            <li>不把 ANSI、HTML、主题颜色或 <code>syntect::Style</code> 放进 core 的公共预览契约；文件内容一律当文本，不执行其中代码或把它作为活动 HTML。</li>
+            <li>只有多个客户端真正需要复用语法解析时，再评估共享不带主题的语法范围；颜色和字体始终由各端决定。现在不新增高亮服务或额外 crate。</li>
+          </ul>
+        </section>
+
+        <section aria-labelledby="implementation">
+          <h2 id="implementation">6. 实施顺序与验收</h2>
+          <p>每次只引入满足当前需求的一项；以下是实施检查顺序，不是功能排期。</p>
+          <ol>
+            <li><strong>确认范围</strong>：对应一个已确认的搜索、筛选或预览需求；检查路线图的明确不做项。库具有某项能力，不意味着产品允许开放它。</li>
+            <li><strong>固定语义</strong>：写清保留的行为、主动改变的行为和不支持的情况；现有实现不足的地方单独列出，不把它美化成已满足的保证。</li>
+            <li><strong>测量基线</strong>：release 模式，记录同一批文件、相同忽略范围、相同机器和缓存条件下的首次结果、完成耗时、内存与取消延迟；不拿少扫描了一半文件当提速。</li>
+            <li><strong>最小接入</strong>：只改相应层的依赖和内部实现，保留现有契约；真有新增生命周期需求才扩契约。不要增加运行期后端选择器或插件接口。</li>
+            <li><strong>验证两端边界</strong>：core 用无界面测试验证业务结果；客户端用实际事件与页面/窗口验证交互，不靠直接调用处理函数证明键盘仍可用。</li>
+            <li><strong>决定是否保留</strong>：收益成立且回归通过才采用；代价超过收益就不合入实验。记录确切依赖版本、feature、MSRV、许可证及资源许可，再同步两份文档。</li>
+          </ol>
+          <div class="table-scroll" role="region" aria-label="实施验收覆盖范围" tabindex="0">
+            <table>
+              <thead><tr><th scope="col">验收域</th><th scope="col">至少覆盖</th></tr></thead>
+              <tbody>
+                <tr><td>查询正确性</td><td>AND 跨行、OR/NOT、名称正则与内容子串区别、空查询、无结果、大小写、NFC/NFD、标签和日期组合</td></tr>
+                <tr><td>文件边界</td><td>中文、空格、换行、前导连字符、平台允许的非 UTF-8 / 非 Unicode 路径、权限失败、目录变化、断链、链接环与 Windows junction</td></tr>
+                <tr><td>忽略规则</td><td>显示隐藏项与搜索忽略分开；规则开关、父规则、全局规则、显式根目录及已有跳过目录的行为</td></tr>
+                <tr><td>任务生命周期</td><td>连续输入新查询、取消、关闭面板、旧批次到达、达到上限、慢消费者、任务失败后能结束等待</td></tr>
+                <tr><td>文本与预览</td><td>二进制、无效编码、文件增长、超预算、极长行、多行语法、未知语言；截断明确，命中位置不越界</td></tr>
+                <tr><td>跨客户端</td><td>相同显式参数得到一致业务结果；客户端未安装这些 CLI 也能工作；主题与键盘布局不影响核心结果</td></tr>
+                <tr><td>性能与平台</td><td>保住 10 万项列表交互与万级目录冷启动基线；测新增路径；macOS、Windows、Linux 分别编译/运行验证，不把本机通过当成三平台通过</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>实施时沿用仓库检查命令；本次文档工作没有执行功能集成或这些 Rust 验收：</p>
+          <pre><code class="language-bash">cargo test -p wfiles-core
+cargo test -p wfiles --bin wfiles -- --skip cmd_backspace_trashes_the_selection_and_undo_puts_it_back
+cargo clippy --workspace --all-targets
+cargo fmt --check
+cargo test --release perf:: -- --nocapture
+</code></pre>
+          <p>性能基准需要为实际新增路径补夹具；既有基准通过，不自动证明搜索或语法高亮更快。所有测试使用隔离目录，不操作用户真实文件。</p>
+        </section>
+
+        <section aria-labelledby="decisions">
+          <h2 id="decisions">7. 实施前必须拍板的问题</h2>
+          <div class="table-scroll" role="region" aria-label="待决定的问题与推荐起点" tabindex="0">
+            <table>
+              <thead><tr><th scope="col">问题</th><th scope="col">推荐起点，不是已批准决定</th></tr></thead>
+              <tbody>
+                <tr><td>是否引入</td><td>需求驱动，逐项评估；不在这轮核心/客户端拆分中顺手把四项接齐</td></tr>
+                <tr><td>模糊匹配覆盖哪里</td><td>从命令面板开始；不默认改普通目录筛选和排序</td></tr>
+                <tr><td>搜索是否遵守项目忽略规则</td><td>作为显式选项评估；不随换库改变已有搜索范围，更不改变浏览列表</td></tr>
+                <tr><td>是否改变内容搜索语法、编码或大小上限</td><td>先保持当前语义；每项扩展单独确认和测试</td></tr>
+                <tr><td>是否把搜索收进统一契约</td><td>多客户端确实需要统一任务生命周期时再扩；不要误认为现在已经覆盖</td></tr>
+                <tr><td>高亮是否共享</td><td>初期留客户端；出现真实复用需求后才评估不带主题的语法数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>不纳入本参考的范围：插件系统、压缩包内搜索、全文编辑器、自动安装外部 CLI。远程协议也不会因为引入本地扫描库自动获得搜索能力；不得悄悄下载整棵远程目录来实现本地搜索。</p>
+        </section>
+
+        <section aria-labelledby="sources">
+          <h2 id="sources">8. 来源与维护</h2>
+          <p>上游资料于 2026-11-07 核对。链接中的 <code>latest</code> 会变化，实施时重新核对实际采用版本；本文不声明所有库 API 稳定，也不承诺未经本项目测试的性能倍数。</p>
+          <div class="table-scroll" role="region" aria-label="上游来源与核对用途" tabindex="0">
+            <table>
+              <thead><tr><th scope="col">来源</th><th scope="col">用途</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://pkg.go.dev/github.com/junegunn/fzf/src">fzf Go 包</a></td><td>确认 Go 接口及终端工具形态</td></tr>
+                <tr><td><a href="https://docs.rs/grep/latest/grep/">grep</a></td><td>ripgrep 的 Rust 聚合库与组件划分</td></tr>
+                <tr><td><a href="https://docs.rs/crate/fd-find/latest/source/Cargo.toml">fd-find 构建清单</a></td><td>确认只有可执行目标及 <code>ignore</code> 依赖</td></tr>
+                <tr><td><a href="https://docs.rs/ignore/latest/ignore/">ignore</a></td><td>目录遍历、忽略规则与并行 API</td></tr>
+                <tr><td><a href="https://docs.rs/nucleo/latest/nucleo/">nucleo</a></td><td>高层增量/并行匹配接口及低层 matcher 的分工</td></tr>
+                <tr><td><a href="https://docs.rs/bat/latest/bat/">bat</a></td><td>PrettyPrinter 与内部 API 注意事项</td></tr>
+                <tr><td><a href="https://docs.rs/syntect/latest/syntect/">syntect</a></td><td>语法解析、文本样式及自定义渲染</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>维护规则：实现一项后，更新“当前代码”与该项状态，写明采纳或放弃的理由、实测结果和剩余限制；同步 Markdown 与 HTML。代码是现状的依据，路线图决定范围，本文只辅助选择实现方案。</p>
+        </section>
+      </article>
+    </main>
+  </div>
+</body>
+</html>

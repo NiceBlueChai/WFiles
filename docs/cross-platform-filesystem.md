@@ -83,6 +83,60 @@
 复制语义坑：Explorer 复制 symlink **默认跟随目标内容**（rsync `-a` 则保留链接）；复制到 exFAT/FAT32 无法保留链接（自动降级为跟随）。
 **WFiles 策略**：默认跟随（避免悬空链接），设置里可切换"保留链接"；目标文件系统不支持时自动降级并提示。
 
+### 6.1 落地状态（2026-11，`crates/wfiles-core/src/entry_kind.rs`）
+
+统一语义层 `EntryKind`：`File` / `Directory` / `Symlink{target,broken}` /
+`Junction{target}` / `ReparseOther{tag}` / `HardLink{links}` /
+`Shortcut{flavor,target}` / `CloudPlaceholder`。界面、遍历、搬运、统计只认它，
+`#[cfg]` 只出现在 `probe()` 里。
+
+| 对象 | 识别依据（官方） | 遍历 | 复制默认 | 保留链接 |
+|---|---|---|---|---|
+| 符号链接 | `symlink_metadata` | 不递归（canonical `seen` 防环） | 跟随目标内容 | 重建 symlink |
+| 断链 | `metadata` 失败 | 不递归 | 复制失败并报错 | 重建断链本身 |
+| 硬链接 | Unix `nlink > 1` | 按普通文件 | 复制成独立文件 | — |
+| Windows junction | `FILE_ATTRIBUTE_REPARSE_POINT` + Name Surrogate 位 | 不递归 | 跟随内容 | **不重建**（需 `FSCTL_SET_REPARSE_POINT` + `SE_CREATE_SYMBOLIC_LINK_NAME`），降级并提示 |
+| 其它 reparse | 同上，非 N 位 | 不递归 | 跟随内容 | 不重建，降级并提示 |
+| `.lnk` | `HeaderSize 0x4C` + `LinkCLSID` + LinkInfo | 普通文件 | 复制文件 | — |
+| Finder 别名 | `book` 魔数（**Apple 未公开格式**） | 普通文件 | 复制文件 | — |
+| `.desktop` | `[Desktop Entry]` + `Exec/URL/Path` | 普通文件 | 复制文件 | — |
+| 云占位（Windows） | `OFFLINE` / `RECALL_ON_OPEN` / `RECALL_ON_DATA_ACCESS` | 不递归 | **拒绝**，提示先下载 | — |
+| 云占位（macOS） | `stat.st_flags & SF_DATALESS (0x40000000)` | 不递归 | **拒绝**，提示先下载 | — |
+| 云占位（旧 iCloud） | 隐藏名 + `.icloud` 结尾（Apple 未文档化） | 不递归 | **拒绝** | — |
+
+三个刻意选择：
+
+1. **判"名字被占"用 `symlink_metadata` 不用 `Path::exists()`**。后者跟随链接，
+   断链会答 false，于是重命名会把链接本身悄悄覆盖掉（不可撤销的数据丢失）。
+2. **进度条分母与 `copy_entry` 同一把尺**：目录链接真的会被复制两遍，分母就算两遍；
+   canonical `seen` 挡住指回祖先的链接，不会数成无限大。
+3. **macOS 判 dataless 只读 flags**。Apple TN3150 明确 `fileExists` / 枚举目录都可能
+   触发 materialization（联网下载）；读 `st_flags` 不触发，读内容才触发。
+4. **查重复按 `(dev, ino)` 去重**。同一 inode 的多个硬链接不是「重复文件」——
+   删掉一个不释放任何空间，报出来只会引导用户白删。Windows 上拿这个身份要
+   每个文件开一次句柄，对"扫几万个文件"太贵，那边 `file_identity` 返回 `None`：
+   宁可多报，也不把两份真数据当成一份。
+
+#### Windows 侧的 FFI（`entry_kind.rs` 的 `win32` 模块）
+
+手写 `extern "system"`，不引入 `windows-sys`：只用 kernel32 的 6 个函数。
+
+- `CreateFileW(..., FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)`
+  + `DeviceIoControl(FSCTL_GET_REPARSE_POINT)` 读 tag 与目标。
+  **只在 `FILE_ATTRIBUTE_REPARSE_POINT` 置位时才开句柄**，不然每个文件都多一次系统调用。
+- `FindFirstStreamW` / `FindNextStreamW` 枚举 ADS，`::$DATA`（默认流）不算。
+- 解析逻辑（`reparse_target` / `stream_name_of`）**是平台无关的纯函数**，
+  所以能在 macOS 上单测；`#[cfg]` 只剩下"去哪儿拿这坨字节"。
+
+**验证边界（重要）**：本机是 macOS，`cargo check --target x86_64-pc-windows-msvc`
+会在 `aws-lc-sys`（russh 的依赖）那里因为缺 Windows SDK 头文件挂掉，
+根本到不了 core。所以改用一个只依赖 std 的探针 crate（`#[path]` 挂
+`entry_kind.rs` + `i18n.rs`）对 Windows / Linux 三元做类型检查——
+它可以证明"能编过"，**不能**证明"跑起来行为对"，后者仍需 Windows 真机/CI。
+注意 `#[path]` 挂进来的文件不在 cargo fingerprint 里，改完源码要 `touch src/lib.rs`，
+否则会看到假绿（用一次故意的类型错误验证过它确实在编译那段）。
+
+
 ## 7. 回收站与"放回原处"（可撤销卖点的地基）
 
 | 平台 | 位置 | 元数据 | 放回原处的条件 |
@@ -92,6 +146,41 @@
 | Linux | home：`$XDG_DATA_HOME/Trash`（默认 `~/.local/share/Trash`）；外部卷：挂载点 `.Trash/$uid`（sticky）或 `.Trash-$uid` | `info/*.trashinfo`：`[Trash Info]` + `Path=`（URL 编码）+ `DeletionDate=`（RFC 3339） | `.trashinfo` 丢失则无法自动恢复 |
 
 **工程铁律：一律走平台 trash API**（macOS `NSFileManager trashItem` / Windows `SHFileOperation` 带 `FOF_ALLOWUNDO` / Linux freedesktop 规范实现，如 `trash` crate）。禁止自己把文件 `mv` 进回收站目录——否则放回原处元数据缺失，"可撤销"直接破功。附加约束：跨卷删除时回收站位于文件所在卷；文件超过回收站容量时 Windows 会询问或直接永久删除。
+
+### 7.1 两种删除方式与可移动介质（2026-11 落地）
+
+| 方式 | 走哪儿 | 能撤销 | 用在哪 |
+|---|---|---|---|
+| **移到回收站** | 平台 trash API（`trash` crate） | ✅ 能放回原处 | 内置卷 / 固定磁盘 |
+| **彻底删除** | 自己递归删，不跟链接、不写回收站 | ❌ **不可撤销** | 用户显式要求；**以及可移动介质上唯一允许的方式** |
+
+**可移动介质只允许彻底删除**，这不是省事，是因为卷上的回收站本来就靠不住：
+
+- 位置在**那根 U 盘上**（macOS `/.Trashes/<uid>`、Windows `$Recycle.Bin`、Linux `.Trash-<uid>`），
+  插到另一台机器上多数看不见，用户以为删了其实还占着空间。
+- 拔盘/换机器之后"放回原处"多半失败，撤销就变成一句空话。
+- U 盘容量小，回收站会白占一块。
+
+判定用**一次系统调用**，不起 `diskutil` / 外部进程：
+
+| 平台 | 判据 | 依据 |
+|---|---|---|
+| macOS | `statfs.f_flags & MNT_REMOVABLE (0x200)` | 本机 SDK `sys/mount.h`；实测 U 盘 = `1`、系统卷 = `0` |
+| Linux | `/sys/dev/block/<major>:<minor>/removable == "1"` | sysfs 的块设备属性（分区继承整盘） |
+| Windows | `GetDriveTypeW(盘符根) == DRIVE_REMOVABLE (2)` | Win32 `GetDriveType`，U 盘/SD 卡返回 2 |
+
+**判不出来时按"不是可移动介质"处理**（拿不到 flags、sysfs 不存在、路径解析不出盘符）：
+宁可让用户走回收站，也不要在他不知情的时候执行不可撤销的删除。这条是安全方向的默认值，
+别为了"覆盖更多情况"把它翻过来。
+
+彻底删除本身还有三条纪律：
+
+1. **删链接不删目标**：先 `symlink_metadata` 判类型，符号链接/junction 用删文件的路径处理，
+   绝不 `read_dir` 跟进去（否则删一个链接会把整棵目标树干掉）。
+2. **不跟 junction/reparse**：`EntryKind::is_redirect()` 为真的项按"一项"删，不递归。
+3. **只读文件先改权限再删**：Windows 上只读文件 `remove_file` 会失败，需要先
+   `set_permissions(readonly = false)`；递归删除时要逐层处理。
+
 
 ## 8. 可移动介质与网络文件系统的坑
 
@@ -107,15 +196,24 @@
 3. **冲突预检**：复制到大小写不敏感卷前检测 case 冲突与 NFC/NFD 碰撞，提前走冲突四策略（跳过/覆盖/重命名/合并）。
 4. **长路径**：manifest 声明 `longPathAware`；内部统一 verbatim 表示；目标路径超 260 时 UI 显式提示（用户系统可能未开 `LongPathsEnabled`）。
 5. **回收站**：只走平台 API；侧栏回收站入口展示原始位置；放回失败（原目录已删/名称被占）要有明确的人工恢复流程。
-6. **元数据保留**：复制前扫描 xattr/ADS/quarantine 并提示丢失项，提供保留选项；exFAT/FAT32 目标自动降级。
+6. **元数据保留**：跨卷搬运前抽样 20 项扫 xattr/ADS/权限，把"可能不保留的类别"
+   并进这次操作的结果提示；同卷不报（同卷复制不会丢，每次都报就是噪音）。
+   **仍未做**：真正把 xattr/ADS 复制过去（现在只提示），以及"保留/放弃"的选择框。
 7. **链接策略**：默认跟随，可配置保留；不支持的文件系统自动降级 + 提示。
 8. **时间戳**：创建时间按平台可用性降级显示；同步/备份语义依赖 mtime，复制时尽力保留。
 9. **隐藏文件**：三平台语义（前导点 / hidden 属性 / Finder 隐藏标志）在 platform 层统一为"隐藏"概念。
 10. **云占位文件（P4）**：识别 reparse/eviction 状态，显示"在云端，需下载"，操作前触发下载。
+11. **删除两种方式**：回收站（可撤销）与彻底删除（不可撤销）分开建模，别做成一个布尔开关；
+    可移动介质上只允许彻底删除；彻底删除**不进撤销栈**，判"是不是可移动"失败时按固定磁盘处理。
+    （判定与纪律见 7.1）
 
 ## 参考来源
 
 - Microsoft Learn：Naming Files, Paths, and Namespaces；Maximum Path Length Limitation
+- Microsoft：[MS-FSCC] 2.1.2.1 Reparse Tags；File Attribute Constants (WinNT.h)；
+  Reparse Points / Reparse Point Operations；FSCTL_SET_REPARSE_POINT；FindFirstStreamW
+- Microsoft：[MS-SHLLINK] 2.1 ShellLinkHeader、2.3 LinkInfo
+- Apple：TN3150 Getting ready for dataless files；Synchronizing the File Provider Extension
 - libyal Windows Recycle.Bin 格式规范（`trash-core` crate 文档）
 - freedesktop.org Trash Specification v1.0
 - Apple：APFS 卷格式文档、TN1150（HFS+ 名称约束）；The Eclectic Light Company：APFS Directories and Names

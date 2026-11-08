@@ -6,17 +6,50 @@
 
 WFiles：Rust 2024 + GPUI Kit 0.7 的跨平台文件管理器（macOS / Windows / Linux 三平台同等优先），核心卖点**快、清楚、可撤销**。P0–P5 的清单已闭（P5 只剩两项不做：安装包与自动更新要签名与公证、原生菜单/分享/通知 GPUI 没有接口，理由见 `ROADMAP.md` 的「P5 剩下的两项为什么没做」）；下一阶段（P6）待定。**阶段标记会过期，以 `ROADMAP.md` 的 ✅ 为准。**
 
+## 文档地图（先看哪一份）
+
+| 你想知道 | 看 |
+|---|---|
+| 代码该写在哪一层、状态归谁、加东西动哪里 | [`docs/architecture.md`](docs/architecture.md) |
+| 核心已经有什么能力、入口函数叫什么、有哪些限制 | [`docs/core-capabilities.md`](docs/core-capabilities.md) |
+| 文件名/路径/回收站/链接/元数据的三平台约束 | [`docs/cross-platform-filesystem.md`](docs/cross-platform-filesystem.md) |
+| NSH（TSX）客户端的结构、已接能力与坑 | [`docs/nsh-client.md`](docs/nsh-client.md) |
+| 做不做某个功能、阶段进度 | [`ROADMAP.md`](ROADMAP.md)（**以其中的 ✅ 为准，本文件的阶段概述会过期**） |
+| 工程铁律、测试纪律、环境坑 | 本文件下面几节 |
+
 ## 环境与命令
 
 ```bash
 cargo build          # 构建
 cargo run            # 运行（当前仅验证 macOS）
-cargo test           # 测试（dev-deps: tempfile）
-cargo clippy --all-targets
+cargo test           # 全量（两个 crate；GUI 集成测试要 headless，慢）
+cargo test -p wfiles-core                  # 只跑核心：单测 + 边界 + 契约（快，改 core 时常用）
+cargo test -p wfiles --bin wfiles -- --skip cmd_backspace_trashes_the_selection_and_undo_puts_it_back
+                                           # 只跑 GUI；那条 skip 是 macOS Finder 自动化权限，与本项目代码无关
+cargo test --release perf:: -- --nocapture # 性能基准（看数字必须 release）
+cargo clippy --workspace --all-targets
 cargo fmt --check
 scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug 可选）
 scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle 时自动调用）
+scripts/smoke-tui.sh      # 用管道真跑一遍 TUI 示例（6 条冒烟判据，改契约时一起跑）
+scripts/smoke-nsh-tui.sh  # NSH 终端后端：真 pty 跑 `nsh run --target tui`，回放最后一屏判 10 条（7 静态 + 3 键盘）
+
+cd nsh-poc && ~/.nsh-source/bin/nsh check  # NSH 客户端：类型检查（首次 40~45s，增量 1-3s）
+cd nsh-poc && ~/.nsh-source/bin/nsh test   # NSH 客户端：headless 测试（首次 ~1m25s，热 30~50s）
+                                           # `nsh` 不在 PATH，别写成 `nsh check`
 ```
+
+- **NSH 有两份 CLI**：`~/.nsh-source/bin/nsh` 是 0.4.0（源码构建，**只有它带
+  `--target tui`**），`~/.nsh/bin/nsh` 是发行版 0.2.0。本仓按 0.4.0 写，见
+  [`docs/nsh-client.md`](docs/nsh-client.md) §六。app 的 `nsh-core` / `nsh-base`
+  按 **path** 依赖源码 checkout，不是 crates.io——`nsh-tui-host` 与
+  `nsh-platform-tui` 没发布，走 registry 就编不出 tui host。
+  **这条上游缺口 2026-11-08 拍板不追**（不报 issue、不 fork），path 依赖是长期形态；
+  同理 `nsh test --target tui` 不认带 `#[native_module]` 的 app，TUI 判据因此落在
+  `scripts/smoke-nsh-tui.sh`，**以后加判据就往脚本里加，别再提搬进 `nsh test`**。
+- **`E0463: can't find crate for X which Y depends on` 先怀疑 exFAT 上的陈旧产物**，
+  不是镜像源：`/Volumes/Ventoy` 的 `target/` 会丢/坏 rlib，重跑一次 `cargo build`
+  多半就过（`oxc_*` 与 `zerofrom_derive` 两次都是这个）。
 
 - Rust edition **2024**，工具链用 stable，无 nightly 特性。
 - `target/` 已 gitignore，禁止提交。
@@ -48,60 +81,90 @@ scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle �
 
 ## 仓库结构
 
+**先说清楚分层**（细节见 [`docs/architecture.md`](docs/architecture.md)、能力清单见 [`docs/core-capabilities.md`](docs/core-capabilities.md)）：
+业务逻辑全在 `crates/wfiles-core/`（不依赖任何界面框架），界面在 `src/`，方向只有「界面 → core」。
+`src/main.rs` 把 core 的模块 `pub use` 回 `crate::xxx`，所以界面里照旧写 `crate::ops::…`。
+
+### 核心：`crates/wfiles-core/src/`
+
+| 文件 | 职责 |
+|---|---|
+| `lib.rs` | 模块清单与分层说明（先读这个） |
+| `contract.rs` | 前端契约：`Command` → `Event`，`Core` 持有列表与内核；新前端只认它 |
+| `kernel.rs` | 操作侧状态机：**撤销栈唯一持有者** + 事件广播 + 链接策略 + 重名策略（整批 / 逐项问） |
+| `entry_kind.rs` | 特殊文件系统对象统一语义（链接/联接点/硬链接/快捷方式/云占位）与 Windows FFI |
+| `model.rs` | 文件条目与目录内容模型、排序、视图模式 |
+| `ops.rs` | 复制/移动/删除/重命名、字节计数、`Control` 中止手柄、`History` 撤销栈、本地↔远程四向搬运 |
+| `resume.rs` | 断点续传：`(源,目标)` 账本、暂存文件、预算清扫、`Hold` 守卫 |
+| `archive.rs` | 压缩包：看内容、解压、打包 |
+| `analyze.rs` | 分析任务的纯逻辑：文件夹大小、重复文件、校验和（可中止、带进度） |
+| `compare.rs` | 目录比较的纯逻辑：差异清单 + 同步计划（拷哪些/删哪些/哪些不敢动） |
+| `diff.rs` | 文件内容比较的纯逻辑：读文件判文本、行级/字符级/字节级差异 |
+| `search.rs` | 后台搜索的纯逻辑：走目录、读文本、分批送结果、随时可中止 |
+| `query.rs` | 搜索查询：一句话 → 条件树，以及"这个文件过不过" |
+| `bulk_rename.rs` | 批量重命名规则与预览（纯逻辑） |
+| `marks.rs` | 标签与颜色：一个路径上有什么记号，以及持久化格式（纯逻辑） |
+| `palette.rs` | 命令面板的匹配与排序（纯逻辑） |
+| `path_input.rs` | 地址栏那句输入 → 该去哪儿 |
+| `preview.rs` | Quick Look 内容层：类型判定、文本/二进制读取（纯逻辑） |
+| `format.rs` | 展示层格式化（大小、时间戳） |
+| `i18n.rs` | 翻译表 + 结构化 `Message`（**纯函数**，无 GPUI） |
+| `clipboard.rs` | 剪贴板文本的拼装（复制路径/文件名）；真正写系统剪贴板在界面层 |
+| `cloud.rs` | 云盘同步状态：认同步目录、判单个文件在不在云端；只看不改 |
+| `remote.rs` | 远程公共部分：连接配置、钥匙串、统一的 `Remote` trait、WebDAV、`dav://id/子路径` 拼拆 |
+| `ftp.rs` | FTP 客户端（明文，不带 TLS） |
+| `sftp.rs` | SFTP（russh + tokio）：known_hosts、密码与私钥登录 |
+| `s3.rs` | S3 兼容对象存储（SigV4、桶的两种写法、前缀当文件夹） |
+| `offline.rs` | 离线缓存：远程目录列表落盘/读回 |
+| `terminal.rs` | 系统终端探测与启动（纯逻辑） |
+| `volumes.rs` | 本机挂着的卷：三平台扫描落点、3 秒 TTL 快照 |
+| `watch.rs` | 文件系统监听（notify），把原始事件收敛成"该刷新了" |
+| `session.rs` | 会话持久化（含状态目录定位规则） |
+| `restore.rs` | 崩溃恢复现场：每栏选中了什么、焦点在哪 |
+| `instance.rs` | 单实例转发：排他锁、门牌、一句话线格式 |
+| `logfile.rs` | 本地日志（从文件管理器启动的进程没有终端，必须写文件） |
+| `cli.rs` | 命令行参数（`--reveal` / `--new-tab` / `--new-window` / `--lang`） |
+| `perf.rs` | 性能基准（**test-only**，看数字要用 `--release`） |
+
+### 界面：`src/`
+
+| 文件 | 职责 |
+|---|---|
+| `main.rs` | 入口：application 初始化 + 开窗；把 core 模块 re-export 回 `crate::xxx` |
+| `app.rs` | `WFilesApp` 应用外壳与全局状态；`Starting` 说明这扇窗是谁（主窗/副窗）——会话、窗口布局、崩溃恢复现场只有主窗写 |
+| `pane.rs` | 面板系统（导航、列表与网格 UI、视图模式、行级拖放、详情板） |
+| `ops_entity.rs` | 文件操作的 UI 枢纽：任务队列、进度与速度、冲突、撤销栈；远程在主线取客户端再交后台 |
+| `drag.rs` | 拖放的纯判定（拖什么、能不能落、移动还是拷贝、悬停多久展开） |
+| `keymap.rs` | 可配置快捷键：命令 id ↔ 按键、出厂键、校验（依赖 UI 命令枚举，所以留界面层） |
+| `settings.rs` | 用户设置持久化（GPUI 全局槽位 + JSON 原子写盘） |
+| `thumbnails.rs` | 缩略图：后台解码 + 有上限的缓存 |
+| `meta.rs` | 可选元数据列：六种探测的纯逻辑 + 缓存实体 |
+| `term.rs` / `term_entity.rs` | 内嵌终端的纯逻辑 / 实体（PTY、量格子、收键盘） |
+| `remotes.rs` | 远程连接注册表实体；远程编辑：下载→监听→按指纹回传 |
+| `analyze_entity.rs` / `compare_entity.rs` / `diff_entity.rs` / `search_entity.rs` | 各面板实体 |
+| `throttle.rs` | 传输限速令牌桶（纯算术，时间从外面喂） |
+| `i18n.rs` | GPUI 适配层：`tr(cx)` / `tr_args(cx)` / `Message::say(cx)`（`Say` 扩展 trait） |
+| `ui_tests.rs` | 无头窗口 UI 集成测试 |
+
+### 其他
+
 | 路径 | 职责 |
 |---|---|
-| `src/main.rs` | 入口：application 初始化 + 开窗 |
-| `src/app.rs` | `WFilesApp` 应用外壳与全局状态；`Starting` 说明这一扇窗是谁（主窗/副窗）——会话、窗口布局、崩溃恢复现场只有主窗写 |
-| `src/pane.rs` | 面板系统（导航/列表与网格 UI、视图模式、行级拖放） |
-| `src/drag.rs` | 拖放的纯判定逻辑（拖什么、能不能落、移动还是拷贝、悬停多久展开） |
-| `src/analyze.rs` | 分析任务的纯逻辑：文件夹大小、重复文件、校验和（可中止、带进度） |
-| `src/compare.rs` | 目录比较的纯逻辑：差异清单 + 同步计划（拷哪些/删哪些/哪些不敢动） |
-| `src/compare_entity.rs` | 比较面板实体：两栏对齐的差异列表、筛选、同步按钮（搬运交给 Ops） |
-| `src/diff.rs` | 文件内容比较的纯逻辑：读文件判文本、行级/字符级/字节级差异 |
-| `src/diff_entity.rs` | 内容比较面板实体：三种看法、并排列表、Esc/↑↓/Enter |
-| `src/keymap.rs` | 可配置快捷键：命令 id ↔ 按键的映射表、出厂键、配置校验（纯逻辑） |
-| `src/model.rs` | 数据模型（目录/条目/会话） |
-| `src/ops.rs` | 文件操作（复制/移动/删除/重命名）、字节计数与任务控制手柄 `Control`；本地 ↔ 远程四向搬运（下载/上传/服务器内 MOVE）与认得远程路径的撤销 |
-| `src/resume.rs` | 断点续传：`(源,目标)` 一对的账本、暂存文件、总量预算清扫、`Hold` 守卫（清扫绕开正在写的那一块） |
-| `src/offline.rs` | 离线缓存：远程目录列表落盘/读回，断网时垫底；坏缓存当没有 |
-| `src/ops_entity.rs` | 文件操作的 UI 枢纽：任务队列、进度与速度、冲突、撤销栈；远程那一端在主线程上取客户端再交给后台，判重与撤销也一样不堵界面 |
-| `src/palette.rs` | 命令面板的匹配与排序（纯逻辑） |
-| `src/preview.rs` | Quick Look 内容层：类型判定、文本/二进制读取（纯逻辑） |
-| `src/thumbnails.rs` | 缩略图：后台解码 + 有上限的缓存 |
-| `src/bulk_rename.rs` | 批量重命名规则与预览（纯逻辑） |
-| `src/settings.rs` | 用户设置持久化（默认终端、每目录的排序与视图模式、窗口布局） |
-| `src/terminal.rs` | 系统终端探测与启动（纯逻辑） |
-| `src/meta.rs` | 可选元数据列：六种探测的纯逻辑 + 缓存实体（后台线程、按 mtime 失效） |
-| `src/marks.rs` | 标签与颜色：一个路径上有什么记号，以及它的持久化格式（纯逻辑） |
-| `src/query.rs` | 搜索查询的纯逻辑：一句话 → 条件树，以及"这个文件过不过"的判定 |
-| `src/remote.rs` | 远程位置的公共部分：连接配置、钥匙串存取、各协议统一的 `Remote` trait 与客户端出口、WebDAV 客户端、`dav://id/子路径` 的拼拆 |
-| `src/ftp.rs` | FTP 客户端（明文，不带 TLS）：绝对路径发命令、`Mutex` 锁住有状态的控制连接、复制绕本地临时文件、删目录先清空 |
-| `src/sftp.rs` | SFTP 客户端（russh + tokio）：known_hosts 认服务器公钥（换了就拒）、密码与私钥两种登录、复制绕本地临时文件、删目录不跟符号链接 |
-| `src/cloud.rs` | 云盘同步状态：认本机的同步目录（各平台各自的落点）、单个文件是已同步还是只在云端；只看不改 |
-| `src/throttle.rs` | 传输限速的令牌桶：按速率放字节、欠账分段睡（纯算术，时间从外面喂） |
-| `src/search.rs` | 后台搜索的纯逻辑：走目录、读文本、分批送结果、随时可中止 |
-| `src/search_entity.rs` | 搜索面板实体：输入 → 查询、结果列表、Enter 跳到那个文件 |
-| `src/term.rs` | 内嵌终端的纯逻辑：按键 → PTY 字节、屏幕与回滚、选中与取文本 |
-| `src/term_entity.rs` | 内嵌终端实体：起 PTY、跨线程收输出、量格子画屏幕、收键盘与鼠标 |
-| `src/cli.rs` | 命令行参数：这次启动开哪个目录、定位哪个文件，以及 `--reveal` / `--new-tab` / `--new-window` / `--lang`（纯逻辑，用法错误也在这儿判，报错文案走 i18n） |
-| `src/instance.rs` | 单实例转发：位子（状态目录里的排他锁）、门牌（端口）、一句话的线格式（一行 ASCII 头 + 原始路径字节）；第二次启动把"开到哪儿"交给已经开着的那一扇，送不到就自己开窗 |
-| `src/clipboard.rs` | 剪贴板 |
-| `src/format.rs` | 展示层格式化 |
-| `src/session.rs` | 会话持久化（含状态目录的定位规则） |
-| `src/restore.rs` | 崩溃恢复现场：每栏选中了什么、键盘焦点在哪；关标签时当场清 |
-| `src/remotes.rs` | 远程连接注册表实体：客户端、目录缓存、后台列目录与下载（界面线程不做网络）；远程编辑：下载到临时目录 → 监听 → 按指纹去重回传 |
-| `src/s3.rs` | S3 兼容对象存储客户端：SigV4 签名、桶的两种写法、前缀当文件夹用 |
-| `src/watch.rs` | 文件系统监听（notify） |
-| `src/volumes.rs` | 本机挂着的卷：三个平台各自的扫描落点、3 秒 TTL 快照缓存 |
-| `src/ui_tests.rs` | 无头窗口 UI 集成测试 |
-| `src/perf.rs` | 性能基准：9 条，钉住 ROADMAP「性能基线」（**看数字要用 `--release`**） |
-| `README.md` / `README.en.md` | 门面：功能一览、平台状态（只有 macOS 真机验证过）、构建与运行、数据位置、快捷键表；英文那份是精简版 |
-| `LICENSE` | MIT；改它别忘了 `Cargo.toml` 的 `license` 字段 |
-| `assets/wfiles.svg` | 应用图标源稿；`scripts/make-icon.sh` 渲成 .icns，bundle 时自动调用 |
+| `crates/wfiles-core/tests/boundary.rs` | 护栏：core 源码/依赖表不许出现界面框架，也不许反向依赖界面模块 |
+| `crates/wfiles-core/tests/contract.rs` | 新前端验收场景（浏览 / 复制撤销 / 删除 / 改名 / 新建 / 链接策略 / 重名两种粒度 / 中止 / 搜索 / 预览 / 卷 / 撤销标签，24 条） |
+| `examples/wfiles-tui.rs` | 只用标准库 + core 的 TUI 示例：**新增前端的最小接入形态**。覆盖契约三种形状（普通命令 / 只读查询 / 流式搜索）；冒烟判据见 [`scripts/smoke-tui.sh`](scripts/smoke-tui.sh) |
+| `nsh-poc/` | **NSH 客户端**：TSX 界面 + `wfiles-core` 后端（独立 `[workspace]`，不在 cargo workspace 里）。结构与坑见 [`docs/nsh-client.md`](docs/nsh-client.md) |
+| `scripts/bundle-macos.sh` / `make-icon.sh` | 打 `.app` / 由 SVG 生成 `.icns` |
+| `scripts/smoke-tui.sh` | 用管道喂命令**真跑一遍 TUI**，逐项验输出（6 条）：预览内容、撤销标签、策略回显、搜索命中与收尾、卷命令 |
+| `assets/wfiles.svg` | 应用图标源稿 |
+| `README.md` / `README.en.md` | 门面：功能一览、平台状态、构建运行、数据位置、快捷键表 |
 | `ROADMAP.md` | 产品路线图：功能范围、阶段划分、明确不做清单 |
-| `docs/cross-platform-filesystem.md` | 三平台文件系统约束调研（文件名/路径/回收站/元数据） |
-| `.agents/skills/` | 项目级 skill 的规范位置（当前：`gpui-kit`、`gpui-kit-design-guides` 两个官方 skill，改 UI/架构前必读） |
-| `.workbuddy/` | **不在仓库里**（已 gitignore，本地保留）：WorkBuddy 的 skill 加载副本与记忆文件。它只扫这个路径且跳过符号链接，所以本地那份必须是真实目录副本，别用软链 |
+| `docs/architecture.md` | **架构定位**：分层、状态归谁、契约、扩展点、已知边界 |
+| `docs/core-capabilities.md` | **能力清单**：模块 × 职责 × 入口 × 状态（先查这里再动手） |
+| `docs/cross-platform-filesystem.md` | 三平台文件系统约束调研 + 特殊对象落地状态 |
+| `.agents/skills/` | 项目级 skill 的规范位置（`gpui-kit`、`gpui-kit-design-guides`，改 UI 前必读） |
+| `.workbuddy/` | **不在仓库里**（已 gitignore，本地保留）：skill 加载副本与记忆文件。它只扫这个路径且跳过符号链接，本地那份必须是真实目录副本，别用软链 |
+| `LICENSE` | MIT；改它别忘了 `Cargo.toml` 的 `license` 字段 |
 
 ## 代码铁律（来自 docs/cross-platform-filesystem.md，违反即 bug）
 
@@ -109,8 +172,16 @@ scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle �
 2. **删除必须走平台 trash API（`trash` crate），禁止自己 mv 进回收站目录。** 自己 mv 会丢元数据，"放回原处"和"可撤销"卖点直接破功。
 3. **创建/重命名前先校验目标名**：Windows 保留名（CON/PRN/NUL/COM1…）、非法字符（`< > : " / \ | ? *`）、结尾空格句点（静默剥离，不报错）。校验器必须三平台共用同一份规则表。
 4. **超长路径用 verbatim（`\\?\`）路径**，并在 UI 层给用户明确提示，不静默失败。
-5. **软链接默认不跟随**，UI 显示链接目标；行为要与三平台系统文件管理器对齐。
-6. **跨 OS 复制前扫描元数据丢失风险**（xattr/Finder 标签、Windows ADS、POSIX 权限、创建时间），丢之前问用户。
+5. **链接要分两种场景，别混成一条**：**遍历 / 统计 / 查重复不跟随**符号链接与联接点（防环，用 canonical `seen`）；
+   **复制默认跟随目标内容**（与 Explorer / Finder 一致），设置里可切成"保留链接"，目标卷不支持时自动降级并提示。
+   另外：**判"名字被占"必须用 `symlink_metadata`，不能用 `Path::exists()`**——后者跟随链接，
+   断链会答 false，于是重命名会把链接本身悄悄覆盖（不可撤销的数据丢失）。特殊对象的完整规则见
+   [`docs/core-capabilities.md`](docs/core-capabilities.md) 的 2.1。
+6. **跨卷搬运前扫描元数据丢失风险**（xattr/Finder 标签、Windows ADS、POSIX 权限、创建时间），
+   把"可能不保留的类别"并进这次操作的结果提示（`entry_kind::metadata_risk_note`）。
+   **只在跨卷时说话、只抽前 20 项、只报用户真在意的类别**：同卷复制不会丢，对每个普通文件都报
+   `com.apple.FinderInfo` 会让提示变成噪音（「狼来了」比不提示更糟）。**目前只提示，没有真的保留
+   xattr/ADS**，要做得先定"保留/放弃"怎么问。
 7. 元数据比较/搜索做 **NFC/NFD 双归一化**，存储和显示保留原始字节。
 8. **中止信号不许用 `io::ErrorKind::Interrupted`。** 那个种类的含义是"被信号打断，重试一次就好"，`write_all` / `read_exact` / `io::copy` 都会把它当成该重试的错误——用户按了中止会变成无限重试，一直写到磁盘满。用 `ops::aborted()`（`ErrorKind::Other`），判别走 `ops::is_aborted()`。
 9. **凡是"后台线程 + 共享暂存/缓存目录"的组合，写之前先占住。** 文件先建出来、账本后补上，中间那段空窗里并发的清扫会把正在写的数据当垃圾删掉。参照 `resume::Journal::hold()` 的守卫写法（`Drop` 自动放开，不靠手动配对）。**进程内那一半靠这张表，跨进程的另一半只能靠文件系统自己的锁**（`File::try_lock`，见 `resume::being_written`）：用户开两份应用、脚本各调一次都是常态，而那张表出了这个进程谁也看不见。**别按时间猜**——"刚建出来 N 分钟内别删"这类判据在"一趟搬运可以跑几小时、正常传完之前根本没有账本"面前必然猜错。同一把锁也用来选主实例（`instance::claim`），于是状态目录里的 `instance.lock` / `instance.json` **都不许删**：删锁文件会让下一个启动在**新的** inode 上抢到锁，于是同时有两个主实例；删门牌会把**新**主实例刚写下的那份删掉（旧的正在退、新的刚好起来），而新主实例不会重写它——从此再没人转得进来。宁可留一张过期的纸，连不上自然走退路。
@@ -189,6 +260,24 @@ scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle �
   切栏/关栏之后按一下 `cmd-t`，看标签栏多没多一栏。写得再"像"也不如这一下
   （见 `ui_tests.rs` 里 `the_shortcuts_survive_*` 那一组）。
 
+### ui_tests 的几处具体手感（踩过才写下来的）
+
+- **菜单项 id 是序号，会随菜单项增减漂移** → 先读 `label()` 再决定点哪个，别硬编码序号。
+  常用稳定 id：`overlay-card` / `prompt-ok` / `confirm-ok` / `bulk-ok` / `favorite` /
+  `toggle-hidden` / `status-message` / `pane-status`。
+- **prompt 输入框自动聚焦，且 `window.input()` 是从光标处插入** → 想替换全文先 `press("cmd-a")`。
+- **`try_find` 不按 `visible` 过滤**（它只在渲染树里找），所以判断"看不看得见"必须自己量 bounds。
+- **单栏没有 `pane-slot`** → 用 `("row-name", i)`；双栏用 `row_names_in(slot)`。
+- **竖向溢出要单独开那个高度**（上面那条只讲了宽度）：`open_app_of_size(cx, w, h)`——
+  只改宽度的测试量不到竖向溢出。点折叠线以下的行之前先 `scroll_sidebar()`；
+  滚动容器自己也要 `.test_support()`。可用的开口只有三个：`open_in` /
+  `open_in_with_app` / `open_in_at_width`（**没有更多 `open_in_*` 变体**，别照名字猜）。
+- **`ViewMode` 是 `rename_all = "snake_case"`** → 夹具里写 `"Grid"` 会让**整份 settings
+  解析失败、静默退回默认值**，看着像"设置没生效"。
+- **从文件管理器启动的进程没有终端**：`eprintln!` 看不见，要写日志文件。
+- **`tempfile::tempdir()` 在 macOS 给 `.tmpXXXX`**，要按真名建子目录做夹具；
+  比对路径前先 `canonicalize`（`/var` 与 `/private/var` 是同一个目录两种写法）。
+
 ## 架构与范围纪律
 
 - 新功能先查 `ROADMAP.md`：在"明确不做"清单里的，直接拒绝，不要"顺手加上"，也**不要因为"先把接口定好放着"就例外**。
@@ -204,6 +293,11 @@ scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle �
   - `h_flex()` 带的是 `items_center`（cross 轴居中），那种情况下遇到超宽内容**不会重新分配**，子元素照旧按固有宽度往右排
 - 固定边框（侧栏 / 详情板这类 `w(px(N)) + flex_shrink_0`）在窄窗口下会把内容区挤没。
   给用户折叠开关，别做"窄了自动藏"——用户比程序更清楚自己现在有多宽。
+- **竖向是同一个问题的另一半，而且更容易漏。** 侧栏中间那几段（收藏、卷、标签）
+  条目数不可控，竖着堆就把页脚顶出窗口；横向的测试一条都测不出竖向溢出。
+  做法：中间段装进 `flex_1 + min_h_0 + overflow_y_scroll` 的列，页脚做它的**兄弟**
+  钉底（不是"最后一个子元素靠 `justify_end`"）。滚动容器自己也要 `.test_support()`；
+  点折叠线以下的行之前先 `scroll_sidebar()`。开那个高度用 `open_app_of_size(cx, w, h)`。
 - **布局挤不下时，第一问是"结构对不对"，不是"尺寸够不够"。**
   - 顶部**地址栏一行、工具栏一行**（跟 Win11 Explorer 一样）。两者挤在一行时
     那一排固定部分合计 590 px，比任何一档窗口都宽。
@@ -225,6 +319,14 @@ scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle �
   - **固定宽度的东西不参与收缩，等于钉死**。`Button` 根节点、`min_w`、
     包在 `flex_shrink_0` group 里的子元素，三者任一都在，行就永远缩不进容器。
     要让它让位，宽度得写在**可收缩的父槽**上。
+  - **竖向同理：长度不可控的一列要么自己滚，要么把别的东西顶出去。** 侧栏的
+    位置 / 收藏 / 磁盘 / 云 / 远程每一段都会长（收藏是用户加的、磁盘会热插拔），
+    所以它们装进一个 `flex_1 + min_h_0 + overflow_y_scroll` 的列，底部的
+    「本地文件系统」是**它的兄弟**（钉在底部），多出来的高度自己滚。
+  - 这一条最阴的地方在判据上：**没有裁剪祖先时，溢出到窗口外的元素照样报
+    `visible`**。所以旧结构（页脚直接排在内容后面）在磁盘行变高之后界面已经残了，
+    而"点得到"的判据还是绿的——直到内容装进 `overflow_y_scroll`，那层裁剪才
+    让 `window.click` 报 `not visible`，缺陷才现形。**滚动容器顺手把假的绿变回真。**
   - **只在需要时插入的元素会让整列错位**。标记色点原来按需插入，被标记的那行
     就比旁边所有行右移"点宽 + 一个 gap"——表头不补那一段的话「名称」也跟着错。
     这种槽要**整列常驻**，不用时画全透明。

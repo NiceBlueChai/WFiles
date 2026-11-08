@@ -64,6 +64,20 @@
 
 三个平台同等优先是这个项目的硬规矩：路径按字节走、删除走系统回收站、保留名与非法字符用同一份校验规则。但「同等对待」目前只到代码层——手上没有另外两个平台的构建环境，**在那里真跑起来之前不敢说能用**。这一栏等验过了会更新。
 
+## 给开发者
+
+业务逻辑全在 `crates/wfiles-core/`（不依赖任何界面框架），界面在 `src/`，依赖方向只有「界面 → core」。
+想加一个 TUI、或换掉 GUI 框架：从 [`examples/wfiles-tui.rs`](examples/wfiles-tui.rs)（单个文件、只依赖标准库和 core）
+和 [`docs/architecture.md`](docs/architecture.md) 起步，核心一行不用改。
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | 分层怎么切、状态归谁、契约怎么用、加东西动哪里 |
+| [`docs/core-capabilities.md`](docs/core-capabilities.md) | 核心能力清单：模块 × 职责 × 入口 × 已知限制 |
+| [`docs/cross-platform-filesystem.md`](docs/cross-platform-filesystem.md) | 三平台文件系统约束与特殊对象处理 |
+| [`AGENTS.md`](AGENTS.md) | 工程铁律、测试纪律、环境坑（改代码前必读） |
+| [`ROADMAP.md`](ROADMAP.md) | 功能范围、阶段进度、明确不做清单 |
+
 ## 构建与运行
 
 需要 Rust stable（本项目用 edition 2024）。
