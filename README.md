@@ -67,7 +67,7 @@
 ## 给开发者
 
 业务逻辑全在 `crates/wfiles-core/`（不依赖任何界面框架），界面在 `src/`，依赖方向只有「界面 → core」。
-想加一个 TUI、或换掉 GUI 框架：从 [`examples/wfiles-tui.rs`](examples/wfiles-tui.rs)（单个文件、只依赖标准库和 core）
+想加一个 TUI、或换掉 GUI 框架：从 [`nsh-poc/src/lib.rs`](nsh-poc/src/lib.rs)（第二个前端的桥接层，只认 `contract::Core`）
 和 [`docs/architecture.md`](docs/architecture.md) 起步，核心一行不用改。
 
 | 文档 | 内容 |

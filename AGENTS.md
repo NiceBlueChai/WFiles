@@ -31,7 +31,6 @@ cargo clippy --workspace --all-targets
 cargo fmt --check
 scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug 可选）
 scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle 时自动调用）
-scripts/smoke-tui.sh      # 用管道真跑一遍 TUI 示例（6 条冒烟判据，改契约时一起跑）
 scripts/smoke-nsh-tui.sh  # NSH 终端后端：真 pty 跑 `nsh run --target tui`，回放最后一屏判 10 条（7 静态 + 3 键盘）
 
 cd nsh-poc && ~/.nsh-source/bin/nsh check  # NSH 客户端：类型检查（首次 40~45s，增量 1-3s）
@@ -152,10 +151,8 @@ cd nsh-poc && ~/.nsh-source/bin/nsh test   # NSH 客户端：headless 测试（�
 |---|---|
 | `crates/wfiles-core/tests/boundary.rs` | 护栏：core 源码/依赖表不许出现界面框架，也不许反向依赖界面模块 |
 | `crates/wfiles-core/tests/contract.rs` | 新前端验收场景（浏览 / 复制撤销 / 删除 / 改名 / 新建 / 链接策略 / 重名两种粒度 / 中止 / 搜索 / 预览 / 卷 / 撤销标签，24 条） |
-| `examples/wfiles-tui.rs` | 只用标准库 + core 的 TUI 示例：**新增前端的最小接入形态**。覆盖契约三种形状（普通命令 / 只读查询 / 流式搜索）；冒烟判据见 [`scripts/smoke-tui.sh`](scripts/smoke-tui.sh) |
-| `nsh-poc/` | **NSH 客户端**：TSX 界面 + `wfiles-core` 后端（独立 `[workspace]`，不在 cargo workspace 里）。结构与坑见 [`docs/nsh-client.md`](docs/nsh-client.md) |
+| `nsh-poc/` | **NSH 客户端**：TSX 界面 + `wfiles-core` 后端（独立 `[workspace]`，不在 cargo workspace 里）。**同一份 `App.tsx` 跑桌面与终端两个宿主**，所以它也是「core 能被第二个前端接上」的活证据。结构与坑见 [`docs/nsh-client.md`](docs/nsh-client.md) |
 | `scripts/bundle-macos.sh` / `make-icon.sh` | 打 `.app` / 由 SVG 生成 `.icns` |
-| `scripts/smoke-tui.sh` | 用管道喂命令**真跑一遍 TUI**，逐项验输出（6 条）：预览内容、撤销标签、策略回显、搜索命中与收尾、卷命令 |
 | `assets/wfiles.svg` | 应用图标源稿 |
 | `README.md` / `README.en.md` | 门面：功能一览、平台状态、构建运行、数据位置、快捷键表 |
 | `ROADMAP.md` | 产品路线图：功能范围、阶段划分、明确不做清单 |

@@ -85,7 +85,7 @@ WFiles = **一个跨平台核心**（`wfiles-core`）+ **可替换的界面**（
 
 命令全表见 [`core-capabilities.md` 8.1](core-capabilities.md)。
 
-最小接入示例就是 `examples/wfiles-tui.rs`：只依赖标准库和 core，全程不认识任何界面框架。它刻意覆盖契约的**三种形状**——普通命令（回执就是新清单：`cd` / `cp` / `undo` / `mkdir`）、只读查询（`preview` / `volumes` / `undo_label` / `conflict_policy`，**不是 `Command`**）、流式命令（`search` 立刻返回，命中分批从事件流收，收到 `SearchDone` 才收工）。`scripts/smoke-tui.sh` 用管道喂命令真跑一遍，逐项验输出（6 条）。**这也是"新增 TUI 不用改核心"的验收用例。**
+**第二个前端就是活证据**：`nsh-poc/` 的同一份 `App.tsx` 跑两个宿主（macOS 桌面与终端 `--target tui`），后端只走 `contract::Core`，core 一行没改。契约的**三种形状**——普通命令（回执就是新清单：`Enter` / `Copy` / `Undo` / `CreateFolder`）、只读查询（`preview` / `volumes` / `undo_label` / `conflict_policy`，**不是 `Command`**）、流式命令（`Search` 立刻返回，命中分批从事件流收，收到 `SearchDone` 才收工）——由 `crates/wfiles-core/tests/contract.rs` 的 24 条钉住。**不要再写第三份"最小示例"**：那种只画界面的夹具与真前端重复，core 一改就得跟着改。
 
 ## 五、一次操作走的两条路（看清哪里共用、哪里分岔）
 
@@ -141,7 +141,7 @@ NSH 的磁盘面板直接调 `volumes::detected()` 而不是 `Core::volumes()`�
 
 | 我想加… | 改这里 | 别动 |
 |---|---|---|
-| 新前端（TUI / 换 GUI） | 新建一个 crate，只 `use wfiles_core::contract::*`；照 `examples/wfiles-tui.rs` 起步 | 不改 core 一行。真需要新能力时先加 `Command`，再加实现 |
+| 新前端（TUI / 换 GUI） | 新建一个 crate，只 `use wfiles_core::contract::*`；照 `nsh-poc/src/lib.rs` 起步（桥接层只做 JSON 转换） | 不改 core 一行。真需要新能力时先加 `Command`，再加实现 |
 | 一个新的文件操作 | `crates/wfiles-core/src/ops.rs`（+ 需要的话 `KernelCommand` / `Command` / `KernelEvent`） | 不在界面里直接 `fs::copy` |
 | 一个新的特殊文件系统对象 | `crates/wfiles-core/src/entry_kind.rs`：加 `EntryKind` 变体 + `classify` 分支 + 单测 | 不在遍历/搬运里各写一份 `is_xxx()` |
 | 一个新的远程协议 | `crates/wfiles-core/src/remote.rs`（实现 `Remote` trait）+ 新模块，并在 `remote` 的构造处登记 | 不改 `ops` 的搬运流程：它只认 trait |
@@ -187,4 +187,4 @@ NSH 的磁盘面板直接调 `volumes::detected()` 而不是 `Core::volumes()`�
 3. `crates/wfiles-core/src/entry_kind.rs` —— 特殊文件系统对象的统一语义（三平台规则都是纯函数）
 4. `crates/wfiles-core/src/ops.rs` —— 搬运/撤销/续传的真身
 5. `src/app.rs` → `src/pane.rs` → `src/ops_entity.rs` —— 界面怎么订阅、怎么调度
-6. `examples/wfiles-tui.rs` —— 一个文件看懂：新前端最少需要什么
+6. `nsh-poc/src/lib.rs` —— 第二个前端的桥接层：怎么只做 JSON 转换、不写业务逻辑
