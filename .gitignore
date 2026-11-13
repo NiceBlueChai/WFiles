@@ -1,5 +1,51 @@
-/target
-.DS_Store
+# ---- 构建产物 ----
+# 用 target/（不限层）而不是 /target：nsh-poc 是独立 workspace，它自己有
+# 64G 的 target/，根这份规则得能兜住，别指望子目录那份一直在。
+target/
+
+# bundle 脚本允许 --out 指到任意目录，误落在仓库根时不许进仓库
+*.app
+*.dmg
+
+# ---- 本机与外部卷 ----
+# 项目常放在 Ventoy 这类 exFAT 卷上，macOS 会给每个文件配一个 ._xxx 资源叉
+# 伴生文件（打 .app 时它会让 codesign 拒签、git gc 会把它当 pack 索引）
 ._*
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# Finder 写在卷根的目录；仓库现在不在卷根，换个摆放位置（或换台机器挂载）
+# 就会出现在这里
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.TemporaryItems/
+.com.apple.timemachine.donotpresent
+
+# ---- 密钥与本地配置 ----
 .env
+.env.*
+!.env.example
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+
+# .workbuddy/ 是本地 skill 副本与记忆目录（AGENTS.md「仓库结构」有交代）：
+# 只在本机存在，不进仓库
 .workbuddy/
+
+# ---- 覆盖率与临时产物 ----
+*.profraw
+*.profdata
+/coverage/
+lcov.info
+*.log
+*.tmp
