@@ -805,7 +805,7 @@ cargo`）。`Wfiles::home()` 因此多了一个只在设了该变量时才走的
 [`ROADMAP.md`](../ROADMAP.md)「明确不做」里，不在这张表上。
 
 2026-11-08 用户逐条拍板，两项**正式移入 [`ROADMAP.md`](../ROADMAP.md)「明确不做」**，不再挂在候选清单里：
-**NSH 内嵌终端**（0.2.0 没有 PTY / 子进程能力）与**拖出到 Finder**（只有 drop destination、没有 drag source）。两条都只限 NSH 客户端——GUI 版的内嵌终端与系统拖出是做完的，别误读成"项目不做"。理由逐条写在 ROADMAP 里，上游有能力了再单独重新提。
+**NSH 内嵌终端**（0.5.0 有 `nsh/process` 的 `spawn` / `run` 子进程，但仍无 PTY；`Terminal` 组件只负责显示程序输出）与**拖出到 Finder**（0.5.0 实测仍只有 drop destination，`NSDraggingSource` 零引用）。两条都只限 NSH 客户端——GUI 版的内嵌终端与系统拖出是做完的，别误读成"项目不做"。2026-11-14 按 0.5.0 源码复核过，**结论不变**；理由逐条写在 ROADMAP 里，上游有了 PTY / drag source 再单独重新提。
 
 ## 八、跟 GUI 版的关系
 

@@ -927,8 +927,8 @@ bash 里 **`$变量` 紧跟全角字符要写 `${变量}`**（全角括号会被
 | **macOS 显示包内容（`.app`/`.framework` 当文件夹展开）** | 单平台专属。Finder 的「显示包内容」已经能用，而 Windows / Linux 上根本没有对应的包概念——为它写 `#[cfg(target_os = "macos")]` 分支不值当。隐藏项开关本身已经让 `.app` 这个名字在列表里可见了，需要进去的用户有 Finder |
 | Git 完整工作流（stage/commit/push） | 保留状态列；提交推送归终端/IDE |
 | **遥测（埋点 / 崩溃上报 / 任何离开本机的数据）** | 2026-10-14 用户决定整条不做。"可放心"是这个项目的卖点之一，而遥测与它直接冲突：用户凭什么相信一个会往外发数据的文件管理器？一条日常路径都不覆盖，换来的是持续的隐私负担与维护成本。崩溃诊断改走**用户自己导出的日志文件**，不发往任何服务器 |
-| **NSH 客户端内嵌终端**（2026-11-08 拍板） | 只限 NSH 客户端，不影响 GUI 版已做好的内嵌终端（P2，`portable-pty` + `vt100`）。NSH 0.2.0 没有子进程 / PTY 能力，要补就得给三个平台各写一份 native module——那是把界面层重新搬一遍，而"开终端"这件事系统终端本来就做得更好。**能力缺失，不是排期问题**；等上游给出 PTY 再说 |
-| **NSH 客户端拖出到 Finder / Explorer**（2026-11-08 拍板） | 只限 NSH 客户端，不影响 GUI 版「拖出窗口交给系统」（P2）。NSH 0.2.0 只有 drop destination，**没有 drag source**（`nsh-platform-macos` 里 `NSDraggingSource` 零引用）。自己写 objc2 + 三平台各一份 = 走回"同一件事三份实现"的老路。当初 PoC 暴露的头号缺口，逐条确认后归档，不再挂在候选清单里；上游有了 drag source 再重新提 |
+| **NSH 客户端内嵌终端**（2026-11-08 拍板；2026-11-14 按 0.5.0 复核，结论不变） | 只限 NSH 客户端，不影响 GUI 版已做好的内嵌终端（P2，`portable-pty` + `vt100`）。**0.5.0 已补上子进程**：`nsh/process` 有 `spawn` / `run`（管道式、受 `capabilities.process.execute` 控制），但**仍没有 PTY**——`Terminal` 组件只显示程序输出，TUI host 里的 `openpty` 全是测试夹具；交互式 shell 要的 TTY / 窗口尺寸 / SIGINT 还得给三个平台各写一份 native module，那是把界面层重新搬一遍，而"开终端"这件事系统终端本来就做得更好。**能力缺失，不是排期问题**；等上游给出 PTY 再说 |
+| **NSH 客户端拖出到 Finder / Explorer**（2026-11-08 拍板；2026-11-14 按 0.5.0 复核，结论不变） | 只限 NSH 客户端，不影响 GUI 版「拖出窗口交给系统」（P2）。**0.5.0 实测仍只有 drop destination**（`nsh-platform-macos/src/file_drop.rs`），`NSDraggingSource` / `beginDraggingSession` / `NSDraggingItem` 在整个 `nsh-platform-macos/src/` 零引用。自己写 objc2 + 三平台各一份 = 走回"同一件事三份实现"的老路。当初 PoC 暴露的头号缺口，逐条确认后归档，不再挂在候选清单里；上游有了 drag source 再重新提 |
 
 ## 技术边界
 
