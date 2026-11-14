@@ -34,8 +34,8 @@ use std::sync::{Arc, Mutex};
 use wfiles_core::contract;
 use wfiles_core::model::SortKey;
 use wfiles_core::ops::ConflictPolicy;
-// 远程客户端的方法都在 trait 上（`list` / `download` / `stat`），要用就得把它带进作用域。
-use wfiles_core::remote::Remote as _;
+// `REMOTE` 存的是 `Arc<dyn Remote>`——core 的 `remote::open()` 直接给的 trait object，
+// `list` / `download` 都在它上面，不必再把 trait 单独带进作用域。
 
 /// 全局唯一的浏览内核。
 ///
@@ -513,14 +513,18 @@ impl Wfiles {
             url,
             user,
         );
-        match wfiles_core::sftp::Sftp::new(&config, &password) {
+        // 走 core 的统一入口，不直接碰协议实现：`sftp` feature 关掉时
+        // `remote::open()` 会明确报"这个构建没有包含 SFTP 支持"，既不会静默失败，
+        // 也不会让这个 dylib 编不过（core 的 `sftp` 模块那时根本不存在）。
+        match wfiles_core::remote::open(&config, &password) {
             Ok(client) => {
                 // 先列根目录再存：连上了但列不出来的连接没有用，不如当场报。
                 let listed = client.list("");
                 let mut guard = REMOTE
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *guard = Some(Arc::new(client));
+                // `open` 给的已经是 `Arc<dyn Remote>`，别再包一层。
+                *guard = Some(client);
                 match listed {
                     Ok(entries) => json!({
                         "ok": true,
@@ -1126,10 +1130,10 @@ fn arm_transfer(core: &mut contract::Core) {
 
 /// 在一条**独立线程**上跑一段需要内核的逻辑，等它跑完。
 ///
-/// 为什么不用 `tokio::spawn_blocking`：这个构建把 core 的 tokio 关掉了
-/// （`default-features = false`，理由见 Cargo.toml 的 sftp feature），
-/// NSH 的运行时也不保证有 blocking 池。`std::thread` 最稳：一次操作一条线程，
-/// 跑完就退。`async-channel` 负责把结果送回界面线程。
+/// 为什么不用 `tokio::spawn_blocking`：core 的 tokio 是 `sftp` feature 带进来的
+/// **可选**依赖，关掉 `sftp` 的构建里根本没有它；即便开着，NSH 的运行时也不
+/// 保证有 blocking 池。`std::thread` 两种情况下都稳：一次操作一条线程，跑完就退。
+/// `async-channel` 负责把结果送回界面线程。
 ///
 /// 注意锁的粒度：`CORE` 的锁在 `work` 里拿、在 `work` 里放，
 /// `await` 的时候**不持有**，不会把界面线程卡在 `.await` 上。

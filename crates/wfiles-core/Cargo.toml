@@ -12,15 +12,14 @@ publish = false
 test-support = []
 
 # SFTP。默认开（GUI/TUI/NSH 都要它），但**可以被关掉**：
-# `russh` 把 `rsa` 钉在 `=0.10.0-rc.18`，而 `quickjs-jit-stdlib`（NSH 的 web host
-# 用它跑 JS）的 optional `rsa ^0.10.0-rc.19` 会要 `pkcs1 ^0.8.0-rc.5`，两者在同一个
-# 依赖图里无交集。这一冲突**在 NSH 那一侧解决**（剪掉 host 的 `nsh-js/crypto` 那条
-# feature 边，见 `docs/nsh-client.md` §6.5），所以这里保持默认开。
-#
-# 真遇到只能靠关它来的构建时，关掉之后 `remote::Kind::Sftp` 仍然存在（界面照样能
-# 列出这个选项），只是连接时会明确报"这个构建没有包含 SFTP 支持"，不会静默失败。
+# 关掉之后 `remote::Kind::Sftp` 仍然存在（界面照样能列出这个选项），只是连接时会
+# 明确报"这个构建没有包含 SFTP 支持"，不会静默失败。
 default = ["sftp"]
 sftp = ["dep:tokio", "dep:russh", "dep:russh-sftp"]
+# 把 `russh` 的 RSA 支持加回来（依赖声明里默认关着它，见下面依赖注释）。
+# 只给**不掺 NSH 依赖图**的构建（GUI / 主仓）用：NSH 那边一开就撞回 `pkcs1`，
+# 所以不进 default。
+sftp-rsa = ["sftp", "russh/rsa"]
 
 [dependencies]
 # 下面每一项都来自主 crate 原有的依赖，没有引入新的第三方库。
@@ -42,7 +41,13 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 quick-xml = { version = "0.38", default-features = false }
 suppaftp = "12"
 # SFTP 那一组默认开、可关（见 [features] 里的说明）。
-russh = { version = "0.64", optional = true }
+#
+# **`rsa` 是 russh 的默认 feature，这里故意不启用**：它会精确钉
+# `pkcs1 =0.8.0-rc.4`，而 NSH 的 `quickjs-jit-stdlib` 经 `rsa rc.19` 要
+# `pkcs1 ^rc.5`，同一依赖图里没有交集（`nsh check` 直接选不出 rsa 版本）。
+# 关掉之后只走 ed25519 / ECDSA 主机与用户密钥，SFTP 照常可用，冲突从根上不成立。
+# 需要 RSA 密钥的构建可以开 `sftp-rsa` 把它加回来（见 [features]）。
+russh = { version = "0.64", default-features = false, features = ["flate2", "aws-lc-rs"], optional = true }
 russh-sftp = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util"], optional = true }
 async-channel = "2.5.0"

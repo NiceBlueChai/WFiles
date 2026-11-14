@@ -2,9 +2,9 @@
 # WFiles × NSH 的**终端**冒烟：真跑 `nsh run --target tui`，在一个 120×40 的
 # 真 pty 里，把最后一屏回放成文本，再逐项判。
 #
-# 为什么不是 `nsh test --target tui`：NSH 0.4.0 那条路上，**带 Rust 原生模块的
-# app 一次都跑不起来**——`.nsh/rust/tui-host` 起来了、bundle 也编好了，但引擎里
-# 没有 app 自己的 UI set：
+# 为什么不是 `nsh test --target tui`：NSH 0.4.0 与 0.5.0 都实测过，**带 Rust
+# 原生模块的 app 一次都跑不起来**——`.nsh/rust/tui-host` 起来了、bundle 也编好了，
+# 但引擎里没有 app 自己的 UI set：
 #     error bundle failed: Error: could not load module 'wfiles/native'
 # 同一个二进制 `nsh run --target tui` 却是好的，所以缺口在测试通道，不在宿主。
 # 在它修好之前，TUI 的判据只能落在这里：真终端 + 真 app + 屏上真有的字。
@@ -20,18 +20,19 @@
 # 环境：`WFILES_HOME` 指到夹具目录（app 的落点是 `Wfiles::home()`）。
 # 不能用 `HOME` 顶替——rustup / cargo 的 toolchain 就在 `$HOME` 底下，
 # 一改 nsh 连 cargo 都起不来（实测：`rustup could not choose a version of cargo`）。
-# NSH 默认取 ~/.nsh-source/bin/nsh（源码构建的 0.4.0，带 tui target）；
-# 发行版 nsh 没有 tui，这个脚本会直接报错而不是假装绿。
+# NSH 默认取 ~/.nsh/bin/nsh（0.5.0 发布版，tui target 已随发行版提供）。
+# 0.4.0 时代这里得指源码构建的那份——那时发行版没有 tui；现在反过来，
+# 找不着就直接报错，不假装绿。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-NSH="${NSH:-$HOME/.nsh-source/bin/nsh}"
+NSH="${NSH:-$HOME/.nsh/bin/nsh}"
 SECONDS_OPEN="${SMOKE_SECONDS:-90}"
 
 cd "$HERE/nsh-poc"
 
 if [[ ! -x "$NSH" ]]; then
-  printf '找不到 %s：TUI 需要带 tui target 的 0.4.0（源码构建），见 docs/nsh-client.md\n' "$NSH" >&2
+  printf '找不到 %s：TUI 需要 0.5.0 发布版 CLI（~/.nsh/bin/nsh），见 docs/nsh-client.md\n' "$NSH" >&2
   exit 2
 fi
 

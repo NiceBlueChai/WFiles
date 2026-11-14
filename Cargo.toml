@@ -13,7 +13,9 @@ members = ["crates/wfiles-core"]
 default-members = [".", "crates/wfiles-core"]
 
 [dependencies]
-wfiles-core = { path = "crates/wfiles-core" }
+# GUI 要能连 RSA 主机/私钥的老服务器，所以把 `sftp-rsa` 打开；NSH 客户端不带它
+# （会撞回 `pkcs1`），见 crates/wfiles-core/Cargo.toml 的 features 说明。
+wfiles-core = { path = "crates/wfiles-core", features = ["sftp-rsa"] }
 # 界面层只单向依赖 core；core 的依赖表里没有 gpui-kit。
 gpui-kit = "0.7.1"
 async-channel = "2.5.0"

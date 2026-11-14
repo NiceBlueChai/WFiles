@@ -33,19 +33,23 @@ scripts/bundle-macos.sh   # 打一个能双击的 WFiles.app（release；--debug
 scripts/make-icon.sh      # 从 assets/wfiles.svg 生成 WFiles.icns（bundle 时自动调用）
 scripts/smoke-nsh-tui.sh  # NSH 终端后端：真 pty 跑 `nsh run --target tui`，回放最后一屏判 10 条（7 静态 + 3 键盘）
 
-cd nsh-poc && ~/.nsh-source/bin/nsh check  # NSH 客户端：类型检查（首次 40~45s，增量 1-3s）
-cd nsh-poc && ~/.nsh-source/bin/nsh test   # NSH 客户端：headless 测试（首次 ~1m25s，热 30~50s）
-                                           # `nsh` 不在 PATH，别写成 `nsh check`
+cd nsh-poc && ~/.nsh/bin/nsh check   # NSH 客户端：类型检查（换版本后首编 Rust ~3m，增量 2-20s）
+cd nsh-poc && ~/.nsh/bin/nsh test    # NSH 客户端：headless 测试（43 条；换版本后首建 runner ~3m35s）
+                                     # `nsh` 不在 PATH，别写成 `nsh check`
 ```
 
-- **NSH 有两份 CLI**：`~/.nsh-source/bin/nsh` 是 0.4.0（源码构建，**只有它带
-  `--target tui`**），`~/.nsh/bin/nsh` 是发行版 0.2.0。本仓按 0.4.0 写，见
-  [`docs/nsh-client.md`](docs/nsh-client.md) §六。app 的 `nsh-core` / `nsh-base`
-  按 **path** 依赖源码 checkout，不是 crates.io——`nsh-tui-host` 与
-  `nsh-platform-tui` 没发布，走 registry 就编不出 tui host。
-  **这条上游缺口 2026-11-08 拍板不追**（不报 issue、不 fork），path 依赖是长期形态；
-  同理 `nsh test --target tui` 不认带 `#[native_module]` 的 app，TUI 判据因此落在
-  `scripts/smoke-nsh-tui.sh`，**以后加判据就往脚本里加，别再提搬进 `nsh test`**。
+- **NSH CLI 现在是官方发行版 0.5.0**：`~/.nsh/bin/nsh`（`nsh 0.5.0 (f4d68f7)`），
+  自带 `--target tui`；`nsh-poc` 的 `nsh-core` / `nsh-base` 走 **crates.io 的 `0.5.0`**，
+  不再 path 依赖源码 checkout（0.4.0 时代那两块 tui host 没发布，0.5.0 已发布）。
+  旧发行版备份在 `~/.nsh-0.2.0-backup/`，`~/.nsh-source/` 是 0.4.0 的历史遗留，
+  构建不再用它。见 [`docs/nsh-client.md`](docs/nsh-client.md) §6.1。
+- **`pkcs1` 死锁在 core 侧解决**：`wfiles-core` 的 `russh` 依赖关掉默认的 `rsa`
+  feature（只留 ed25519/ECDSA），`rsa` / `pkcs1` 就不进 NSH 依赖图；GUI 侧用
+  `sftp-rsa` feature 把 RSA 支持加回来。**别再去剪上游 `nsh-engine` 的 feature 边**
+  （0.4.0/0.5.0 早期的做法，升级会被覆盖），也别自研 SSH 协议栈。见 §四.1。
+- **`nsh test --target tui` 不认带 `#[native_module]` 的 app**（0.4.0 与 0.5.0 都实测过），
+  TUI 判据因此落在 `scripts/smoke-nsh-tui.sh`，**以后加判据就往脚本里加，
+  别再提搬进 `nsh test`**。
 - **`E0463: can't find crate for X which Y depends on` 先怀疑 exFAT 上的陈旧产物**，
   不是镜像源：`/Volumes/Ventoy` 的 `target/` 会丢/坏 rlib，重跑一次 `cargo build`
   多半就过（`oxc_*` 与 `zerofrom_derive` 两次都是这个）。

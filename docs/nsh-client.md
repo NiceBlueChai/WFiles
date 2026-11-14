@@ -1,8 +1,9 @@
 # NSH 客户端（TSX 界面 + 共享核心）
 
 > 位置：`nsh-poc/`（**不在 cargo workspace 里**，独立 `[workspace]`）。
-> 跑法：`cd nsh-poc && ~/.nsh/bin/nsh check | test | run --target macos`。
-> （`nsh` 不在 `PATH` 里，直接敲 `nsh` 会 `command not found`——2026-11-07 实测。）
+> 跑法：`cd nsh-poc && ~/.nsh/bin/nsh check | test | run --target tui`。
+> （`nsh` 不在 `PATH` 里，直接敲 `nsh` 会 `command not found`——2026-11-07 实测；
+> 且必须用**0.5.0 官方发行版**：`~/.nsh/bin/nsh`，`nsh 0.5.0 (f4d68f7)`。）
 >
 > 这不是"另写一个文件管理器"。界面是 TSX，**目录模型、排序过滤、搬运、撤销、
 > 特殊文件对象、新建模板、删除语义全在 `wfiles-core`**——与 GUI 版共用同一份代码。
@@ -104,9 +105,9 @@ NSH 的 `onPress` **不带事件参数**（`onPress?: () => void`），界面层
 界面统一调异步版。
 
 异步实现不用 `tokio::spawn_blocking`：`nsh-poc` 自己不依赖 tokio（core 那份
-tokio 是给 SFTP 客户端用的 `rt-multi-thread`，见 §四.1），也没有现成的 runtime
-可挂。改用最朴素的一条：开一个 `std::thread`，在 `async-channel` 的 bounded(1)
-上把结果回传。
+tokio 是 `sftp` feature 带来的 `rt-multi-thread`，feature 一关就没有），也没有
+现成的 runtime 可挂。改用最朴素的一条：开一个 `std::thread`，在
+`async-channel` 的 bounded(1) 上把结果回传。
 
 ```rust
 async fn on_worker<R, F>(work: F) -> Option<R>
@@ -358,33 +359,58 @@ core 只回 `Preview::Opaque(Kind)`。接法：
 
 ## 四、两个必须知道的坑
 
-### 1. `pkcs1` 版本死锁 → 从 `nsh-engine` 剪掉一条 feature 边
+### 1. `pkcs1` 版本死锁 → 关掉 `russh` 的 `rsa` feature
 
 `nsh check` 会为**所有平台**建 host（macos / linux / windows / ios / android / web /
 test）。web host → `quickjs-jit-stdlib` 的 **optional** `rsa ^0.10.0-rc.19` 由
-`nsh-js` 的 `crypto` feature 打开；而 `wfiles-core` → `russh 0.64` 精确钉
-`rsa =0.10.0-rc.18`。真正没有交集的是更底下一层：**`pkcs1`**——`russh` 要
-`=0.8.0-rc.4`（连带 `rsa =rc.18`），`rsa rc.19` 要 `pkcs1 ^0.8.0-rc.5`。
+`nsh-js` 的 `crypto` feature 打开；而 `wfiles-core` → `russh 0.64` 的 `rsa` feature
+精确钉 `rsa =0.10.0-rc.18` / `pkcs1 =0.8.0-rc.4`。真正没有交集的是更底下一层：
+**`pkcs1`**——`russh` 要 `=rc.4`，`rsa rc.19` 要 `^rc.5`。报错可能显示成
+`failed to select a version for rsa` 或 `pkcs1`，取决于 lock 里锁了什么。
 
-查过 crates.io index：`russh` 0.63–0.65 全部钉死 `rc.4`，升级无解；
-`quickjs-jit-stdlib` 只有 0.14.x 带 `rsa`，降级也无解。
+0.5.0 上游**没修**：`quickjs-jit-stdlib` 仍是 `=0.14.2`，`nsh-engine` 的
+`crypto = ["js-core", "nsh-js/crypto"]` 原样。查过 crates.io index：`russh`
+0.63–0.65 全部钉死 `rc.4`，升级无解；`quickjs-jit-stdlib` 只有 0.14.x 带 `rsa`，
+降级也无解。
 
-**解法在上游源码 checkout 里，不在本仓**：`crates/nsh-engine/Cargo.toml` 的
-`crypto` feature 从 `["js-core", "nsh-js/crypto"]` 改成 `["js-core"]`——host 侧
-用不到 JS 的 crypto 开关。**一条边同时解掉所有平台的 host**，比逐个 crate 去关
-默认的 `crypto` 干净得多。于是：
+**2026-11-14 起的解法（本仓一行，不动上游、不关 SFTP）**：
+`crates/wfiles-core/Cargo.toml` 里
 
-- `wfiles-core` 的 `sftp` feature **保持默认开**，SFTP 能用了；
-- `nsh-poc` 不再需要 `default-features = false`（§四.1 的旧版本曾这么绕）。
+```toml
+russh = { version = "0.64", default-features = false,
+          features = ["flate2", "aws-lc-rs"], optional = true }
+```
 
-代价是这条改动会被上游升级覆盖，恢复办法写在 **§6.5**（`nsh-engine` 的注释里
-引的就是那一节）。
+`rsa` 只是 `russh` 的**可选 feature**（`rsa = ["dep:rsa", "dep:pkcs1", "ssh-key/rsa"]`），
+默认才开。关掉它，`rsa` / `pkcs1` 根本不进依赖图，host 那侧想选 `rc.19` 就选，
+冲突从根上不成立。SFTP 照常可用，只少了 RSA 主机/私钥的老服务器
+（ed25519 / ECDSA 正常）。`cargo tree -i rsa` / `-i pkcs1` 都答「包不在依赖图里」。
 
-两个踩过的坑：
+- **GUI 不牺牲 RSA**：主仓 `Cargo.toml` 给 `wfiles-core` 加 `features = ["sftp-rsa"]`，
+  这个 feature 用 `russh/rsa` 把支持加回来；GUI 的依赖图里没有 `quickjs-jit-stdlib`，
+  不会冲突。NSH 客户端是独立 workspace，不带它。
+- **NSH 侧的 `sftp` 单独开关**：`nsh-poc/Cargo.toml` 的 `[features]` 里
+  `default = ["sftp"]` / `sftp = ["wfiles-core/sftp"]`，要出不带远程的构建用
+  `--no-default-features`。桥接层走 `wfiles_core::remote::open()`，关掉时 core 会
+  明确报"这个构建没有包含 SFTP 支持"，既不静默失败也不编不过。
+
+**别自研 SSH**：`sftp.rs` 1327 行里客户端的 known_hosts、密码/私钥认证、
+channel + `subsystem("sftp")` 全靠 `russh`，包协议靠 `russh-sftp`，还带一整套
+server 夹具给单测用。从 tokio 重写等于重写 SSH-2 传输层 + 连接层 + SFTP v3
+（KEX、主机密钥验证、AEAD/MAC、认证、流控），几千行密码学协议代码还要跟各家
+OpenSSH 互操作。tokio 只是运行时，要替代的是协议栈，不是运行时。
+
+**负验证**（发布版 0.5.0 CLI 上做的）：把那行改回
+`russh = { version = "0.64", optional = true }`，`nsh check` 立刻红回
+`failed to select a version for pkcs1`，`cargo tree -i rsa` 能把
+`rsa rc.18 → pkcs1 =rc.4` 那条链完整打出来；改回来、删掉
+`nsh-poc/.nsh/rust/Cargo.lock` 重解析，check 又绿。
+
+两个仍然成立的旧坑：
 
 - `.nsh/rust/Cargo.lock` 里的 `pkcs1` 可能被锁成正式版 `0.8.0`（有 `rsa rc.19`
-  时留下的），此时报错看起来像"无交集"，其实是旧锁在撒谎。**删掉 lock 重新解析**
-  就落到 `rc.4`；`cargo update -p pkcs1 --precise` 会把 lock 弄成半更新，越弄越乱。
+  时留下的），此时报错看起来像"无交集"，其实是旧锁在撒谎。**删掉 lock 重新解析**；
+  `cargo update -p pkcs1 --precise` 会把 lock 弄成半更新，越弄越乱。
 - **别为了让 SFTP 回来去降级 russh**：0.61–0.65 全系钉 `=rc.18`，只有 ≤0.60 用
   `^rc.10`；跨 4 个 minor 降级会撞 API 变更，代价远大于收益。
 
@@ -399,15 +425,18 @@ test）。web host → `quickjs-jit-stdlib` 的 **optional** `rsa ^0.10.0-rc.19`
 
 ```bash
 cd nsh-poc
-# 0.4.0，源码构建的那份（带 `--target tui`，理由见 §六）：
-~/.nsh-source/bin/nsh check   # 首次 40~45s（编 Rust crate），增量 1-3s
-~/.nsh-source/bin/nsh test    # 首次 ~1m25s（还要建 headless runner），热 30~50s
-~/.nsh-source/bin/nsh run --target macos
-~/.nsh-source/bin/nsh run --target tui     # 终端里跑同一份 App.tsx
+# 0.5.0 官方发行版 CLI（~/.nsh/bin/nsh），自带 --target tui：
+~/.nsh/bin/nsh check   # 类型检查 + Rust crate；换版本后首编约 3m，增量 2-20s
+~/.nsh/bin/nsh test    # 43 条 headless；换版本后首建 runner 实测 3m35s
+~/.nsh/bin/nsh run --target macos
+~/.nsh/bin/nsh run --target tui     # 终端里跑同一份 App.tsx
+../scripts/smoke-nsh-tui.sh         # 真 pty 判据 10 条（相对 nsh-poc/）
 ```
 
-发行版 CLI（`~/.nsh/bin/nsh`，0.2.0）仍在，但**它没有 tui target**，且 0.2.0 与
-0.4.0 的接口差异见 §六.4；本仓现在按 0.4.0 写。
+CLI 是官方 release 的 `nsh-macos-arm64.tar.gz`（sha256 校验过，
+`nsh 0.5.0 (f4d68f7)`），0.2.0 备份在 `~/.nsh-0.2.0-backup/`。
+0.2.0 → 0.4.0 的接口差异见 §6.4，0.4.0 → 0.5.0 见 §6.4.1；
+**本仓现在按 0.5.0 写，且不再需要源码 checkout / path 依赖 / 剪上游 feature 边**。
 
 `App.test.tsx` 的四十三条判据（前三条不画界面，其余真的驱动界面；表按加入顺序，
 第 27、28 条（预览）与第 29、30 条（磁盘）在文件里排在"逐项问"之后、"搜索"之前，
@@ -559,32 +588,30 @@ core 那一层还有一条更狠的：把 `Kernel::transfer` 里的 `self.confli
 NSH 自己的终端后端：同一份 `App.tsx`，界面对象落到 ratatui 的 Cell 网格上
 （默认 1 Cell = 8×16 points，`nsh.json` 的 `tui.pointsPerCell` 可调）。
 
-### 6.1 工具链：必须源码构建，且 app 得按 path 依赖
+### 6.1 工具链：0.5.0 官方发行版 CLI + crates.io 依赖
 
 - `--target tui` 是 **0.4.0 才有**的（0.2.0 与 v0.4.0 的发行版都没有；实测
-  `nsh run --target tui` 在 0.2.0 上直接 `invalid value 'tui'`）。
-- `--target tui` 要的两块 `nsh-tui-host` / `nsh-platform-tui` **没发布到 crates.io**
-  （`index.crates.io/ns/h-/nsh-platform-tui` 404）。走 registry 的话 `nsh check`
-  会给 `.nsh/rust/tui-host` 生成 `nsh-tui-host = { version = "=0.4.0" }`，
-  解析必然失败。
-- 解法是官方给「app 跟着源码一起改」留的入口：`nsh-poc/Cargo.toml` 里把
-  `nsh-core` / `nsh-base` 写成**到某个 checkout 的 path 依赖**。
-  `nsh-cli` 的 `Nsh::of()` 读 app 的 `cargo metadata --no-deps`，看到 path 就
-  让生成的 host 也用 path——app 与 host 天然共用同一份 nsh，不需要 `[patch]`
-  （何况 `.nsh/rust/*` 每次 `nsh run` 都会重写，补丁活不过下一次）。
-- 本机落点：源码 `~/.nsh-source/source`，二进制 `~/.nsh-source/bin/nsh`
-  （`CARGO_TARGET_DIR=/Volumes/Ventoy/nsh-source-target`）。0.2.0 的
-  `~/.nsh/bin/nsh` 没动。
-  **`~/.nsh-source/bin/nsh` 是个符号链接**（→ `…/release/nsh`），不是拷贝：
-  换机器重建时这一步要自己补，漏了它就变成「命令找不到」而不是「版本旧了」，
-  两种故障长得完全不一样。
-- **2026-11-08 拍板：不追上游。** 这两块没发布到 registry，就一直用 path 依赖——
-  **不报 issue、不 fork、不等新版**。理由很实际：path 依赖是官方给「app 跟着源码
-  一起改」留的正规入口，不是绕路；报 issue 要等一个不确定的时间，而这条线现在
-  已经能跑、能判。所以「path 依赖 + 本地源码 checkout」**是长期形态，不是临时方案**，
-  换机器时按本节重建一遍即可（步骤在上面三条里，一条都不省）。
-  什么时候重新考虑：真要在 CI 上跑 TUI 判据、或者要把 `nsh-poc` 交给别人构建时——
-  那时才会需要一个能 `cargo install` 的上游版本。
+  `nsh run --target tui` 在 0.2.0 上直接 `invalid value 'tui'`）。0.5.0 起它进了
+  官方发行版，`nsh-tui-host` / `nsh-platform-tui` 也发布到了 crates.io
+  （两块都是 0.5.0，index 200、未 yank）。
+- **0.4.0 时代**这两块没发布，`nsh check` 会给 `.nsh/rust/tui-host` 生成
+  `nsh-tui-host = { version = "=0.4.0" }` 而解析失败，所以当时只能把
+  `nsh-core` / `nsh-base` 写成**到源码 checkout 的 path 依赖**——`nsh-cli` 的
+  `Nsh::of()` 读 app 的 `cargo metadata --no-deps`，看到 path 就让生成的 host
+  也用 path。这条理由在 0.5.0 已经**不成立**。
+- **2026-11-14 起改回 registry**：`nsh-poc/Cargo.toml` 里就是
+  `nsh-core = "0.5.0"` / `nsh-base = "0.5.0"`，CLI 用 `~/.nsh/bin/nsh`。
+  实测 `nsh check` 绿、43 条判据绿、TUI 冒烟 10/10 绿。
+- **为什么现在能换回来**：`pkcs1` 冲突上游没修（`quickjs-jit-stdlib` 仍是
+  `=0.14.2`、`crypto` 仍拉 `rsa ^rc.19`），但解法挪到了**本仓 core 侧**——
+  关掉 `russh` 的 `rsa` feature（§四.1），不再需要剪上游源码里那两处 feature 边。
+  没有「必须改上游 checkout」这个前提，path 依赖也就没有理由留着。
+- **「2026-11-08 拍板不追上游」这条已经自然消解**：两块 tui host 上游自己发布了，
+  `pkcs1` 我们也在本仓绕开了，不需要报 issue / fork / 等新版。
+  `~/.nsh-source/`（0.4.0 源码构建）是历史遗留，构建不再用它；旧发行版 CLI
+  备份在 `~/.nsh-0.2.0-backup/`。
+- **唯一还缺的那条**是 `nsh test --target tui` 不认原生模块（§6.2，
+  0.4.0 与 0.5.0 都实测过），TUI 判据因此继续落在 `scripts/smoke-nsh-tui.sh`。
 
 ### 6.2 `nsh run --target tui` 能跑，`nsh test --target tui` 不能
 
@@ -602,6 +629,8 @@ NSH 自己的终端后端：同一份 `App.tsx`，界面对象落到 ratatui 的
 ```
 
 **`nsh test --target tui` 在带 Rust 原生模块的 app 上一次都跑不起来**：
+**2026-11-14 在 0.5.0 上原样重测过**，报的仍是同一句（连 tui host 都编出来了，
+2m17s，卡在 bundle 那一步）——所以这条缺口不是 0.4.0 的旧账。
 
 ```text
 error bundle failed: Error: could not load module 'wfiles/native'
@@ -694,44 +723,80 @@ cargo`）。`Wfiles::home()` 因此多了一个只在设了该变量时才走的
 `Input` 在 0.4.0 的**生成类型里缺失**（`nsh/base.d.ts` 只有 `InputHostProps`，没有
 组件本体：它在 `nsh-js` 的 `ELEMENTS` 里只是 `Registry::native_values` 的运行时注册，
 `declarations.rs` 不吐它）。框架自己的夹具照 `nsh/base` import，但夹具不做类型检查，
-所以上游没暴露。`nsh-poc/nsh-input.d.ts` 是补丁，上游补上后删掉即可。
+所以上游没暴露。`nsh-poc/nsh-input.d.ts` 是当时的补丁——**0.5.0 补上了
+`export declare function Input(props: InputProps): JSX.Element`（`base.d.ts:6109`），
+2026-11-14 删掉补丁后 `nsh check` 仍绿，补丁正式退休。**
 
-### 6.5 对 nsh 源码做的那一处改动（升级会被覆盖，此处留底）
+### 6.4.1 0.4.0 → 0.5.0（2026-11-14 实测：没踩到接口差异）
 
-`nsh-poc` 用的是源码 checkout（§6.1），所以能改上游——**目前只改了两行，都是
-feature 边**，为的是把 `rsa` 从 host 的依赖图里彻底摘掉（成因见 §四.1）：
+这次是 1142 个文件、+9.1 万行的大版本，但**`App.tsx` 一行没改**就能跑：
+`nsh check` 绿、43 条判据全绿、TUI 冒烟 10/10 见 §6.3。上表那些坑（`onChange`
+载荷、选择器前缀、`Input` 归 `nsh/base`、`keymap` 归 `nsh`）在 0.5.0 里都还是
+老样子；Release notes 里写的 "Window API replaced" 也没波及
+`Window.get("main")?.set({ title })` 这条路径。
+
+| 变了什么 | 对本仓的影响 |
+|---|---|
+| `Input` 的生成类型补上了 | `nsh-poc/nsh-input.d.ts` 删除（见上文） |
+| `nsh-tui-host` / `nsh-platform-tui` 0.5.0 发布 | **换回 crates.io 依赖 + 官方发行版 CLI**，path 依赖退休（§6.1） |
+| workspace `rust-version = "1.97"` | 本机 1.99.1，够；换机器先看 `rustc --version` |
+| `quickjs-jit-stdlib` 仍 `=0.14.2`、`crypto` 仍拉 `rsa ^rc.19` | `pkcs1` 冲突没修，但解法挪到 core 侧：关 `russh/rsa`（§四.1），不再剪上游 |
+| `nsh test --target tui` 仍不认 `#[native_module]` | §6.2 的 smoke 脚本继续是唯一 TUI 判据 |
+| `Cargo.lock` 新增 0.5.0 带进来的依赖 | 重新解析后的 lock 要提交 |
+
+**升级方式（现在这一版）**：CLI 直接装官方 release 的
+`nsh-macos-arm64.tar.gz`（校验 `.sha256`），解到 `~/.nsh`；
+`nsh-poc/Cargo.toml` 的两个依赖改成 `"0.5.0"`；core 侧关 `russh/rsa`（§四.1）；
+删 `nsh-poc/.nsh/rust/Cargo.lock` 重解析。不需要源码构建（0.4.0 时代重建 CLI
+要 7m58s），也不需要给上游打补丁。实测：`nsh check` 首编约 3m、
+`nsh test` 首建 runner 3m35s、TUI 冒烟 10/10。
+
+**历史**：2026-11-14 早先还走过一次「源码 checkout + 重剪 feature 边」的路
+（shallow checkout 用 `git fetch --depth=1 origin tag v0.5.0`，切完重剪
+`nsh-engine` / `nsh-testing` 两处）。那条路能跑，但每次升级都要重来；现在已被
+上面的方案取代，细节留底在 §6.5，**别照着做**。
+
+### 6.5 曾经改过上游源码，现在不用了（留底）
+
+0.4.0 与 2026-11-14 早期的 0.5.0 都靠**改上游源码 checkout** 绕 `pkcs1`：
+把 `rsa` 从 host 的依赖图里摘掉。改的是两行 feature 边（成因见 §四.1）：
 
 | 文件 | 原来 | 改成 |
 |---|---|---|
 | `crates/nsh-engine/Cargo.toml` | `crypto = ["js-core", "nsh-js/crypto"]` | `crypto = ["js-core"]` |
 | `crates/nsh-testing/Cargo.toml` | `nsh-js = { …, features = ["zlib", "crypto"] }` | `features = ["zlib"]` |
 
-第二条是同一个道理的另一处入口：测试宿主也把 `nsh-js/crypto` 打开了，
-不关它照样会把 `rsa ^rc.19` 带进来。
+第二条是同一道理的另一处入口：测试宿主也把 `nsh-js/crypto` 打开了。
+一条边同时解掉所有平台的 host。
 
-**为什么改 feature 而不改本仓**：冲突发生在 host（`nsh-engine` → `nsh-js` →
-`quickjs-jit-stdlib` → `rsa`）这一侧，跟 `wfiles-core` 无关。本仓能做的只有
-「关掉自己的 sftp feature」——那是上一版的做法，代价是这个客户端没有 SFTP。
-剪掉 host 那条边之后两边都留着，而且**对所有平台一次生效**。
+**为什么不这么做了**：它只在本机源码 checkout 上生效，`git checkout` 换版本就被
+覆盖，每次升级都要重剪；而且用官方发行版 CLI 时根本改不到 host。现在的解法在
+**本仓**（关 `russh/rsa`，§四.1）——一行、不随升级失效、对所有平台一次生效，
+还能让 GUI 用 `sftp-rsa` 把 RSA 支持单独加回来。所以
+`~/.nsh-source/source` 现在保持上游原样，不再有任何本地改动。
 
-**升级步骤**（`~/.nsh-source/source` 换了版本之后）：
+**当前 feature 结构**（三处，别混）：
 
-```bash
-cd ~/.nsh-source/source
-# 1. 两个 feature 重新剪一遍（内容照上表）
-grep -n '^crypto' crates/nsh-engine/Cargo.toml
-grep -n 'nsh-js = ' crates/nsh-testing/Cargo.toml
-# 2. 删 lock 重解析（旧 lock 里 pkcs1 可能锁在正式版 0.8.0，见 §四.1）
-rm -f .nsh/rust/Cargo.lock
-# 3. 重建二进制（产物在 /Volumes/Ventoy/nsh-source-target）
-cargo build --release -p nsh-cli
-```
+| 位置 | 声明 | 作用 |
+|---|---|---|
+| `crates/wfiles-core/Cargo.toml` 依赖 | `russh = { …, default-features = false, features = ["flate2", "aws-lc-rs"] }` | 默认不带 `rsa` / `pkcs1` |
+| 同上 `[features]` | `sftp-rsa = ["sftp", "russh/rsa"]` | 给 GUI 把 RSA 加回来（NSH 不带） |
+| `nsh-poc/Cargo.toml` `[features]` | `default = ["sftp"]` / `sftp = ["wfiles-core/sftp"]` | NSH 侧 SFTP 单独开关 |
 
-改完 `nsh check` 必须过——不过就是这两处又被上游改回去了。
+`nsh-poc` 对 `wfiles-core` 写
+`default-features = false, features = ["test-support"]`，让 feature 只由
+`[features]` 说了算。关掉 `sftp` 时桥接层仍编得过，因为 `sftp_connect` 走
+`wfiles_core::remote::open()`；core 的 `#[cfg(not(feature = "sftp"))]` 分支会
+明确报"这个构建没有包含 SFTP 支持"，不静默失败。
 
-**这条改动的性质**：它是**本机工具链的裁剪**，不是给上游的补丁。上游真把
-`rsa` 那一组依赖理顺了（比如 `quickjs-jit-stdlib` 不再可选依赖 `rsa`），
-这两行就该删掉——那时 `crypto` feature 恢复原样即可，本仓一行都不用动。
+**负验证**（都做过）：
+
+- 把 `russh` 改回带 `rsa` → `nsh check` 红 `failed to select a version for pkcs1`，
+  `cargo tree -i rsa` 能打出 `rsa rc.18 → pkcs1 =rc.4` 那条链；改回来、删
+  `.nsh/rust/Cargo.lock`（**在 app 目录下，不在源码 checkout 里**）重解析 → 绿。
+- `cd nsh-poc && cargo check --no-default-features`（关 `sftp`）→ 桥接层仍编得过；
+  若把 `remote::open()` 改回 `wfiles_core::sftp::Sftp::new()`，这时会直接编译错
+  ——那个模块在关掉 feature 时根本不存在。
 
 ## 七、还没接的（按重要性）
 

@@ -135,7 +135,7 @@ Windows 侧手写 `unsafe extern "system" { fn GetDiskFreeSpaceExW(...) }`，不
 |---|---|---|---|
 | `remote` | 连接配置、系统钥匙串存取、统一的 `Remote` trait、`dav://id/子路径` 拼拆、WebDAV 客户端 | `Remote`、`Config`、`parse_location`、`location`、`fake`（test-support） | **`Remote` trait 一律同步**，异步关在协议实现内部（tokio runtime），否则调用方到处 async |
 | `ftp` | 明文 FTP | `Remote` 实现 | 控制连接有状态，用 `Mutex` 锁住 |
-| `sftp` | SFTP（russh + tokio） | `Remote` 实现 | known_hosts 认公钥，**换了就拒**；密码与私钥两种登录 |
+| `sftp` | SFTP（russh + tokio，`sftp` feature 默认开） | `Remote` 实现 | known_hosts 认公钥，**换了就拒**；密码与私钥两种登录。`russh` 默认**不启用 `rsa` feature**，只支持 ed25519/ECDSA 主机与用户密钥（避开 NSH 的 `pkcs1` 死锁，见 `docs/nsh-client.md` §四.1）；GUI 侧用 `sftp-rsa` feature 把 RSA 支持加回来 |
 | `s3` | S3 兼容对象存储 | `Remote` 实现 | SigV4 签名；桶的两种写法；前缀当文件夹 |
 | `offline` | 远程目录列表落盘，断网垫底 | `test_guard()` | 坏缓存当没有，不许拦住启动 |
 

@@ -6,24 +6,21 @@ publish = false
 
 [workspace]
 
+[features]
+# SFTP 是**单独一个开关**（透传 core 的 `sftp` feature）。默认开：0.5.0 之后
+# `pkcs1` 死锁已经在 core 那一侧解决（`russh` 不启用 rsa feature），不用再靠
+# 「关掉整个远程」来躲。真要出一份不带远程的构建用 `--no-default-features`；
+# 那时 core 的 `remote::open()` 会明确报"这个构建没有包含 SFTP 支持"，
+# 界面不会留一个按了没反应的选项。
+default = ["sftp"]
+sftp = ["wfiles-core/sftp"]
+
 [dependencies]
-# NSH 的 crate 指向**源码 checkout**，不是 crates.io。
-#
-# 原因很具体：`nsh-tui-host` 与 `nsh-platform-tui`（`--target tui` 的两块）
-# **没有发布到 crates.io**（`index.crates.io/ns/h-/nsh-platform-tui` 404），
-# 走 registry 时 `nsh check` 会给 `.nsh/rust/tui-host` 生成
-# `nsh-tui-host = { version = "=0.4.0" }`，那次解析必然失败。
-#
-# `nsh-cli` 的 `Nsh::of()` 会读 app 的 `cargo metadata --no-deps`：依赖写 path
-# 且落在某个 checkout 里，生成的 host 也用 `path`——这本来就是官方给
-# 「app 要跟源码一起改」留的入口（`nsh init --template rust --nsh-source`）。
-# 于是「app 与 host 共用同一份 nsh」这件事由它自己保证，不用 `[patch]`。
-#
-# 换回发布版 CLI 时改成 `nsh-core = "0.4.0"` / `nsh-base = "0.4.0"` 即可，
-# 代价是丢掉 `--target tui`。路径是本机专用的（`~/.nsh-source/source`，
-# 源码构建产物同处 `~/.nsh-source`）。
-nsh-core = { path = "/Users/nice/.nsh-source/source/crates/nsh-core" }
-nsh-base = { path = "/Users/nice/.nsh-source/source/crates/nsh-base" }
+# 0.5.0 起 `nsh-tui-host` / `nsh-platform-tui` 已发布到 crates.io，`--target tui`
+# 也在发布版 CLI 里，所以不再需要 0.4.0 时代的 path 依赖源码 checkout。
+# CLI 就是官方发行版 `~/.nsh/bin/nsh`（0.5.0）。
+nsh-core = "0.5.0"
+nsh-base = "0.5.0"
 # PoC 侧自写的薄实现要用的两个库，主仓库已有，编译缓存可复用。
 serde_json = "1"
 dirs = "6"
@@ -33,15 +30,12 @@ async-channel = "2"
 # 主仓库的核心：目录模型、排序过滤、搬运、撤销、续传、特殊文件对象全在这儿。
 # 与 GUI 版共用同一份代码——这一层不再自己写 fs::read_dir。
 #
-# **SFTP 现在是开着的**（`wfiles-core` 的默认特性）。曾经为了躲 `pkcs1` 冲突在这里
-# 写 `default-features = false`，代价是这个客户端没有远程；冲突在 host 那一侧
-# （`nsh-engine` → `nsh-js` → `quickjs-jit-stdlib` → `rsa rc.19`）剪掉一条 feature
-# 边之后就没有了，本仓不用再让。理由、改了哪两行、升级后怎么恢复：`docs/nsh-client.md`
-# §四.1 与 §6.5。
+# `default-features = false` 是为了让 feature 只由上面的 `[features]` 说了算：
+# 除了判据要用的 `test-support`，只有显式开的 `sftp` 会进依赖图。
 #
 # `test-support` 只在**这个 PoC 的 headless 判据**里用：`Wfiles.setTestVolumes()`
 # 要借 core 的 `volumes::set_override` 钉住"本机挂着哪几块盘"，否则判据只能
 # 拿跑测试那台机器的真实挂载点说事（空列表就什么都不验了）。
 # NSH 的 `check` / `test` 编的是同一个 dylib，没有 dev 构建之分，所以只能把
 # feature 开在依赖上；夹具默认是 `None`，正式路径一次都不经过它。
-wfiles-core = { path = "../crates/wfiles-core", features = ["test-support"] }
+wfiles-core = { path = "../crates/wfiles-core", default-features = false, features = ["test-support"] }
