@@ -4,9 +4,9 @@
 // 方向只能是「界面 → core」：core 的依赖表里没有 gpui-kit，反向引用编译不过。
 pub use wfiles_core::{
     analyze, archive, bulk_rename, cli, clipboard, cloud, compare, contract, diff, entry_kind,
-    favorites, format, ftp, instance, kernel, logfile, marks, model, offline, ops, palette, path_input,
-    preview, query, remote, restore, resume, s3, search, session, sftp, templates, terminal,
-    volumes, watch,
+    favorites, format, ftp, instance, kernel, logfile, marks, model, offline, ops, palette,
+    path_input, preview, query, remote, restore, resume, s3, search, session, sftp, templates,
+    terminal, volumes, watch,
 };
 
 // 下面这些是界面层：渲染、窗格状态、拖放、快捷键、菜单、缩略图、终端绘制，

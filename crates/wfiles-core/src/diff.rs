@@ -584,7 +584,11 @@ mod tests {
             removed: 1,
         };
         assert_eq!(mixed.summary(), "改了 2 行 · 少了 1 行");
-        assert!(!mixed.summary().contains("新增"), "0 项不许出现：{}", mixed.summary());
+        assert!(
+            !mixed.summary().contains("新增"),
+            "0 项不许出现：{}",
+            mixed.summary()
+        );
 
         // 三种都有时按「改 → 增 → 少」的固定顺序，别随统计结构体的字段顺序漂。
         let all = TextStats {

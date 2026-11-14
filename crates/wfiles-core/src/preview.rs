@@ -446,7 +446,11 @@ mod tests {
         }
 
         let unique: std::collections::BTreeSet<&&str> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len(), "有两个类型共用了同一个 id：{ids:?}");
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "有两个类型共用了同一个 id：{ids:?}"
+        );
     }
 
     /// 图片这一支必须叫 `image`：NSH 客户端与后续前端都按它判缩略图。

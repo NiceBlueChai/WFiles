@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::i18n::{Msg, Message};
+use crate::i18n::{Message, Msg};
 
 /// 一条收藏。
 ///
@@ -245,7 +245,10 @@ mod tests {
 
         let items = toggle(Path::new("/tmp/via-override"), true).unwrap();
         assert_eq!(items.len(), 1, "覆盖之后 toggle 走的仍是同一套读写");
-        assert!(dir.path().join("settings.json").exists(), "文件落在覆盖目录里");
+        assert!(
+            dir.path().join("settings.json").exists(),
+            "文件落在覆盖目录里"
+        );
         assert_eq!(list().len(), 1, "list 也认同一个落点");
 
         set_dir_override(None);

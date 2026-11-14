@@ -592,7 +592,11 @@ mod tests {
             truncated: true,
             ..Stats::default()
         };
-        assert!(clipped.summary().contains("已到上限"), "{}", clipped.summary());
+        assert!(
+            clipped.summary().contains("已到上限"),
+            "{}",
+            clipped.summary()
+        );
     }
 
     fn write(path: PathBuf, contents: &str) {

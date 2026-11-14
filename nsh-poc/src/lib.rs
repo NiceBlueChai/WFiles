@@ -733,7 +733,7 @@ impl Wfiles {
             apply_and_render(core, contract::Command::Copy { sources, dest })
         })
         .await
-        .unwrap_or_else(|| worker_died())
+        .unwrap_or_else(worker_died)
     }
 
     /// 移动（异步）。
@@ -745,7 +745,7 @@ impl Wfiles {
             apply_and_render(core, contract::Command::Move { sources, dest })
         })
         .await
-        .unwrap_or_else(|| worker_died())
+        .unwrap_or_else(worker_died)
     }
 
     /// 现在的搬运进度，JSON：`null` = 没有搬运在跑。
@@ -839,7 +839,7 @@ impl Wfiles {
             apply_and_render(core, contract::Command::Delete { paths, permanent })
         })
         .await
-        .unwrap_or_else(|| worker_died())
+        .unwrap_or_else(worker_died)
     }
 
     /// 重命名（异步）。
@@ -854,7 +854,7 @@ impl Wfiles {
             )
         })
         .await
-        .unwrap_or_else(|| worker_died())
+        .unwrap_or_else(worker_died)
     }
 
     /// 新建文件夹（异步）。
@@ -869,7 +869,7 @@ impl Wfiles {
             )
         })
         .await
-        .unwrap_or_else(|| worker_died())
+        .unwrap_or_else(worker_died)
     }
 
     /// 按模板新建文件（异步）。
@@ -885,14 +885,14 @@ impl Wfiles {
             )
         })
         .await
-        .unwrap_or_else(|| worker_died())
+        .unwrap_or_else(worker_died)
     }
 
     /// 撤销（异步）。
     pub async fn undo_async() -> String {
         on_worker(|core| apply_and_render(core, contract::Command::Undo))
             .await
-            .unwrap_or_else(|| worker_died())
+            .unwrap_or_else(worker_died)
     }
 
     // ---- 辅助 ----

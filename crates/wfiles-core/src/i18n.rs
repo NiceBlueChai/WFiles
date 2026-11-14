@@ -1188,10 +1188,7 @@ static EN: &[(&str, &str)] = &[
         "Can't work out where the recovery file lives",
     ),
     ("序列化失败：{error}", "Serializing failed: {error}"),
-    (
-        "读不了设置：{error}",
-        "Couldn't read the settings: {error}",
-    ),
+    ("读不了设置：{error}", "Couldn't read the settings: {error}"),
     (
         "序列化收藏失败：{error}",
         "Couldn't serialize the favourites: {error}",
